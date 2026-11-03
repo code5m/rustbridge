@@ -197,6 +197,8 @@ impl Collector<'_> {
                     "This trait defines behavior that a type may implement.");
             }
             "enum_item" => {
+                self.keyword(node, "enum", None, "Rust enum ↔ tagged union",
+                    "A Rust enum can carry different data per variant. Java enums are only a partial analogy; model each variant explicitly.");
                 self.named(node, "type", "Rust enum",
                     "Rust enums can carry data in variants. Java enums are not a complete equivalent.");
             }
@@ -260,13 +262,14 @@ impl Collector<'_> {
             }
             "field_identifier" => {
                 let is_decl = node.parent().is_some_and(|p| p.kind() == "field_declaration");
+                let (topic, detail) = match text {
+                    "iter" | "iter_mut" | "into_iter" => ("Iterator traversal", "Iterator methods express borrowed, mutable-borrowed, or owned traversal. This is not a Java Stream conversion and may move elements."),
+                    "map" | "filter" | "collect" => ("Iterator pipeline", "Rust iterator adapters are lazy until consumed. Borrowing and ownership in the closure still apply."),
+                    _ if is_decl => ("Field declaration", "This is the declared field name. The paired Rust span is its exact AST occurrence."),
+                    _ => ("Field or method access", "This is a field or method occurrence, not necessarily the declaration. Cross-file name resolution is not implemented."),
+                };
                 self.add(node, "field",
-                    if is_decl { "Field declaration" } else { "Field or method access" },
-                    if is_decl {
-                        "This is the declared field name. The paired Rust span is its exact AST occurrence."
-                    } else {
-                        "This is a field or method occurrence, not necessarily the declaration. Cross-file name resolution is not implemented."
-                    }, 1);
+                    topic, detail, 1);
             }
             "identifier" => self.add(node, "symbol", "Rust symbol occurrence",
                 "Clicking links this exact token occurrence between the two views. Definition lookup requires a type/name resolver.", 1),
@@ -514,6 +517,31 @@ mod tests {
                 .iter()
                 .any(|a| a.explanation.contains("type resolver"))
         );
+    }
+
+    #[test]
+    fn enum_and_iterator_concepts_are_linked_without_guessing_types() {
+        let src = "enum Event { Count(u32), Stop }\nfn main() { let xs = vec![1]; xs.iter().map(|x| x + 1).collect::<Vec<_>>(); }";
+        let projection = project(src);
+        assert!(
+            projection
+                .anchors
+                .iter()
+                .any(|anchor| anchor.topic == "Rust enum ↔ tagged union")
+        );
+        assert!(
+            projection
+                .anchors
+                .iter()
+                .any(|anchor| anchor.topic == "Iterator traversal")
+        );
+        assert!(
+            projection
+                .anchors
+                .iter()
+                .any(|anchor| anchor.topic == "Iterator pipeline")
+        );
+        assert_links(src);
     }
 
     #[test]
