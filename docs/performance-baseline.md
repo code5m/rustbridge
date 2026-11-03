@@ -34,6 +34,26 @@ ends. This is one idle sample with the built-in example, not a main-branch basel
 The desktop automation interface did not expose the native window, so actual visible
 rendering and interaction were not verified.
 
+## Current release re-measurement (commit `530c475`, 2026-11-04)
+
+The same shared machine was used after the background filename search and optional
+rust-analyzer diagnostic task were added. `cargo build --release` produced a
+10,061,456-byte binary. The application was started with its built-in example and
+sampled from `/proc`; after one second of warm-up, CPU ticks (`utime + stime`) and
+`VmRSS` were sampled five seconds apart, then the measurement process was terminated.
+
+| Measurement | Observed value | Method / limitation |
+| --- | ---: | --- |
+| Idle CPU | 0.00% of one core over 5 s | Tick delta divided by `CLK_TCK`; one sample on a shared machine. |
+| Idle RSS | 95,304 KiB at both endpoints | `/proc/<pid>/status`; built-in example only. |
+| Binary size | 10,061,456 bytes | `stat` after release build. |
+| `rust-analyzer diagnostics` | Completed in 20.1 s end-to-end including RustBridge validation commands | Direct command on this small project with build scripts and proc macros disabled; it reported only weak `cfg(test)` inactive-code notices. |
+
+This verifies that native event-loop startup remains idle after initialization and that
+the optional diagnostic command can finish on the current project. It is not a GUI
+latency benchmark: this environment still does not expose the native window to the
+automation driver, so file-open, editing and click latency cannot be measured honestly.
+
 ## Still required
 
 Startup latency, repeatable GUI file-open/edit latency, CPU and memory under activity,
