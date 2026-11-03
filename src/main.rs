@@ -25,6 +25,113 @@ struct FileStamp {
     modified: Option<std::time::SystemTime>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyntaxToken {
+    Comment,
+    String,
+    Word,
+    Plain,
+}
+
+fn quoted_end(rest: &str, quote: char) -> usize {
+    let mut escaped = false;
+    for (offset, character) in rest[1..].char_indices() {
+        if character == '\n' || character == '\r' {
+            break;
+        }
+        if character == quote && !escaped {
+            return offset + 2;
+        }
+        escaped = character == '\\' && !escaped;
+        if character != '\\' {
+            escaped = false;
+        }
+    }
+    1
+}
+
+fn raw_string_end(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let prefix = if rest.starts_with("br") {
+        2
+    } else if rest.starts_with('r') {
+        1
+    } else {
+        return None;
+    };
+    let hashes = bytes[prefix..]
+        .iter()
+        .take_while(|byte| **byte == b'#')
+        .count();
+    if bytes.get(prefix + hashes) != Some(&b'"') {
+        return None;
+    }
+    let terminator = format!("\"{}", "#".repeat(hashes));
+    rest[prefix + hashes + 1..]
+        .find(&terminator)
+        .map(|offset| prefix + hashes + 1 + offset + terminator.len())
+        .or(Some(rest.len()))
+}
+
+fn block_comment_end(rest: &str) -> usize {
+    let mut depth = 1;
+    let mut index = 2;
+    while index + 1 < rest.len() {
+        match &rest[index..index + 2] {
+            "/*" => {
+                depth += 1;
+                index += 2;
+            }
+            "*/" => {
+                depth -= 1;
+                index += 2;
+                if depth == 0 {
+                    return index;
+                }
+            }
+            _ => index += rest[index..].chars().next().unwrap().len_utf8(),
+        }
+    }
+    rest.len()
+}
+
+fn next_rust_token(rest: &str) -> (usize, SyntaxToken) {
+    if rest.starts_with("//") {
+        return (rest.find('\n').unwrap_or(rest.len()), SyntaxToken::Comment);
+    }
+    if rest.starts_with("/*") {
+        return (block_comment_end(rest), SyntaxToken::Comment);
+    }
+    if let Some(end) = raw_string_end(rest) {
+        return (end, SyntaxToken::String);
+    }
+    if rest.starts_with("b\"") {
+        return (1 + quoted_end(&rest[1..], '"'), SyntaxToken::String);
+    }
+    if rest.starts_with("b'") {
+        return (1 + quoted_end(&rest[1..], '\''), SyntaxToken::String);
+    }
+    if rest.starts_with('"') {
+        return (quoted_end(rest, '"'), SyntaxToken::String);
+    }
+    if rest.starts_with('\'') {
+        return (quoted_end(rest, '\''), SyntaxToken::String);
+    }
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_alphabetic() || character == '_')
+    {
+        return (
+            rest.char_indices()
+                .find(|(_, character)| !character.is_alphanumeric() && *character != '_')
+                .map_or(rest.len(), |(end, _)| end),
+            SyntaxToken::Word,
+        );
+    }
+    (rest.chars().next().unwrap().len_utf8(), SyntaxToken::Plain)
+}
+
 fn append_rust_syntax(
     job: &mut egui::text::LayoutJob,
     text: &str,
@@ -87,41 +194,14 @@ fn append_rust_syntax(
     let mut index = 0;
     while index < text.len() {
         let rest = &text[index..];
-        let end = if rest.starts_with("//") {
-            index + rest.find('\n').unwrap_or(rest.len())
-        } else if let Some(after_quote) = rest.strip_prefix('"') {
-            let mut escaped = false;
-            let mut length = 1;
-            for character in after_quote.chars() {
-                length += character.len_utf8();
-                if character == '"' && !escaped {
-                    break;
-                }
-                escaped = character == '\\' && !escaped;
-                if character != '\\' {
-                    escaped = false;
-                }
-            }
-            index + length
-        } else if rest
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_alphabetic() || character == '_')
-        {
-            index
-                + rest
-                    .char_indices()
-                    .find(|(_, character)| !character.is_alphanumeric() && *character != '_')
-                    .map_or(rest.len(), |(end, _)| end)
-        } else {
-            index + rest.chars().next().unwrap().len_utf8()
-        };
+        let (length, kind) = next_rust_token(rest);
+        let end = index + length;
         let token = &text[index..end];
-        let color = if token.starts_with("//") {
+        let color = if kind == SyntaxToken::Comment {
             Color32::from_rgb(112, 142, 112)
-        } else if token.starts_with('"') {
+        } else if kind == SyntaxToken::String {
             Color32::from_rgb(202, 162, 98)
-        } else if keyword(token) {
+        } else if kind == SyntaxToken::Word && keyword(token) {
             Color32::from_rgb(126, 188, 247)
         } else {
             base
@@ -1303,6 +1383,38 @@ mod file_tests {
                 .iter()
                 .any(|section| section.format.background == Color32::from_rgb(53, 103, 155))
         );
+    }
+
+    #[test]
+    fn lexical_highlighter_recognizes_nested_comments_and_rust_literals() {
+        let source = "/* outer /* inner */ done */\nlet raw = r#\"中文\"#;\nlet byte = b'a';";
+        let mut job = egui::text::LayoutJob::default();
+        append_rust_syntax(
+            &mut job,
+            source,
+            &egui::FontId::monospace(12.),
+            Color32::WHITE,
+            None,
+        );
+        let rendered: String = job
+            .sections
+            .iter()
+            .map(|section| &source[section.byte_range.clone()])
+            .collect();
+        assert_eq!(rendered, source);
+        let comment = &source[..source.find('\n').unwrap()];
+        assert!(job.sections.iter().any(|section| {
+            &source[section.byte_range.clone()] == comment
+                && section.format.color == Color32::from_rgb(112, 142, 112)
+        }));
+        assert!(job.sections.iter().any(|section| {
+            &source[section.byte_range.clone()] == "r#\"中文\"#"
+                && section.format.color == Color32::from_rgb(202, 162, 98)
+        }));
+        assert!(job.sections.iter().any(|section| {
+            &source[section.byte_range.clone()] == "b'a'"
+                && section.format.color == Color32::from_rgb(202, 162, 98)
+        }));
     }
 
     #[test]
