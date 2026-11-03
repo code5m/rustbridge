@@ -49,6 +49,9 @@ struct App {
     disk_stamp: Option<FileStamp>,
     external_change: bool,
     next_disk_check: std::time::Instant,
+    editor_query: String,
+    editor_find: Option<parser::ByteSpan>,
+    editor_jump: Option<parser::ByteSpan>,
     status: String,
 }
 
@@ -81,6 +84,9 @@ impl Default for App {
             disk_stamp: None,
             external_change: false,
             next_disk_check: std::time::Instant::now(),
+            editor_query: String::new(),
+            editor_find: None,
+            editor_jump: None,
             status: "Java view is an AST-aligned teaching aid, not compilable Java.".into(),
         }
     }
@@ -107,6 +113,8 @@ impl App {
                 self.file = Some(path);
                 self.selected = None;
                 self.jump_to = None;
+                self.editor_find = None;
+                self.editor_jump = None;
                 self.scroll_follow = None;
                 self.last_scroll = None;
                 self.mode = Mode::Java;
@@ -232,6 +240,39 @@ impl App {
             self.external_change = true;
             self.status =
                 "File changed outside RustBridge; save is blocked until you reopen it.".into();
+        }
+    }
+
+    fn find_next_in_editor(&mut self) {
+        let query = self.editor_query.trim();
+        if query.is_empty() {
+            self.editor_find = None;
+            self.editor_jump = None;
+            return;
+        }
+        let start = self.editor_find.map_or(0, |span| span.end);
+        let offset = self.rust[start..]
+            .find(query)
+            .or_else(|| self.rust[..start].find(query));
+        if let Some(offset) = offset {
+            let span = parser::ByteSpan {
+                start: if offset < start {
+                    offset
+                } else {
+                    start + offset
+                },
+                end: if offset < start {
+                    offset
+                } else {
+                    start + offset
+                } + query.len(),
+            };
+            self.editor_find = Some(span);
+            self.editor_jump = Some(span);
+            self.status = format!("Found Rust text at byte {}.", span.start);
+        } else {
+            self.editor_find = None;
+            self.status = "Text not found in the original Rust source.".into();
         }
     }
 
@@ -375,15 +416,29 @@ impl App {
                 self.save();
             }
         });
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.editor_query)
+                    .hint_text("Find in original Rust…")
+                    .desired_width(220.),
+            );
+            if ui.button("Find next").clicked()
+                || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            {
+                self.find_next_in_editor();
+            }
+        });
         let active = self
             .selected
             .and_then(|idx| self.projection.anchors.get(idx))
-            .map(|anchor| anchor.rust);
+            .map(|anchor| anchor.rust)
+            .or(self.editor_find);
         let jump = self
             .jump_to
             .take()
             .and_then(|idx| self.projection.anchors.get(idx))
             .map(|anchor| anchor.rust);
+        let cursor_target = jump.or(self.editor_jump.take());
 
         // Highlight the selected source token without changing the file or transforming its syntax.
         let mut layouter = |ui: &egui::Ui, content: &dyn egui::TextBuffer, width: f32| {
@@ -424,6 +479,8 @@ impl App {
         if output.response.changed() {
             self.update_projection();
             self.dirty = self.rust != self.saved_source;
+            self.editor_find = None;
+            self.editor_jump = None;
             self.selected = None;
             self.status = "Source edited; updating the reading projection.".into();
         }
@@ -437,7 +494,7 @@ impl App {
                     .and_then(|before| self.projection.rust_anchor(before))
             });
         }
-        if let Some(span) = jump
+        if let Some(span) = cursor_target
             && span.end <= self.rust.len()
         {
             use egui::text::{CCursor, CCursorRange};
@@ -929,5 +986,23 @@ mod file_tests {
         assert!(app.external_change);
         assert!(app.status.contains("changed outside"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn editor_find_cycles_over_original_rust_text() {
+        let mut app = App {
+            rust: "fn one() {}\nfn two() {}\nfn one_again() {}".into(),
+            editor_query: "one".into(),
+            ..App::default()
+        };
+        app.find_next_in_editor();
+        assert_eq!(app.editor_find, Some(parser::ByteSpan { start: 3, end: 6 }));
+        app.find_next_in_editor();
+        assert_eq!(
+            app.editor_find,
+            Some(parser::ByteSpan { start: 27, end: 30 })
+        );
+        app.find_next_in_editor();
+        assert_eq!(app.editor_find, Some(parser::ByteSpan { start: 3, end: 6 }));
     }
 }
