@@ -17,6 +17,12 @@ enum Mode {
     Learn,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
 struct App {
     root: Option<PathBuf>,
     file: Option<PathBuf>,
@@ -40,6 +46,9 @@ struct App {
     show_excluded: bool,
     file_query: String,
     search_results: Vec<PathBuf>,
+    disk_stamp: Option<FileStamp>,
+    external_change: bool,
+    next_disk_check: std::time::Instant,
     status: String,
 }
 
@@ -69,6 +78,9 @@ impl Default for App {
             show_excluded: false,
             file_query: String::new(),
             search_results: Vec::new(),
+            disk_stamp: None,
+            external_change: false,
+            next_disk_check: std::time::Instant::now(),
             status: "Java view is an AST-aligned teaching aid, not compilable Java.".into(),
         }
     }
@@ -86,6 +98,8 @@ impl App {
     fn open_file(&mut self, path: PathBuf) {
         match fs::read_to_string(&path) {
             Ok(text) => {
+                self.disk_stamp = file_stamp(&path).ok();
+                self.external_change = false;
                 self.saved_source = text.clone();
                 self.rust = text;
                 self.dirty = false;
@@ -117,6 +131,8 @@ impl App {
                 Ok(()) => {
                     self.dirty = false;
                     self.saved_source.clone_from(&self.rust);
+                    self.disk_stamp = file_stamp(path).ok();
+                    self.external_change = false;
                     self.status = "Saved original Rust source".into();
                 }
                 Err(error) => self.status = format!("Save failed: {error}"),
@@ -204,6 +220,18 @@ impl App {
             {
                 self.search_results.push(path);
             }
+        }
+    }
+
+    fn check_external_change(&mut self) {
+        let Some(path) = self.file.as_ref() else {
+            return;
+        };
+        let current = file_stamp(path).ok();
+        if current != self.disk_stamp {
+            self.external_change = true;
+            self.status =
+                "File changed outside RustBridge; save is blocked until you reopen it.".into();
         }
     }
 
@@ -566,6 +594,10 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if std::time::Instant::now() >= self.next_disk_check {
+            self.next_disk_check = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            self.check_external_change();
+        }
         if self
             .projection_due
             .is_some_and(|due| std::time::Instant::now() >= due)
@@ -673,6 +705,9 @@ impl eframe::App for App {
                 }
                 if self.dirty {
                     ui.colored_label(Color32::YELLOW, "● Unsaved");
+                }
+                if self.external_change {
+                    ui.colored_label(Color32::RED, "Disk changed outside the app");
                 }
             });
         });
@@ -795,6 +830,14 @@ fn save_if_unchanged(path: &Path, expected: &str, text: &str) -> std::io::Result
     fs::write(path, text)
 }
 
+fn file_stamp(path: &Path) -> std::io::Result<FileStamp> {
+    let metadata = fs::metadata(path)?;
+    Ok(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -870,5 +913,21 @@ mod file_tests {
         let option = App::lesson_for_topic("Option<T> ↔ Optional<T>").unwrap();
         assert_eq!(lessons::LESSONS[option].rust, "Option<T>");
         assert!(App::lesson_for_topic("Rust symbol occurrence").is_none());
+    }
+
+    #[test]
+    fn external_file_stamp_is_detected_before_save() {
+        let path = std::env::temp_dir().join(format!("rustbridge-stamp-{}", std::process::id()));
+        fs::write(&path, "one").unwrap();
+        let mut app = App {
+            file: Some(path.clone()),
+            disk_stamp: file_stamp(&path).ok(),
+            ..App::default()
+        };
+        fs::write(&path, "two changed").unwrap();
+        app.check_external_change();
+        assert!(app.external_change);
+        assert!(app.status.contains("changed outside"));
+        fs::remove_file(path).unwrap();
     }
 }
