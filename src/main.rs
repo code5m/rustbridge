@@ -337,6 +337,12 @@ impl App {
         }
     }
 
+    fn reload_disk_copy(&mut self) {
+        if let Some(path) = self.file.clone() {
+            self.open(path);
+        }
+    }
+
     fn update_projection(&mut self) {
         self.revision += 1;
         self.projection_pending = true;
@@ -1012,6 +1018,9 @@ impl eframe::App for App {
                 }
                 if self.external_change {
                     ui.colored_label(Color32::RED, "Disk changed outside the app");
+                    if ui.button("Reload disk copy").clicked() {
+                        self.reload_disk_copy();
+                    }
                 }
             });
         });
@@ -1309,6 +1318,27 @@ mod file_tests {
         app.check_external_change();
         assert!(app.external_change);
         assert!(app.status.contains("changed outside"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reload_disk_copy_never_discards_unsaved_source_without_confirmation() {
+        let path = std::env::temp_dir().join(format!("rustbridge-reload-{}", std::process::id()));
+        fs::write(&path, "disk version").unwrap();
+        let mut app = App {
+            file: Some(path.clone()),
+            rust: "my unsaved version".into(),
+            saved_source: "old version".into(),
+            dirty: true,
+            ..App::default()
+        };
+        app.reload_disk_copy();
+        assert_eq!(app.rust, "my unsaved version");
+        assert_eq!(app.pending_open, Some(path.clone()));
+        app.dirty = false;
+        app.pending_open = None;
+        app.reload_disk_copy();
+        assert_eq!(app.rust, "disk version");
         fs::remove_file(path).unwrap();
     }
 
