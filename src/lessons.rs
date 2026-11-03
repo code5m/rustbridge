@@ -4,6 +4,7 @@ pub struct Lesson {
     pub why: &'static str,
     pub java_code: &'static str,
     pub rust_code: &'static str,
+    pub common_mistake: &'static str,
 }
 pub const LESSONS: &[Lesson] = &[
     Lesson {
@@ -12,6 +13,7 @@ pub const LESSONS: &[Lesson] = &[
         why: "Separate data from methods; Java inheritance does not carry over.",
         java_code: "class User { String name; }",
         rust_code: "struct User { name: String }\nimpl User { fn name(&self) -> &str { &self.name } }",
+        common_mistake: "Expecting struct + impl to provide Java inheritance or nullable fields.",
     },
     Lesson {
         java: "interface",
@@ -19,6 +21,7 @@ pub const LESSONS: &[Lesson] = &[
         why: "Traits define reusable behavior, potentially with default implementations.",
         java_code: "interface Greeter { void greet(); }",
         rust_code: "trait Greeter { fn greet(&self); }",
+        common_mistake: "Assuming a trait object or default method has the same dispatch and ownership rules as Java interfaces.",
     },
     Lesson {
         java: "extends",
@@ -26,6 +29,7 @@ pub const LESSONS: &[Lesson] = &[
         why: "Use composition and traits rather than class inheritance.",
         java_code: "class Admin extends User {}",
         rust_code: "struct Admin { user: User }",
+        common_mistake: "Looking for extends instead of composing data and implementing shared behavior with traits.",
     },
     Lesson {
         java: "null / Optional",
@@ -33,6 +37,7 @@ pub const LESSONS: &[Lesson] = &[
         why: "Handle Some and None explicitly; missing values are visible in the type.",
         java_code: "Optional<String> s = Optional.empty();",
         rust_code: "let s: Option<String> = None;",
+        common_mistake: "Calling unwrap because a Java value would normally be null-checked later.",
     },
     Lesson {
         java: "Exception",
@@ -40,6 +45,7 @@ pub const LESSONS: &[Lesson] = &[
         why: "Rust models recoverable failure as explicit success/error values.",
         java_code: "try { load(); } catch(IOException e) {}",
         rust_code: "fn load() -> std::io::Result<String> { std::fs::read_to_string(\"x\") }",
+        common_mistake: "Treating Err as a thrown exception without deciding where it is handled or propagated.",
     },
     Lesson {
         java: "ArrayList",
@@ -47,6 +53,7 @@ pub const LESSONS: &[Lesson] = &[
         why: "An owned, contiguous growable array.",
         java_code: "List<Integer> xs = new ArrayList<>();",
         rust_code: "let mut xs: Vec<i32> = Vec::new(); xs.push(1);",
+        common_mistake: "Keeping references into a Vec across a push that may reallocate it.",
     },
     Lesson {
         java: "HashMap",
@@ -54,6 +61,7 @@ pub const LESSONS: &[Lesson] = &[
         why: "Familiar lookup API, but Rust insertions can move owned keys and values.",
         java_code: "Map<String,Integer> xs = new HashMap<>();",
         rust_code: "let mut xs = std::collections::HashMap::new(); xs.insert(\"a\", 1);",
+        common_mistake: "Using a borrowed map entry while mutating the same map.",
     },
     Lesson {
         java: "Stream API",
@@ -61,6 +69,7 @@ pub const LESSONS: &[Lesson] = &[
         why: "Iterator chains are lazy, evaluated by a consumer like collect.",
         java_code: "xs.stream().filter(x -> x > 2).collect(toList());",
         rust_code: "let ys: Vec<_> = xs.iter().filter(|x| **x > 2).collect();",
+        common_mistake: "Forgetting that iterator adapters are lazy until consumed by collect, for, or another consumer.",
     },
     Lesson {
         java: "CompletableFuture",
@@ -68,6 +77,7 @@ pub const LESSONS: &[Lesson] = &[
         why: "Rust futures are lazy and require an executor for progress.",
         java_code: "CompletableFuture.supplyAsync(() -> fetch());",
         rust_code: "async fn fetch() -> String { String::from(\"ok\") }",
+        common_mistake: "Assuming calling an async function starts work without an executor awaiting or spawning it.",
     },
     Lesson {
         java: "synchronized",
@@ -75,6 +85,7 @@ pub const LESSONS: &[Lesson] = &[
         why: "Scoped guards unlock automatically; distinguish std mutex from async mutex.",
         java_code: "synchronized(lock) { count++; }",
         rust_code: "let lock = std::sync::Mutex::new(0); *lock.lock().unwrap() += 1;",
+        common_mistake: "Holding a mutex guard across slow work or treating std::sync::Mutex as an async mutex.",
     },
     Lesson {
         java: "JVM + GC",
@@ -82,6 +93,7 @@ pub const LESSONS: &[Lesson] = &[
         why: "Rust relies on compile-time ownership checks and deterministic Drop, not a GC.",
         java_code: "User u = new User(); consume(u);",
         rust_code: "let u = String::from(\"hi\"); consume(u); // moved",
+        common_mistake: "Using a value after moving it, or adding clones before considering a borrow.",
     },
     Lesson {
         java: "Maven / Gradle",
@@ -89,5 +101,6 @@ pub const LESSONS: &[Lesson] = &[
         why: "Cargo handles builds, dependency resolution, tests and packaging.",
         java_code: "mvn test",
         rust_code: "cargo check\ncargo test\ncargo run",
+        common_mistake: "Expecting Cargo commands to behave like Maven phases without checking the package and workspace context.",
     },
 ];
