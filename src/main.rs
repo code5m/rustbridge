@@ -131,6 +131,7 @@ fn append_rust_syntax(
 
 struct App {
     root: Option<PathBuf>,
+    cargo_project: bool,
     file: Option<PathBuf>,
     rust: String,
     projection: parser::Projection,
@@ -167,6 +168,7 @@ impl Default for App {
         let rust = include_str!("../examples/basics.rs").to_owned();
         Self {
             root: None,
+            cargo_project: false,
             file: None,
             projection: parser::project(&rust),
             worker: None,
@@ -848,8 +850,14 @@ impl eframe::App for App {
                 if ui.button("Open folder").clicked()
                     && let Some(folder) = rfd::FileDialog::new().pick_folder()
                 {
+                    self.cargo_project = is_cargo_root(&folder);
                     self.root = Some(folder);
                     self.refresh_file_search();
+                    self.status = if self.cargo_project {
+                        "Opened Cargo project directory. Rust source remains the only editable truth.".into()
+                    } else {
+                        "Opened directory without Cargo.toml. Browsing Rust files.".into()
+                    };
                 }
                 ui.separator();
                 for (mode, label) in [
@@ -897,6 +905,11 @@ impl eframe::App for App {
                 ui.separator();
                 if let Some(root) = self.root.clone() {
                     ui.strong(root.file_name().unwrap_or_default().to_string_lossy());
+                    ui.small(if self.cargo_project {
+                        "Cargo.toml detected"
+                    } else {
+                        "No Cargo.toml at this directory root"
+                    });
                     if !self.file_query.trim().is_empty() {
                         ui.small(format!(
                             "{} result(s), limited to 100",
@@ -999,6 +1012,10 @@ fn file_stamp(path: &Path) -> std::io::Result<FileStamp> {
     })
 }
 
+fn is_cargo_root(path: &Path) -> bool {
+    path.join("Cargo.toml").is_file()
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1099,6 +1116,17 @@ mod file_tests {
         assert!(app.external_change);
         assert!(app.status.contains("changed outside"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cargo_root_detection_uses_the_real_manifest() {
+        let root =
+            std::env::temp_dir().join(format!("rustbridge-cargo-root-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        assert!(!is_cargo_root(&root));
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"sample\"").unwrap();
+        assert!(is_cargo_root(&root));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
