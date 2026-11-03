@@ -154,6 +154,7 @@ struct App {
     show_excluded: bool,
     file_query: String,
     search_results: Vec<PathBuf>,
+    recent_files: Vec<PathBuf>,
     disk_stamp: Option<FileStamp>,
     external_change: bool,
     next_disk_check: std::time::Instant,
@@ -193,6 +194,7 @@ impl Default for App {
             show_excluded: false,
             file_query: String::new(),
             search_results: Vec::new(),
+            recent_files: Vec::new(),
             disk_stamp: None,
             external_change: false,
             next_disk_check: std::time::Instant::now(),
@@ -226,6 +228,7 @@ impl App {
                 self.dirty = false;
                 self.update_projection();
                 self.file = Some(path);
+                self.record_recent_file();
                 self.selected = None;
                 self.jump_to = None;
                 self.editor_find = None;
@@ -316,6 +319,15 @@ impl App {
         if !query.is_empty() {
             self.find_rust_files(&root, &query, 0);
         }
+    }
+
+    fn record_recent_file(&mut self) {
+        let Some(path) = self.file.clone() else {
+            return;
+        };
+        self.recent_files.retain(|recent| recent != &path);
+        self.recent_files.insert(0, path);
+        self.recent_files.truncate(8);
     }
 
     fn find_rust_files(&mut self, dir: &Path, query: &str, depth: usize) {
@@ -961,6 +973,16 @@ impl eframe::App for App {
                 } else {
                     ui.label("Open folder to browse the actual project.");
                 }
+                if !self.recent_files.is_empty() {
+                    ui.separator();
+                    ui.strong("Recent Rust files");
+                    let recent = self.recent_files.clone();
+                    for path in recent {
+                        if ui.selectable_label(self.file.as_ref() == Some(&path), path.display().to_string()).clicked() {
+                            self.open(path);
+                        }
+                    }
+                }
                 ui.separator();
                 ui.strong("Optional rust-analyzer");
                 ui.small("Availability only; no LSP, diagnostics, completion, or definition lookup is started.");
@@ -1154,6 +1176,21 @@ mod file_tests {
         fs::write(root.join("Cargo.toml"), "[package]\nname = \"sample\"").unwrap();
         assert!(is_cargo_root(&root));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recent_files_are_unique_and_bounded() {
+        let mut app = App::default();
+        for index in 0..10 {
+            app.file = Some(PathBuf::from(format!("/tmp/rustbridge-{index}.rs")));
+            app.record_recent_file();
+        }
+        assert_eq!(app.recent_files.len(), 8);
+        assert_eq!(app.recent_files[0], PathBuf::from("/tmp/rustbridge-9.rs"));
+        app.file = Some(PathBuf::from("/tmp/rustbridge-5.rs"));
+        app.record_recent_file();
+        assert_eq!(app.recent_files.len(), 8);
+        assert_eq!(app.recent_files[0], PathBuf::from("/tmp/rustbridge-5.rs"));
     }
 
     #[test]
