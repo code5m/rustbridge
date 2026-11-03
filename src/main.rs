@@ -87,13 +87,12 @@ impl App {
                 egui::CollapsingHeader::new(format!("▸ {name}"))
                     .id_salt(path.clone())
                     .show(ui, |ui| self.directory(ui, &path, depth + 1));
-            } else if path.extension().is_some_and(|x| x == "rs") {
-                if ui
+            } else if path.extension().is_some_and(|x| x == "rs")
+                && ui
                     .selectable_label(self.file.as_ref() == Some(&path), format!("  {name}"))
                     .clicked()
-                {
-                    self.open(path);
-                }
+            {
+                self.open(path);
             }
         }
     }
@@ -208,18 +207,17 @@ impl eframe::App for App {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("RustBridge");
                 ui.separator();
-                if ui.button("Open .rs").clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
+                if ui.button("Open .rs").clicked()
+                    && let Some(p) = rfd::FileDialog::new()
                         .add_filter("Rust", &["rs"])
                         .pick_file()
-                    {
-                        self.open(p);
-                    }
+                {
+                    self.open(p);
                 }
-                if ui.button("Open folder").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                        self.root = Some(p);
-                    }
+                if ui.button("Open folder").clicked()
+                    && let Some(p) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.root = Some(p);
                 }
                 ui.separator();
                 for (mode, label) in [

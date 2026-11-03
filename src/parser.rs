@@ -91,19 +91,19 @@ fn visit(node: Node<'_>, src: &str, lines: &mut [String], notes: &mut Vec<Note>)
     if row < lines.len() {
         match kind {
             "struct" => {
-                if let Some(name) = node.child_by_field_name("name") {
-                    if let Ok(name) = name.utf8_text(src.as_bytes()) {
-                        lines[row] =
-                            format!("class {name} {{ // Rust struct; educational approximation");
-                    }
+                if let Some(name) = node.child_by_field_name("name")
+                    && let Ok(name) = name.utf8_text(src.as_bytes())
+                {
+                    lines[row] =
+                        format!("class {name} {{ // Rust struct; educational approximation");
                 }
             }
             "trait" => {
-                if let Some(name) = node.child_by_field_name("name") {
-                    if let Ok(name) = name.utf8_text(src.as_bytes()) {
-                        lines[row] =
-                            format!("interface {name} {{ // Rust trait; educational approximation");
-                    }
+                if let Some(name) = node.child_by_field_name("name")
+                    && let Ok(name) = name.utf8_text(src.as_bytes())
+                {
+                    lines[row] =
+                        format!("interface {name} {{ // Rust trait; educational approximation");
                 }
             }
             "impl" => lines[row] = format!("// impl (Rust methods): {}", lines[row].trim()),
