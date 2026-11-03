@@ -208,6 +208,7 @@ impl Collector<'_> {
                 "A reference borrows a value; the borrow checker prevents invalid lifetimes and conflicting mutable access."),
             "macro_invocation" => {
                 // Intentionally keep macro syntax unchanged: expansion needs compiler semantics.
+                return;
             }
             _ => {}
         }
@@ -292,23 +293,19 @@ fn shifted(value: usize, offset: isize) -> usize {
         .expect("valid projection offset")
 }
 
-fn map_span(span: ByteSpan, edits: &[Edit]) -> Option<ByteSpan> {
-    let mut delta = 0_isize;
-    for edit in edits {
-        if edit.rust.end <= span.start {
-            delta += edit.replacement.len() as isize - edit.rust.len() as isize;
-        } else if edit.rust.start >= span.end {
-            break;
-        } else if edit.rust == span {
-            let start = shifted(span.start, delta);
-            return Some(ByteSpan {
-                start,
-                end: start + edit.replacement.len(),
-            });
-        } else {
+fn map_span(span: ByteSpan, edits: &[Edit], offsets: &[isize]) -> Option<ByteSpan> {
+    let index = edits.partition_point(|edit| edit.rust.end <= span.start);
+    let delta = offsets[index];
+    if let Some(edit) = edits.get(index).filter(|edit| edit.rust.start < span.end) {
+        if edit.rust != span {
             // Never present a partial or overlapping rewrite as a precise source map.
             return None;
         }
+        let start = shifted(span.start, delta);
+        return Some(ByteSpan {
+            start,
+            end: start + edit.replacement.len(),
+        });
     }
     Some(ByteSpan {
         start: shifted(span.start, delta),
@@ -381,11 +378,19 @@ pub fn project(source: &str) -> Projection {
         }
     }
     let java = apply_edits(source, &non_overlapping);
+    let mut offsets = Vec::with_capacity(non_overlapping.len() + 1);
+    offsets.push(0);
+    for edit in &non_overlapping {
+        offsets.push(
+            offsets.last().copied().unwrap_or(0) + edit.replacement.len() as isize
+                - edit.rust.len() as isize,
+        );
+    }
     let rust_lines = line_starts(source);
     let java_lines = line_starts(&java);
     let mut anchors = Vec::new();
     for draft in collector.drafts {
-        if let Some(projected) = map_span(draft.rust, &non_overlapping) {
+        if let Some(projected) = map_span(draft.rust, &non_overlapping, &offsets) {
             anchors.push(Anchor {
                 rust: draft.rust,
                 java: projected,
@@ -484,6 +489,8 @@ mod tests {
         assert!(p.java.contains("'a"));
         assert_links(src);
         assert!(project("fn broken( {").warning);
+        let macro_source = "custom! { fn example() { let value: Option<i32> = None; } }";
+        assert_eq!(project(macro_source).java, macro_source);
     }
 
     #[test]

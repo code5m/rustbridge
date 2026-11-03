@@ -29,6 +29,8 @@ struct App {
     scroll_follow: Option<(bool, f32)>,
     last_scroll: Option<(f32, f32)>,
     dirty: bool,
+    saved_source: String,
+    confirm_close: bool,
     status: String,
 }
 
@@ -39,6 +41,7 @@ impl Default for App {
             root: None,
             file: None,
             projection: parser::project(&rust),
+            saved_source: rust.clone(),
             rust,
             mode: Mode::Java,
             lesson: 0,
@@ -48,6 +51,7 @@ impl Default for App {
             scroll_follow: None,
             last_scroll: None,
             dirty: false,
+            confirm_close: false,
             status: "Java view is an AST-aligned teaching aid, not compilable Java.".into(),
         }
     }
@@ -61,6 +65,7 @@ impl App {
         }
         match fs::read_to_string(&path) {
             Ok(text) => {
+                self.saved_source = text.clone();
                 self.rust = text;
                 self.projection = parser::project(&self.rust);
                 self.file = Some(path);
@@ -77,9 +82,10 @@ impl App {
 
     fn save(&mut self) {
         match &self.file {
-            Some(path) => match fs::write(path, &self.rust) {
+            Some(path) => match save_if_unchanged(path, &self.saved_source, &self.rust) {
                 Ok(()) => {
                     self.dirty = false;
+                    self.saved_source.clone_from(&self.rust);
                     self.status = "Saved original Rust source".into();
                 }
                 Err(error) => self.status = format!("Save failed: {error}"),
@@ -281,7 +287,7 @@ impl App {
             ui.fonts_mut(|fonts| fonts.layout_job(job))
         };
         let mut output = egui::TextEdit::multiline(&mut self.rust)
-            .id_salt("rust_source_editor")
+            .id_salt(("rust_source_editor", &self.file))
             .font(egui::TextStyle::Monospace)
             .code_editor()
             .desired_width(f32::INFINITY)
@@ -289,7 +295,7 @@ impl App {
             .show(ui);
         if output.response.changed() {
             self.projection = parser::project(&self.rust);
-            self.dirty = true;
+            self.dirty = self.rust != self.saved_source;
             self.selected = None;
             self.status = "Source edited; AST source map rebuilt.".into();
         }
@@ -443,6 +449,35 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+        if self.confirm_close {
+            egui::Window::new("Unsaved changes")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Your changes have not been saved.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Save and close").clicked() {
+                            self.save();
+                            if !self.dirty {
+                                self.confirm_close = false;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        }
+                        if ui.button("Discard and close").clicked() {
+                            self.dirty = false;
+                            self.confirm_close = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_close = false;
+                        }
+                    });
+                });
+        }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             self.save();
         }
@@ -548,6 +583,16 @@ impl eframe::App for App {
     }
 }
 
+fn save_if_unchanged(path: &Path, expected: &str, text: &str) -> std::io::Result<()> {
+    let current = fs::read_to_string(path)?;
+    if current != expected {
+        return Err(std::io::Error::other(
+            "File changed externally; save blocked to protect both versions. Copy your edits before reopening.",
+        ));
+    }
+    fs::write(path, text)
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -563,4 +608,23 @@ fn main() -> eframe::Result {
             Ok(Box::<App>::default())
         }),
     )
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    #[test]
+    fn external_changes_and_deletion_block_save() {
+        let path =
+            std::env::temp_dir().join(format!("rustbridge-save-test-{}", std::process::id()));
+        fs::write(&path, "original").unwrap();
+        save_if_unchanged(&path, "original", "edited").unwrap();
+        fs::write(&path, "external").unwrap();
+        assert!(save_if_unchanged(&path, "edited", "mine").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+        fs::remove_file(&path).unwrap();
+        assert!(save_if_unchanged(&path, "edited", "mine").is_err());
+        assert!(!path.exists());
+    }
 }
