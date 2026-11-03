@@ -158,6 +158,7 @@ struct App {
     editor_query: String,
     editor_find: Option<parser::ByteSpan>,
     editor_jump: Option<parser::ByteSpan>,
+    lesson_return: Option<(Mode, Option<usize>)>,
     status: String,
 }
 
@@ -193,6 +194,7 @@ impl Default for App {
             editor_query: String::new(),
             editor_find: None,
             editor_jump: None,
+            lesson_return: None,
             status: "Java view is an AST-aligned teaching aid, not compilable Java.".into(),
         }
     }
@@ -621,7 +623,17 @@ impl App {
             columns[1].monospace(lesson.rust_code);
         });
         ui.separator();
+        ui.strong("Common mistake");
+        ui.label(lesson.common_mistake);
+        ui.separator();
         ui.horizontal(|ui| {
+            if let Some((mode, anchor)) = self.lesson_return
+                && ui.button("← Back to code").clicked()
+            {
+                self.mode = mode;
+                self.jump_to = anchor;
+                self.lesson_return = None;
+            }
             if ui
                 .add_enabled(self.lesson > 0, egui::Button::new("← Previous"))
                 .clicked()
@@ -688,6 +700,7 @@ impl App {
                 if let Some(lesson) = Self::lesson_for_topic(anchor.topic)
                     && ui.button("Open lesson").clicked()
                 {
+                    self.lesson_return = Some((self.mode, Some(idx)));
                     self.lesson = lesson;
                     self.mode = Mode::Learn;
                 }
@@ -1061,6 +1074,15 @@ mod file_tests {
         let option = App::lesson_for_topic("Option<T> ↔ Optional<T>").unwrap();
         assert_eq!(lessons::LESSONS[option].rust, "Option<T>");
         assert!(App::lesson_for_topic("Rust symbol occurrence").is_none());
+    }
+
+    #[test]
+    fn every_lesson_has_a_common_mistake() {
+        assert!(
+            lessons::LESSONS
+                .iter()
+                .all(|lesson| !lesson.common_mistake.is_empty())
+        );
     }
 
     #[test]
