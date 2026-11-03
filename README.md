@@ -76,8 +76,10 @@ Text transforms never reorder source statements or insert/remove newlines, prese
 
 ## Still outside v0.2
 
-- `rust-analyzer` integration and cross-file symbol resolution are not yet provided.
-  The local executable is optional; its absence must never affect core reading or editing.
+- **Optional rust-analyzer check:** the sidebar can check `rust-analyzer --version` in
+  the background. It never starts an LSP session, and diagnostics, completion and
+  go-to-definition are still outside the current scope. The executable is optional;
+  its absence never affects core reading or editing.
 - No debugging, Rust build/run actions for opened projects, installation bundles, plugin marketplace, or full IDE replacement.
 - No complete Java syntax conversion. Java view is intentionally partial and read-only.
 - Native window launches are smoke-tested separately; manual interaction review remains necessary for each desktop environment.
