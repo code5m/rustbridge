@@ -218,6 +218,10 @@ impl Collector<'_> {
             }
             "reference_type" => self.keyword(node, "&", None, "Reference and borrowing",
                 "A reference borrows a value; the borrow checker prevents invalid lifetimes and conflicting mutable access."),
+            "reference_expression" => self.keyword(node, "&", None, "Reference and borrowing",
+                "This expression borrows an existing value. The value remains owned elsewhere, and Rust enforces aliasing rules."),
+            "closure_expression" => self.keyword(node, "move", None, "move closure capture",
+                "A move closure captures used values by ownership. This differs from Java lambda capture and can make the original binding unavailable."),
             _ => {}
         }
 
@@ -541,6 +545,21 @@ mod tests {
                 .iter()
                 .any(|anchor| anchor.topic == "Iterator pipeline")
         );
+        assert_links(src);
+    }
+
+    #[test]
+    fn borrowing_and_move_closures_are_precisely_anchored() {
+        let src = "fn main() { let text = String::from(\"x\"); let borrowed = &text; let task = move || text.len(); }";
+        let projection = project(src);
+        assert!(projection.anchors.iter().any(|anchor| {
+            anchor.topic == "Reference and borrowing"
+                && &src[anchor.rust.start..anchor.rust.end] == "&"
+        }));
+        assert!(projection.anchors.iter().any(|anchor| {
+            anchor.topic == "move closure capture"
+                && &src[anchor.rust.start..anchor.rust.end] == "move"
+        }));
         assert_links(src);
     }
 

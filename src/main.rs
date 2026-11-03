@@ -530,7 +530,7 @@ impl App {
             "Result<T,E> ↔ explicit errors" => "Result<T,E>",
             "Vec<T> ↔ ArrayList<T>" => "Vec<T>",
             "HashMap<K,V> ↔ Map<K,V>" => "HashMap<K,V>",
-            "Reference and borrowing" => "Ownership + Borrowing",
+            "Reference and borrowing" | "move closure capture" => "Ownership + Borrowing",
             _ => return None,
         };
         lessons::LESSONS
@@ -1293,6 +1293,8 @@ mod file_tests {
     fn known_ast_topics_open_the_matching_lesson() {
         let option = App::lesson_for_topic("Option<T> ↔ Optional<T>").unwrap();
         assert_eq!(lessons::LESSONS[option].rust, "Option<T>");
+        let closure = App::lesson_for_topic("move closure capture").unwrap();
+        assert_eq!(lessons::LESSONS[closure].rust, "Ownership + Borrowing");
         assert!(App::lesson_for_topic("Rust symbol occurrence").is_none());
     }
 
