@@ -173,6 +173,16 @@ impl Collector<'_> {
     }
 
     fn walk(&mut self, node: Node<'_>) {
+        if node.is_error() || node.is_missing() || node.kind() == "macro_invocation" {
+            return;
+        }
+        if node.has_error() {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                self.walk(child);
+            }
+            return;
+        }
         match node.kind() {
             "struct_item" => {
                 self.keyword(node, "struct", Some("class"), "class ↔ struct",
@@ -206,10 +216,6 @@ impl Collector<'_> {
             }
             "reference_type" => self.keyword(node, "&", None, "Reference and borrowing",
                 "A reference borrows a value; the borrow checker prevents invalid lifetimes and conflicting mutable access."),
-            "macro_invocation" => {
-                // Intentionally keep macro syntax unchanged: expansion needs compiler semantics.
-                return;
-            }
             _ => {}
         }
 
