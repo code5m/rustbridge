@@ -1,5 +1,6 @@
 mod analyzer;
 mod code_view;
+mod file_search_worker;
 mod lessons;
 mod parser;
 mod projection_worker;
@@ -154,6 +155,9 @@ struct App {
     show_excluded: bool,
     file_query: String,
     search_results: Vec<PathBuf>,
+    file_search_worker: Option<file_search_worker::FileSearchWorker>,
+    file_search_revision: u64,
+    file_search_pending: bool,
     recent_files: Vec<PathBuf>,
     disk_stamp: Option<FileStamp>,
     external_change: bool,
@@ -194,6 +198,9 @@ impl Default for App {
             show_excluded: false,
             file_query: String::new(),
             search_results: Vec::new(),
+            file_search_worker: None,
+            file_search_revision: 0,
+            file_search_pending: false,
             recent_files: Vec::new(),
             disk_stamp: None,
             external_change: false,
@@ -311,13 +318,32 @@ impl App {
     }
 
     fn refresh_file_search(&mut self) {
+        self.file_search_revision += 1;
         self.search_results.clear();
         let Some(root) = self.root.clone() else {
+            self.file_search_pending = false;
             return;
         };
         let query = self.file_query.trim().to_lowercase();
-        if !query.is_empty() {
-            self.find_rust_files(&root, &query, 0);
+        if query.is_empty() {
+            self.file_search_pending = false;
+            return;
+        }
+        self.file_search_pending = true;
+        self.file_search_worker
+            .get_or_insert_with(file_search_worker::FileSearchWorker::new)
+            .submit(self.file_search_revision, root, query, self.show_excluded);
+    }
+
+    fn update_file_search_results(&mut self) {
+        if let Some((revision, results)) = self
+            .file_search_worker
+            .as_ref()
+            .and_then(|worker| worker.take())
+            && revision == self.file_search_revision
+        {
+            self.search_results = results;
+            self.file_search_pending = false;
         }
     }
 
@@ -328,34 +354,6 @@ impl App {
         self.recent_files.retain(|recent| recent != &path);
         self.recent_files.insert(0, path);
         self.recent_files.truncate(8);
-    }
-
-    fn find_rust_files(&mut self, dir: &Path, query: &str, depth: usize) {
-        if depth > 12 || self.search_results.len() >= 100 {
-            return;
-        }
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if self.search_results.len() >= 100 {
-                break;
-            }
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if path.is_dir() {
-                if !self.show_excluded
-                    && [".git", "target", "node_modules"].contains(&name.as_str())
-                {
-                    continue;
-                }
-                self.find_rust_files(&path, query, depth + 1);
-            } else if path.extension().is_some_and(|extension| extension == "rs")
-                && name.to_lowercase().contains(query)
-            {
-                self.search_results.push(path);
-            }
-        }
     }
 
     fn check_external_change(&mut self) {
@@ -801,6 +799,7 @@ impl eframe::App for App {
             self.projection_pending = false;
             self.status = "Reading projection updated.".into();
         }
+        self.update_file_search_results();
         if let Some(result) = self
             .analyzer_check
             .as_ref()
@@ -809,7 +808,7 @@ impl eframe::App for App {
             self.analyzer_status = result;
             self.analyzer_check = None;
         }
-        if self.projection_pending {
+        if self.projection_pending || self.file_search_pending {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty {
@@ -943,10 +942,14 @@ impl eframe::App for App {
                         "No Cargo.toml at this directory root"
                     });
                     if !self.file_query.trim().is_empty() {
-                        ui.small(format!(
-                            "{} result(s), limited to 100",
-                            self.search_results.len()
-                        ));
+                        if self.file_search_pending {
+                            ui.small("Searching project files in the background…");
+                        } else {
+                            ui.small(format!(
+                                "{} result(s), limited to 100",
+                                self.search_results.len()
+                            ));
+                        }
                         let results = self.search_results.clone();
                         egui::ScrollArea::vertical()
                             .max_height(180.)
@@ -1127,11 +1130,49 @@ mod file_tests {
             ..App::default()
         };
         app.refresh_file_search();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.file_search_pending {
+            app.update_file_search_results();
+            assert!(
+                deadline > std::time::Instant::now(),
+                "file search did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(app.search_results, vec![root.join("src/demo.rs")]);
         app.show_excluded = true;
         app.file_query = "generated".into();
         app.refresh_file_search();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.file_search_pending {
+            app.update_file_search_results();
+            assert!(
+                deadline > std::time::Instant::now(),
+                "file search did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(app.search_results, vec![root.join("target/generated.rs")]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clearing_file_search_discards_an_older_result() {
+        let root =
+            std::env::temp_dir().join(format!("rustbridge-clear-search-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("demo.rs"), "fn demo() {}").unwrap();
+        let mut app = App {
+            root: Some(root.clone()),
+            file_query: "demo".into(),
+            ..App::default()
+        };
+        app.refresh_file_search();
+        app.file_query.clear();
+        app.refresh_file_search();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        app.update_file_search_results();
+        assert!(app.search_results.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
