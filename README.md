@@ -76,9 +76,10 @@ Text transforms never reorder source statements or insert/remove newlines, prese
 
 ## Still outside v0.2
 
-- **Optional rust-analyzer check:** the sidebar can check `rust-analyzer --version` in
-  the background. It never starts an LSP session, and diagnostics, completion and
-  go-to-definition are still outside the current scope. The executable is optional;
+- **Optional rust-analyzer diagnostics:** the sidebar can check availability and, on
+  demand, run its bounded, cancellable `diagnostics` command for an opened Cargo project.
+  Build scripts and proc macros are disabled for this check. It never starts an LSP session;
+  completion and go-to-definition remain outside the current scope. The executable is optional;
   its absence never affects core reading or editing.
 - No debugging, Rust build/run actions for opened projects, installation bundles, plugin marketplace, or full IDE replacement.
 - No complete Java syntax conversion. Java view is intentionally partial and read-only.
