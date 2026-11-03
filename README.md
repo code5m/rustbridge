@@ -16,6 +16,9 @@ RustBridge is written in Rust (egui/eframe + Tree-sitter). There is no JVM, Elec
 - **Rust Source:** edit the actual file. Clicking a token shows its explanation; jumping from the guide selects that token in the editor. Save with Ctrl+S.
 - **Linked scroll:** optionally follow scrolling across compare panes, including wheel and scrollbar changes.
 - **Real filesystem:** open `.rs` files and explore the actual Cargo project tree; do not hide, replace or synthesize source directories.
+- **Project navigation:** search real Rust filenames, show why `.git`, `target` and `node_modules` are excluded by default, and opt in to see them when needed.
+- **Safe editing:** saving refuses to overwrite a file changed or removed outside RustBridge; switching files and closing with edits require an explicit save, discard or cancel choice.
+- **Responsive projection:** edits are debounced and projected on one on-demand worker. Older results are discarded, so an outdated source map is never applied to newer text.
 - **Learn:** 12 paged Java 8 ↔ Rust language concepts, with short code examples.
 - **Conservative syntax handling:** Tree-sitter AST recognition, no automatic macro expansion, warnings on malformed syntax; unrecognized Rust syntax stays Rust.
 - **Large-file support:** visible-row rendering and per-line indexed AST links, without scanning the entire AST for every visible line.
@@ -42,6 +45,18 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
+## Performance and limits
+
+Measured observations, machine details and the exact benchmark method are in
+[docs/performance-baseline.md](docs/performance-baseline.md). They deliberately
+separate real measurements from unverified claims: the native window was started on
+Linux, but the available desktop automation could not attach to it, so the document
+does not claim a completed visual interaction review.
+
+File-name search is bounded to 100 matching Rust files and depth 12. The tree is
+bounded to 180 entries per expanded directory and depth 8. These bounds keep a large
+project from freezing the UI; a fuller project index remains future work.
+
 ## Architecture
 
 | Path | Responsibility |
@@ -61,7 +76,8 @@ Text transforms never reorder source statements or insert/remove newlines, prese
 
 ## Still outside v0.2
 
-- No rust-analyzer or cross-file symbol resolution (planned as optional, on-demand feature).
+- `rust-analyzer` integration and cross-file symbol resolution are not yet provided.
+  The local executable is optional; its absence must never affect core reading or editing.
 - No debugging, Rust build/run actions for opened projects, installation bundles, plugin marketplace, or full IDE replacement.
 - No complete Java syntax conversion. Java view is intentionally partial and read-only.
 - Native window launches are smoke-tested separately; manual interaction review remains necessary for each desktop environment.

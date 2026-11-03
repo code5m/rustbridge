@@ -1,6 +1,7 @@
 mod code_view;
 mod lessons;
 mod parser;
+mod projection_worker;
 
 use eframe::egui::{self, Color32};
 use std::{
@@ -21,6 +22,10 @@ struct App {
     file: Option<PathBuf>,
     rust: String,
     projection: parser::Projection,
+    worker: Option<projection_worker::ProjectionWorker>,
+    revision: u64,
+    projection_pending: bool,
+    projection_due: Option<std::time::Instant>,
     mode: Mode,
     lesson: usize,
     selected: Option<usize>,
@@ -29,6 +34,12 @@ struct App {
     scroll_follow: Option<(bool, f32)>,
     last_scroll: Option<(f32, f32)>,
     dirty: bool,
+    saved_source: String,
+    confirm_close: bool,
+    pending_open: Option<PathBuf>,
+    show_excluded: bool,
+    file_query: String,
+    search_results: Vec<PathBuf>,
     status: String,
 }
 
@@ -39,6 +50,11 @@ impl Default for App {
             root: None,
             file: None,
             projection: parser::project(&rust),
+            worker: None,
+            revision: 0,
+            projection_pending: false,
+            projection_due: None,
+            saved_source: rust.clone(),
             rust,
             mode: Mode::Java,
             lesson: 0,
@@ -48,6 +64,11 @@ impl Default for App {
             scroll_follow: None,
             last_scroll: None,
             dirty: false,
+            confirm_close: false,
+            pending_open: None,
+            show_excluded: false,
+            file_query: String::new(),
+            search_results: Vec::new(),
             status: "Java view is an AST-aligned teaching aid, not compilable Java.".into(),
         }
     }
@@ -56,13 +77,19 @@ impl Default for App {
 impl App {
     fn open(&mut self, path: PathBuf) {
         if self.dirty {
-            self.status = "Save your changes before switching files.".into();
+            self.pending_open = Some(path);
             return;
         }
+        self.open_file(path);
+    }
+
+    fn open_file(&mut self, path: PathBuf) {
         match fs::read_to_string(&path) {
             Ok(text) => {
+                self.saved_source = text.clone();
                 self.rust = text;
-                self.projection = parser::project(&self.rust);
+                self.dirty = false;
+                self.update_projection();
                 self.file = Some(path);
                 self.selected = None;
                 self.jump_to = None;
@@ -75,11 +102,21 @@ impl App {
         }
     }
 
+    fn update_projection(&mut self) {
+        self.revision += 1;
+        self.projection_pending = true;
+        self.selected = None;
+        self.jump_to = None;
+        self.projection_due =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
+    }
+
     fn save(&mut self) {
         match &self.file {
-            Some(path) => match fs::write(path, &self.rust) {
+            Some(path) => match save_if_unchanged(path, &self.saved_source, &self.rust) {
                 Ok(()) => {
                     self.dirty = false;
+                    self.saved_source.clone_from(&self.rust);
                     self.status = "Saved original Rust source".into();
                 }
                 Err(error) => self.status = format!("Save failed: {error}"),
@@ -92,16 +129,30 @@ impl App {
         if depth > 7 {
             return;
         }
-        let Ok(dir_entries) = fs::read_dir(dir) else {
-            return;
+        let dir_entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                ui.colored_label(Color32::YELLOW, format!("Cannot read folder: {error}"));
+                return;
+            }
         };
-        let mut entries: Vec<_> = dir_entries.flatten().collect();
+        let mut entries = Vec::new();
+        for entry in dir_entries {
+            match entry {
+                Ok(entry) => entries.push(entry),
+                Err(error) => {
+                    ui.colored_label(Color32::YELLOW, format!("Cannot read entry: {error}"));
+                }
+            }
+        }
         entries.sort_by_key(|entry| (!entry.path().is_dir(), entry.file_name()));
         for entry in entries.into_iter().take(180) {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             if path.is_dir() {
-                if [".git", "target", "node_modules"].contains(&name.as_str()) {
+                if !self.show_excluded
+                    && [".git", "target", "node_modules"].contains(&name.as_str())
+                {
                     continue;
                 }
                 egui::CollapsingHeader::new(format!("▸ {name}"))
@@ -113,6 +164,45 @@ impl App {
                     .clicked()
             {
                 self.open(path);
+            }
+        }
+    }
+
+    fn refresh_file_search(&mut self) {
+        self.search_results.clear();
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let query = self.file_query.trim().to_lowercase();
+        if !query.is_empty() {
+            self.find_rust_files(&root, &query, 0);
+        }
+    }
+
+    fn find_rust_files(&mut self, dir: &Path, query: &str, depth: usize) {
+        if depth > 12 || self.search_results.len() >= 100 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if self.search_results.len() >= 100 {
+                break;
+            }
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if !self.show_excluded
+                    && [".git", "target", "node_modules"].contains(&name.as_str())
+                {
+                    continue;
+                }
+                self.find_rust_files(&path, query, depth + 1);
+            } else if path.extension().is_some_and(|extension| extension == "rs")
+                && name.to_lowercase().contains(query)
+            {
+                self.search_results.push(path);
             }
         }
     }
@@ -135,6 +225,22 @@ impl App {
                 self.mode = Mode::Compare;
             }
         }
+    }
+
+    fn lesson_for_topic(topic: &str) -> Option<usize> {
+        let rust = match topic {
+            "class ↔ struct" | "Struct declaration" => "struct + impl",
+            "interface ↔ trait" | "Trait declaration" => "trait",
+            "Option<T> ↔ Optional<T>" => "Option<T>",
+            "Result<T,E> ↔ explicit errors" => "Result<T,E>",
+            "Vec<T> ↔ ArrayList<T>" => "Vec<T>",
+            "HashMap<K,V> ↔ Map<K,V>" => "HashMap<K,V>",
+            "Reference and borrowing" => "Ownership + Borrowing",
+            _ => return None,
+        };
+        lessons::LESSONS
+            .iter()
+            .position(|lesson| lesson.rust == rust)
     }
 
     fn read_only(&mut self, ui: &mut egui::Ui, java: bool) {
@@ -281,19 +387,20 @@ impl App {
             ui.fonts_mut(|fonts| fonts.layout_job(job))
         };
         let mut output = egui::TextEdit::multiline(&mut self.rust)
-            .id_salt("rust_source_editor")
+            .id_salt(("rust_source_editor", &self.file))
             .font(egui::TextStyle::Monospace)
             .code_editor()
             .desired_width(f32::INFINITY)
             .layouter(&mut layouter)
             .show(ui);
         if output.response.changed() {
-            self.projection = parser::project(&self.rust);
-            self.dirty = true;
+            self.update_projection();
+            self.dirty = self.rust != self.saved_source;
             self.selected = None;
-            self.status = "Source edited; AST source map rebuilt.".into();
+            self.status = "Source edited; updating the reading projection.".into();
         }
-        if output.response.clicked()
+        if !self.projection_pending
+            && output.response.clicked()
             && let Some(cursor) = output.cursor_range
         {
             let byte = parser::char_to_byte(&self.rust, cursor.primary.index);
@@ -327,12 +434,14 @@ impl App {
             lesson.java,
             lesson.rust
         ));
+        ui.strong("Key difference");
         ui.label(lesson.why);
+        ui.small("Examples are teaching sketches. Check the real Rust source and compiler before treating them as production code.");
         ui.separator();
         ui.columns(2, |columns| {
-            columns[0].heading("Java 8");
+            columns[0].heading("Java 8 mental model");
             columns[0].monospace(lesson.java_code);
-            columns[1].heading("Rust");
+            columns[1].heading("Rust example");
             columns[1].monospace(lesson.rust_code);
         });
         ui.separator();
@@ -359,6 +468,10 @@ impl App {
         ui.heading("AST correspondence");
         ui.small("Precise token spans · syntax-level, not symbol resolution");
         ui.separator();
+        if self.projection_pending {
+            ui.label("Updating projection; links are temporarily unavailable.");
+            return;
+        }
         if self.projection.warning {
             ui.colored_label(
                 Color32::YELLOW,
@@ -396,6 +509,12 @@ impl App {
                     self.mode = Mode::Rust;
                     self.jump_to = Some(idx);
                 }
+                if let Some(lesson) = Self::lesson_for_topic(anchor.topic)
+                    && ui.button("Open lesson").clicked()
+                {
+                    self.lesson = lesson;
+                    self.mode = Mode::Learn;
+                }
             });
         } else {
             ui.label(
@@ -432,6 +551,10 @@ impl App {
     }
 
     fn body(&mut self, ui: &mut egui::Ui) {
+        if self.projection_pending && matches!(self.mode, Mode::Java | Mode::Compare) {
+            ui.label("Updating projection in the background…");
+            return;
+        }
         match self.mode {
             Mode::Java => self.read_only(ui, true),
             Mode::Rust => self.editor(ui),
@@ -443,6 +566,78 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self
+            .projection_due
+            .is_some_and(|due| std::time::Instant::now() >= due)
+        {
+            self.projection_due = None;
+            self.worker
+                .get_or_insert_with(projection_worker::ProjectionWorker::new)
+                .submit(self.revision, self.rust.clone());
+        }
+        if let Some((revision, projection)) = self.worker.as_ref().and_then(|worker| worker.take())
+            && revision == self.revision
+        {
+            self.projection = projection;
+            self.projection_pending = false;
+            self.status = "Reading projection updated.".into();
+        }
+        if self.projection_pending {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm_close = true;
+        }
+        if self.confirm_close {
+            egui::Modal::new(egui::Id::new("confirm_close")).show(ctx, |ui| {
+                ui.heading("Unsaved changes");
+                ui.label("Your changes have not been saved.");
+                ui.label(&self.status);
+                ui.horizontal(|ui| {
+                    if ui.button("Save and close").clicked() {
+                        self.save();
+                        if !self.dirty {
+                            self.confirm_close = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                    if ui.button("Discard and close").clicked() {
+                        self.dirty = false;
+                        self.confirm_close = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_close = false;
+                    }
+                });
+            });
+        }
+        if self.pending_open.is_some() && !self.confirm_close {
+            egui::Modal::new(egui::Id::new("confirm_open")).show(ctx, |ui| {
+                ui.heading("Switch file with unsaved changes");
+                ui.label("Save or discard your edits before switching files.");
+                ui.label(&self.status);
+                ui.horizontal(|ui| {
+                    if ui.button("Save and open").clicked() {
+                        self.save();
+                        if !self.dirty
+                            && let Some(path) = self.pending_open.take()
+                        {
+                            self.open(path);
+                        }
+                    }
+                    if ui.button("Discard and open").clicked()
+                        && let Some(path) = self.pending_open.take()
+                    {
+                        self.open_file(path);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.pending_open = None;
+                    }
+                });
+            });
+        }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             self.save();
         }
@@ -461,6 +656,7 @@ impl eframe::App for App {
                     && let Some(folder) = rfd::FileDialog::new().pick_folder()
                 {
                     self.root = Some(folder);
+                    self.refresh_file_search();
                 }
                 ui.separator();
                 for (mode, label) in [
@@ -486,9 +682,50 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.heading("Real project files");
                 ui.small("Filesystem truth; .rs filter");
+                let excluded_changed = ui
+                    .checkbox(
+                        &mut self.show_excluded,
+                        "Show .git, target and node_modules",
+                    )
+                    .changed();
+                ui.small("At most 180 entries per folder; maximum depth 8.");
+                let changed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.file_query)
+                            .hint_text("Find Rust file…"),
+                    )
+                    .changed();
+                if changed || excluded_changed {
+                    self.refresh_file_search();
+                }
                 ui.separator();
                 if let Some(root) = self.root.clone() {
                     ui.strong(root.file_name().unwrap_or_default().to_string_lossy());
+                    if !self.file_query.trim().is_empty() {
+                        ui.small(format!(
+                            "{} result(s), limited to 100",
+                            self.search_results.len()
+                        ));
+                        let results = self.search_results.clone();
+                        egui::ScrollArea::vertical()
+                            .max_height(180.)
+                            .show(ui, |ui| {
+                                for path in results {
+                                    let label = path
+                                        .strip_prefix(&root)
+                                        .unwrap_or(&path)
+                                        .display()
+                                        .to_string();
+                                    if ui
+                                        .selectable_label(self.file.as_ref() == Some(&path), label)
+                                        .clicked()
+                                    {
+                                        self.open(path);
+                                    }
+                                }
+                            });
+                        ui.separator();
+                    }
                     egui::ScrollArea::vertical()
                         .max_height(300.)
                         .show(ui, |ui| self.directory(ui, &root, 0));
@@ -548,6 +785,16 @@ impl eframe::App for App {
     }
 }
 
+fn save_if_unchanged(path: &Path, expected: &str, text: &str) -> std::io::Result<()> {
+    let current = fs::read_to_string(path)?;
+    if current != expected {
+        return Err(std::io::Error::other(
+            "File changed externally; save blocked to protect both versions. Copy your edits before reopening.",
+        ));
+    }
+    fs::write(path, text)
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -563,4 +810,65 @@ fn main() -> eframe::Result {
             Ok(Box::<App>::default())
         }),
     )
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    #[test]
+    fn external_changes_and_deletion_block_save() {
+        let path =
+            std::env::temp_dir().join(format!("rustbridge-save-test-{}", std::process::id()));
+        fs::write(&path, "original").unwrap();
+        save_if_unchanged(&path, "original", "edited").unwrap();
+        fs::write(&path, "external").unwrap();
+        assert!(save_if_unchanged(&path, "edited", "mine").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+        fs::remove_file(&path).unwrap();
+        assert!(save_if_unchanged(&path, "edited", "mine").is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn failed_discard_and_open_keeps_unsaved_buffer() {
+        let mut app = App::default();
+        app.rust.push_str("\n// unsaved");
+        app.dirty = true;
+        let previous = app.rust.clone();
+        let missing =
+            std::env::temp_dir().join(format!("rustbridge-missing-{}", std::process::id()));
+        app.open_file(missing);
+        assert!(app.dirty);
+        assert_eq!(app.rust, previous);
+        assert!(app.status.starts_with("Open failed:"));
+    }
+
+    #[test]
+    fn file_search_uses_real_paths_and_skips_build_output_by_default() {
+        let root = std::env::temp_dir().join(format!("rustbridge-search-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("src/demo.rs"), "fn demo() {}").unwrap();
+        fs::write(root.join("target/generated.rs"), "fn generated() {}").unwrap();
+        let mut app = App {
+            root: Some(root.clone()),
+            file_query: "demo".into(),
+            ..App::default()
+        };
+        app.refresh_file_search();
+        assert_eq!(app.search_results, vec![root.join("src/demo.rs")]);
+        app.show_excluded = true;
+        app.file_query = "generated".into();
+        app.refresh_file_search();
+        assert_eq!(app.search_results, vec![root.join("target/generated.rs")]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn known_ast_topics_open_the_matching_lesson() {
+        let option = App::lesson_for_topic("Option<T> ↔ Optional<T>").unwrap();
+        assert_eq!(lessons::LESSONS[option].rust, "Option<T>");
+        assert!(App::lesson_for_topic("Rust symbol occurrence").is_none());
+    }
 }
