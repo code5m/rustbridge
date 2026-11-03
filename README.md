@@ -1,38 +1,69 @@
 # RustBridge 🦀☕
 
-**A tiny native Rust IDE for Java 8 developers learning Rust.**
+**一个为 Java 8 开发者设计的极轻量 Rust 学习 IDE。** / A tiny native Rust IDE for Java developers learning Rust.
 
-Rust desktop GUI (egui/eframe), Rust syntax parsing (Tree-sitter), and 12 paired Java/Rust lessons. No JVM, Node.js, Electron, or Chromium runtime.
+RustBridge is written in Rust (egui/eframe + Tree-sitter). There is no JVM, Electron, Chromium, or Node.js runtime.
 
-## Implemented MVP
+> **Important:** The Java view is an educational *mental model*, not compilable Java, a full transpiler, or a proof of semantic equivalence. The real `.rs` file is the only editable source of truth.
 
-- Open real `.rs` files and browse real project folders; Rust files remain the source of truth.
-- Java-inspired default read-only teaching view (partial, approximate, NOT compilable Java).
-- One-click real Rust editor with Save and Ctrl+S.
-- Side-by-side Java teaching projection and Rust source.
-- Twelve paged Java 8 versus Rust lessons.
-- Tree-sitter analysis with line-numbered conceptual hints and syntax-error warning.
-- No automatic execution of project code or external network requests.
+![RustBridge AST-linked Java and Rust comparison](docs/images/rustbridge-linked-compare.png)
 
-## Get started on Ubuntu
+## What works — v0.2
 
-Install Rust with rustup, plus native GUI dependencies for your distribution, then:
+- **Java View (default):** open a real `.rs` file and read a conservative AST-based Java-inspired projection.
+- **Linked Compare:** left Java projection, right actual Rust; click a highlighted method, field, type or keyword in **either** pane to select its exact corresponding AST token occurrence, highlight both, and jump to the same source location.
+- **Semantic guide:** see 1-based Rust / Java line and Unicode-aware column, original/projection token, and Java-to-Rust conceptual explanation.
+- **Rust Source:** edit the actual file. Clicking a token shows its explanation; jumping from the guide selects that token in the editor. Save with Ctrl+S.
+- **Linked scroll:** optionally follow scrolling across compare panes, including wheel and scrollbar changes.
+- **Real filesystem:** open `.rs` files and explore the actual Cargo project tree; do not hide, replace or synthesize source directories.
+- **Learn:** 12 paged Java 8 ↔ Rust language concepts, with short code examples.
+- **Conservative syntax handling:** Tree-sitter AST recognition, no automatic macro expansion, warnings on malformed syntax; unrecognized Rust syntax stays Rust.
+- **Large-file support:** visible-row rendering and per-line indexed AST links, without scanning the entire AST for every visible line.
 
-    cargo run
-    cargo fmt --check
-    cargo check --all-targets
-    cargo test
-    cargo clippy --all-targets
+## Run locally (Ubuntu/Linux)
 
-## Important limitations
+Install the Rust toolchain via https://rustup.rs and native X11 / Wayland graphics development libraries required by eframe. On Ubuntu/Debian:
 
-Java view is an educational partial projection, not a compiler or semantically equivalent translation. Unsupported Rust syntax remains Rust. It does not fully represent ownership, lifetimes, macros or concurrency semantics. Compare panes currently have independent scrolling. Initial code editing is basic; no LSP, debugger, project builds, synchronized symbol jumps or full IDE features yet. Save writes only the actual opened Rust file.
+```bash
+sudo apt-get install -y build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev libx11-xcb-dev libgl1-mesa-dev
+git clone https://github.com/code5m/rustbridge.git
+cd rustbridge
+cargo run
+```
 
-## Structure
+Then choose **Open folder** for a real Cargo project or **Open .rs** for a single Rust file. The Java view opens by default. Click the blue symbols to enter paired comparison. Switch to **Rust Source** when you want to edit and save the original file.
 
-- `src/main.rs`: native UI, editing, file browsing, mode switching
-- `src/parser.rs`: Tree-sitter Rust parsing and educational projection
-- `src/lessons.rs`: 12 Java 8 versus Rust lessons
-- `examples/basics.rs`: demonstration source
+## Validate
 
-MIT licensed. Contributions welcome.
+```bash
+cargo fmt --check
+cargo check --all-targets
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+```
+
+## Architecture
+
+| Path | Responsibility |
+| --- | --- |
+| `src/parser.rs` | Tree-sitter syntax tree, AST occurrence anchors, UTF-8-safe source↔projection span mapping |
+| `src/code_view.rs` | Virtualized read-only line renderer and clickable token spans |
+| `src/main.rs` | Native GUI, file I/O, selection/navigation, scroll linking, Rust editing |
+| `src/lessons.rs` | 12 introductory Java↔Rust lessons |
+| `examples/basics.rs` | Self-contained example |
+| `AGENTS.md` | Design principles, contracts, acceptance criteria |
+
+## Precision and scope
+
+**Precise** means the same *syntactic occurrence* has byte-accurate spans in both views. It does **not** yet mean cross-file definition lookup, type inference, trait resolution, lifetime checking, or macro expansion. Replacements such as `Option` → `Optional` and `Vec` → `ArrayList` are **conventions only** until a semantic resolver is integrated; a user-defined type with the same name may differ. Always check the original Rust and explanatory panel.
+
+Text transforms never reorder source statements or insert/remove newlines, preserving line correspondence. Span maps and Unicode/CRLF handling are unit-tested. Original Rust source is not modified by Java View or Compare.
+
+## Still outside v0.2
+
+- No rust-analyzer or cross-file symbol resolution (planned as optional, on-demand feature).
+- No debugging, Rust build/run actions for opened projects, installation bundles, plugin marketplace, or full IDE replacement.
+- No complete Java syntax conversion. Java view is intentionally partial and read-only.
+- Native window launches are smoke-tested separately; manual interaction review remains necessary for each desktop environment.
+
+MIT licensed. See [CHANGELOG.md](CHANGELOG.md).
