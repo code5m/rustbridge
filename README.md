@@ -17,7 +17,7 @@ RustBridge is written in Rust (egui/eframe + Tree-sitter). There is no JVM, Elec
 - **Linked scroll:** optionally follow scrolling across compare panes, including wheel and scrollbar changes.
 - **Real filesystem:** open `.rs` files and explore the actual Cargo project tree; do not hide, replace or synthesize source directories.
 - **Project navigation:** search real Rust filenames on a cancellable background worker, reopen the eight most recently opened Rust files, show why `.git`, `target` and `node_modules` are excluded by default, and opt in to see them when needed.
-- **Safe editing:** saving refuses to overwrite a file changed or removed outside RustBridge; switching files and closing with edits require an explicit save, discard or cancel choice.
+- **Safe editing:** saving refuses to overwrite a file changed or removed outside RustBridge; a visible reload action restores the disk copy, while switching files and closing with edits require an explicit save, discard or cancel choice.
 - **Responsive projection:** edits are debounced and projected on one on-demand worker. Older results are discarded, so an outdated source map is never applied to newer text.
 - **Learn:** 12 paged Java 8 ↔ Rust language concepts, with short code examples.
 - **Conservative syntax handling:** Tree-sitter AST recognition, no automatic macro expansion, warnings on malformed syntax; unrecognized Rust syntax stays Rust.
