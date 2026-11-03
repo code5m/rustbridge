@@ -131,6 +131,14 @@ fn append_rust_syntax(
     }
 }
 
+fn line_number_gutter(text: &str) -> String {
+    let line_count = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    (1..=line_count)
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 struct App {
     root: Option<PathBuf>,
     cargo_project: bool,
@@ -573,10 +581,10 @@ impl App {
         let cursor_target = jump.or(self.editor_jump.take());
 
         // This is deliberately lexical highlighting only. Tree-sitter remains the source of links.
-        let mut layouter = |ui: &egui::Ui, content: &dyn egui::TextBuffer, width: f32| {
+        let mut layouter = |ui: &egui::Ui, content: &dyn egui::TextBuffer, _width: f32| {
             let text = content.as_str();
             let mut job = egui::text::LayoutJob::default();
-            job.wrap.max_width = width;
+            job.wrap.max_width = f32::INFINITY;
             let font = egui::TextStyle::Monospace.resolve(ui.style());
             let active = active.filter(|span| {
                 span.end <= text.len()
@@ -586,13 +594,29 @@ impl App {
             append_rust_syntax(&mut job, text, &font, ui.visuals().text_color(), active);
             ui.fonts_mut(|fonts| fonts.layout_job(job))
         };
-        let mut output = egui::TextEdit::multiline(&mut self.rust)
-            .id_salt(("rust_source_editor", &self.file))
-            .font(egui::TextStyle::Monospace)
-            .code_editor()
-            .desired_width(f32::INFINITY)
-            .layouter(&mut layouter)
-            .show(ui);
+        let line_numbers = line_number_gutter(&self.rust);
+        let mut output = None;
+        egui::ScrollArea::both()
+            .id_salt(("rust_source_editor_scroll", &self.file))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(line_numbers).monospace().weak())
+                            .selectable(false),
+                    );
+                    output = Some(
+                        egui::TextEdit::multiline(&mut self.rust)
+                            .id_salt(("rust_source_editor", &self.file))
+                            .font(egui::TextStyle::Monospace)
+                            .code_editor()
+                            .desired_width(f32::INFINITY)
+                            .layouter(&mut layouter)
+                            .show(ui),
+                    );
+                });
+            });
+        let mut output = output.expect("Rust source editor always renders");
         if output.response.changed() {
             self.update_projection();
             self.dirty = self.rust != self.saved_source;
@@ -1278,6 +1302,15 @@ mod file_tests {
             job.sections
                 .iter()
                 .any(|section| section.format.background == Color32::from_rgb(53, 103, 155))
+        );
+    }
+
+    #[test]
+    fn line_number_gutter_preserves_physical_lines() {
+        assert_eq!(line_number_gutter(""), "1");
+        assert_eq!(
+            line_number_gutter("let 中文 = 1;\r\nlet next = 2;\n"),
+            "1\n2\n3"
         );
     }
 }
