@@ -90,7 +90,12 @@ impl DiagnosticTask {
                     }
                     Some(Ok(None)) => std::thread::sleep(Duration::from_millis(50)),
                     Some(Err(error)) => {
-                        worker_child.lock().unwrap().take();
+                        if let Some(mut process) = worker_child.lock().unwrap().take() {
+                            let _ = process.kill();
+                            let _ = process.wait();
+                        }
+                        let _ = stdout.join();
+                        let _ = stderr.join();
                         let _ = sender.send(format!("rust-analyzer diagnostics failed: {error}"));
                         return;
                     }
