@@ -13,7 +13,7 @@ RustBridge is written in Rust (egui/eframe + Tree-sitter). There is no JVM, Elec
 - **Java View (default):** open a real `.rs` file and read a conservative AST-based Java-inspired projection.
 - **Linked Compare:** left Java projection, right actual Rust; click a highlighted method, field, type or keyword in **either** pane to select its exact corresponding AST token occurrence, highlight both, and jump to the same source location.
 - **Semantic guide:** see 1-based Rust / Java line and Unicode-aware column, original/projection token, and Java-to-Rust conceptual explanation.
-- **Rust Source:** edit the actual file. Clicking a token shows its explanation; jumping from the guide selects that token in the editor. Save with Ctrl+S.
+- **Rust Source:** edit the actual file with syntax colors, physical line numbers, find-next and native undo/redo shortcuts. Clicking a token shows its explanation; jumping from the guide selects that token in the editor. Save with Ctrl+S.
 - **Linked scroll:** optionally follow scrolling across compare panes, including wheel and scrollbar changes.
 - **Real filesystem:** open `.rs` files and explore the actual Cargo project tree; do not hide, replace or synthesize source directories.
 - **Project navigation:** search real Rust filenames on a cancellable background worker, reopen the eight most recently opened Rust files, show why `.git`, `target` and `node_modules` are excluded by default, and opt in to see them when needed.
