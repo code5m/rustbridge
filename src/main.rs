@@ -256,6 +256,8 @@ struct App {
     lesson_return: Option<(Mode, Option<usize>)>,
     analyzer_status: String,
     analyzer_check: Option<std::sync::mpsc::Receiver<String>>,
+    analyzer_diagnostics: Option<analyzer::DiagnosticTask>,
+    analyzer_diagnostics_status: String,
     status: String,
 }
 
@@ -299,6 +301,9 @@ impl Default for App {
             lesson_return: None,
             analyzer_status: "Not checked; core reading does not require rust-analyzer.".into(),
             analyzer_check: None,
+            analyzer_diagnostics: None,
+            analyzer_diagnostics_status: "Diagnostics are off until requested for a Cargo project."
+                .into(),
             status: "Java view is an AST-aligned teaching aid, not compilable Java.".into(),
         }
     }
@@ -467,6 +472,17 @@ impl App {
             self.analyzer_status = "Checking rust-analyzer in the background…".into();
             self.analyzer_check = Some(analyzer::check_async());
         }
+    }
+
+    fn start_analyzer_diagnostics(&mut self) {
+        let Some(root) = self.root.clone().filter(|_| self.cargo_project) else {
+            self.analyzer_diagnostics_status =
+                "Open a Cargo project before requesting diagnostics.".into();
+            return;
+        };
+        self.analyzer_diagnostics_status =
+            "rust-analyzer is checking this project in the background…".into();
+        self.analyzer_diagnostics = Some(analyzer::DiagnosticTask::start(root));
     }
 
     fn find_next_in_editor(&mut self) {
@@ -918,7 +934,18 @@ impl eframe::App for App {
             self.analyzer_status = result;
             self.analyzer_check = None;
         }
-        if self.projection_pending || self.file_search_pending {
+        if let Some(result) = self
+            .analyzer_diagnostics
+            .as_ref()
+            .and_then(|task| task.take_result())
+        {
+            self.analyzer_diagnostics_status = result;
+            self.analyzer_diagnostics = None;
+        }
+        if self.projection_pending
+            || self.file_search_pending
+            || self.analyzer_diagnostics.is_some()
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty {
@@ -1101,10 +1128,22 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 ui.strong("Optional rust-analyzer");
-                ui.small("Availability only; no LSP, diagnostics, completion, or definition lookup is started.");
+                ui.small("Diagnostics are opt-in; no LSP session, completion, or definition lookup is started.");
                 ui.label(&self.analyzer_status);
                 if ui.add_enabled(self.analyzer_check.is_none(), egui::Button::new("Check availability")).clicked() {
                     self.check_analyzer();
+                }
+                ui.separator();
+                ui.small(&self.analyzer_diagnostics_status);
+                if let Some(task) = self.analyzer_diagnostics.as_ref() {
+                    if ui.button("Cancel diagnostics").clicked() {
+                        task.cancel();
+                    }
+                } else if ui
+                    .add_enabled(self.cargo_project && self.root.is_some(), egui::Button::new("Check Cargo diagnostics"))
+                    .clicked()
+                {
+                    self.start_analyzer_diagnostics();
                 }
                 ui.separator();
                 ui.strong("Java 8 → Rust lessons");
