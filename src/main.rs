@@ -227,6 +227,22 @@ impl App {
         }
     }
 
+    fn lesson_for_topic(topic: &str) -> Option<usize> {
+        let rust = match topic {
+            "class ↔ struct" | "Struct declaration" => "struct + impl",
+            "interface ↔ trait" | "Trait declaration" => "trait",
+            "Option<T> ↔ Optional<T>" => "Option<T>",
+            "Result<T,E> ↔ explicit errors" => "Result<T,E>",
+            "Vec<T> ↔ ArrayList<T>" => "Vec<T>",
+            "HashMap<K,V> ↔ Map<K,V>" => "HashMap<K,V>",
+            "Reference and borrowing" => "Ownership + Borrowing",
+            _ => return None,
+        };
+        lessons::LESSONS
+            .iter()
+            .position(|lesson| lesson.rust == rust)
+    }
+
     fn read_only(&mut self, ui: &mut egui::Ui, java: bool) {
         let jump = self.jump_to.take();
         let result =
@@ -418,12 +434,14 @@ impl App {
             lesson.java,
             lesson.rust
         ));
+        ui.strong("Key difference");
         ui.label(lesson.why);
+        ui.small("Examples are teaching sketches. Check the real Rust source and compiler before treating them as production code.");
         ui.separator();
         ui.columns(2, |columns| {
-            columns[0].heading("Java 8");
+            columns[0].heading("Java 8 mental model");
             columns[0].monospace(lesson.java_code);
-            columns[1].heading("Rust");
+            columns[1].heading("Rust example");
             columns[1].monospace(lesson.rust_code);
         });
         ui.separator();
@@ -490,6 +508,12 @@ impl App {
                 if ui.button("Edit Rust").clicked() {
                     self.mode = Mode::Rust;
                     self.jump_to = Some(idx);
+                }
+                if let Some(lesson) = Self::lesson_for_topic(anchor.topic)
+                    && ui.button("Open lesson").clicked()
+                {
+                    self.lesson = lesson;
+                    self.mode = Mode::Learn;
                 }
             });
         } else {
@@ -839,5 +863,12 @@ mod file_tests {
         app.refresh_file_search();
         assert_eq!(app.search_results, vec![root.join("target/generated.rs")]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn known_ast_topics_open_the_matching_lesson() {
+        let option = App::lesson_for_topic("Option<T> ↔ Optional<T>").unwrap();
+        assert_eq!(lessons::LESSONS[option].rust, "Option<T>");
+        assert!(App::lesson_for_topic("Rust symbol occurrence").is_none());
     }
 }
