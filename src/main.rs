@@ -23,6 +23,112 @@ struct FileStamp {
     modified: Option<std::time::SystemTime>,
 }
 
+fn append_rust_syntax(
+    job: &mut egui::text::LayoutJob,
+    text: &str,
+    font: &egui::FontId,
+    base: Color32,
+    active: Option<parser::ByteSpan>,
+) {
+    let format = |color, start: usize, end: usize| egui::TextFormat {
+        font_id: font.clone(),
+        color,
+        background: if active.is_some_and(|span| span.start < end && start < span.end) {
+            Color32::from_rgb(53, 103, 155)
+        } else {
+            Color32::TRANSPARENT
+        },
+        ..Default::default()
+    };
+    let keyword = |word: &str| {
+        matches!(
+            word,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+        )
+    };
+    let mut index = 0;
+    while index < text.len() {
+        let rest = &text[index..];
+        let end = if rest.starts_with("//") {
+            index + rest.find('\n').unwrap_or(rest.len())
+        } else if let Some(after_quote) = rest.strip_prefix('"') {
+            let mut escaped = false;
+            let mut length = 1;
+            for character in after_quote.chars() {
+                length += character.len_utf8();
+                if character == '"' && !escaped {
+                    break;
+                }
+                escaped = character == '\\' && !escaped;
+                if character != '\\' {
+                    escaped = false;
+                }
+            }
+            index + length
+        } else if rest
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_alphabetic() || character == '_')
+        {
+            index
+                + rest
+                    .char_indices()
+                    .find(|(_, character)| !character.is_alphanumeric() && *character != '_')
+                    .map_or(rest.len(), |(end, _)| end)
+        } else {
+            index + rest.chars().next().unwrap().len_utf8()
+        };
+        let token = &text[index..end];
+        let color = if token.starts_with("//") {
+            Color32::from_rgb(112, 142, 112)
+        } else if token.starts_with('"') {
+            Color32::from_rgb(202, 162, 98)
+        } else if keyword(token) {
+            Color32::from_rgb(126, 188, 247)
+        } else {
+            base
+        };
+        job.append(token, 0.0, format(color, index, end));
+        index = end;
+    }
+}
+
 struct App {
     root: Option<PathBuf>,
     file: Option<PathBuf>,
@@ -440,33 +546,18 @@ impl App {
             .map(|anchor| anchor.rust);
         let cursor_target = jump.or(self.editor_jump.take());
 
-        // Highlight the selected source token without changing the file or transforming its syntax.
+        // This is deliberately lexical highlighting only. Tree-sitter remains the source of links.
         let mut layouter = |ui: &egui::Ui, content: &dyn egui::TextBuffer, width: f32| {
             let text = content.as_str();
             let mut job = egui::text::LayoutJob::default();
             job.wrap.max_width = width;
             let font = egui::TextStyle::Monospace.resolve(ui.style());
-            let format = |marked: bool| egui::TextFormat {
-                font_id: font.clone(),
-                color: ui.visuals().text_color(),
-                background: if marked {
-                    Color32::from_rgb(53, 103, 155)
-                } else {
-                    Color32::TRANSPARENT
-                },
-                ..Default::default()
-            };
-            if let Some(span) = active.filter(|span| {
+            let active = active.filter(|span| {
                 span.end <= text.len()
                     && text.is_char_boundary(span.start)
                     && text.is_char_boundary(span.end)
-            }) {
-                job.append(&text[..span.start], 0.0, format(false));
-                job.append(&text[span.start..span.end], 0.0, format(true));
-                job.append(&text[span.end..], 0.0, format(false));
-            } else {
-                job.append(text, 0.0, format(false));
-            }
+            });
+            append_rust_syntax(&mut job, text, &font, ui.visuals().text_color(), active);
             ui.fonts_mut(|fonts| fonts.layout_job(job))
         };
         let mut output = egui::TextEdit::multiline(&mut self.rust)
@@ -1004,5 +1095,34 @@ mod file_tests {
         );
         app.find_next_in_editor();
         assert_eq!(app.editor_find, Some(parser::ByteSpan { start: 3, end: 6 }));
+    }
+
+    #[test]
+    fn lexical_highlighter_keeps_source_bytes_and_marks_keywords() {
+        let source = "fn main() { // note\nlet value = \"text\"; }";
+        let mut job = egui::text::LayoutJob::default();
+        append_rust_syntax(
+            &mut job,
+            source,
+            &egui::FontId::monospace(12.),
+            Color32::WHITE,
+            Some(parser::ByteSpan { start: 3, end: 7 }),
+        );
+        let rendered: String = job
+            .sections
+            .iter()
+            .map(|section| &source[section.byte_range.clone()])
+            .collect();
+        assert_eq!(rendered, source);
+        assert!(
+            job.sections
+                .iter()
+                .any(|section| section.format.color == Color32::from_rgb(126, 188, 247))
+        );
+        assert!(
+            job.sections
+                .iter()
+                .any(|section| section.format.background == Color32::from_rgb(53, 103, 155))
+        );
     }
 }
