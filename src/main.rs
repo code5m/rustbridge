@@ -1,3 +1,4 @@
+mod analyzer;
 mod code_view;
 mod lessons;
 mod parser;
@@ -160,6 +161,8 @@ struct App {
     editor_find: Option<parser::ByteSpan>,
     editor_jump: Option<parser::ByteSpan>,
     lesson_return: Option<(Mode, Option<usize>)>,
+    analyzer_status: String,
+    analyzer_check: Option<std::sync::mpsc::Receiver<String>>,
     status: String,
 }
 
@@ -197,6 +200,8 @@ impl Default for App {
             editor_find: None,
             editor_jump: None,
             lesson_return: None,
+            analyzer_status: "Not checked; core reading does not require rust-analyzer.".into(),
+            analyzer_check: None,
             status: "Java view is an AST-aligned teaching aid, not compilable Java.".into(),
         }
     }
@@ -350,6 +355,13 @@ impl App {
             self.external_change = true;
             self.status =
                 "File changed outside RustBridge; save is blocked until you reopen it.".into();
+        }
+    }
+
+    fn check_analyzer(&mut self) {
+        if self.analyzer_check.is_none() {
+            self.analyzer_status = "Checking rust-analyzer in the background…".into();
+            self.analyzer_check = Some(analyzer::check_async());
         }
     }
 
@@ -777,6 +789,14 @@ impl eframe::App for App {
             self.projection_pending = false;
             self.status = "Reading projection updated.".into();
         }
+        if let Some(result) = self
+            .analyzer_check
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok())
+        {
+            self.analyzer_status = result;
+            self.analyzer_check = None;
+        }
         if self.projection_pending {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -940,6 +960,13 @@ impl eframe::App for App {
                         .show(ui, |ui| self.directory(ui, &root, 0));
                 } else {
                     ui.label("Open folder to browse the actual project.");
+                }
+                ui.separator();
+                ui.strong("Optional rust-analyzer");
+                ui.small("Availability only; no LSP, diagnostics, completion, or definition lookup is started.");
+                ui.label(&self.analyzer_status);
+                if ui.add_enabled(self.analyzer_check.is_none(), egui::Button::new("Check availability")).clicked() {
+                    self.check_analyzer();
                 }
                 ui.separator();
                 ui.strong("Java 8 → Rust lessons");
