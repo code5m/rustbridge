@@ -411,7 +411,7 @@ pub fn add(a:u32,b:u32)->u32{a+b}
         }
         let test_status = test_finished.expect("cargo test must finish");
         assert!(
-            test_status.contains("exit status: 0"),
+            test_status.trim_end().ends_with(": 0"),
             "cargo test: {test_status}"
         );
         drop(test_task);
@@ -432,7 +432,7 @@ pub fn add(a:u32,b:u32)->u32{a+b}
         }
         let run_status = run_finished.expect("cargo run must finish");
         assert!(
-            run_status.contains("exit status: 0"),
+            run_status.trim_end().ends_with(": 0"),
             "cargo run: {run_status}"
         );
         assert!(
