@@ -8,7 +8,7 @@ RustBridge is written in Rust (egui/eframe + Tree-sitter). There is no JVM, Elec
 
 ![RustBridge Java / Rust learner view with OS CJK font fallback](docs/images/rustbridge-zh-hardening.png)
 
-## What works — v0.4
+## What works — v0.5
 
 - **Java View (default):** open a real `.rs` file and read a conservative AST-based Java-inspired projection.
 - **Linked Compare:** left Java projection, right actual Rust; click a highlighted method, field, type or keyword in **either** pane to select its exact corresponding AST token occurrence, highlight both, and jump to the same source location.
@@ -22,6 +22,22 @@ RustBridge is written in Rust (egui/eframe + Tree-sitter). There is no JVM, Elec
 - **Learn:** 12 paged Java 8 ↔ Rust language concepts, with short code examples.
 - **Conservative syntax handling:** Tree-sitter AST recognition, no automatic macro expansion, warnings on malformed syntax; unrecognized Rust syntax stays Rust.
 - **Large-file support:** visible-row rendering and per-line indexed AST links, without scanning the entire AST for every visible line.
+
+## v0.5 · Java8-to-Rust learning and native release
+
+RustBridge v0.5 keeps real Rust files as the only editable source. Java code on screen is a read-only conceptual projection, not an executable transpilation.
+
+- **Crash recovery:** private local journal of dirty Rust source with a full saved baseline; on restart, restore into the editor only if the disk still matches that baseline. Otherwise export a non-overwriting recovery copy.
+- **Session continuity:** resume real project/file, reading mode, lesson progress and Rust cursor position.
+- **Interactive learning:** twelve short Java8→Rust quizzes; incorrect answers have conceptual explanations, and progress is stored privately.
+- **Optional rust-analyzer LSP:** real JSON-RPC hover, completion, same/cross-file definition locations, UTF-16 coordinates and cancellable server lifecycle. Enable explicitly; semantic indexing may take time.
+- **User-authorized Cargo:** explicit trust approval before cargo check/test/run (including potentially unsafe build.rs/project code), bounded subprocess output, timeouts, cancellation and clickable rustc diagnostics.
+- **Sliding virtual source window:** a global line slider, wheel-edge rebase and keyboard navigation across a bounded 240-line moving editor. This is not a full rope-based text editor.
+- **Source safety:** per-path cooperative Unix lock, exclusive Windows open handles, separate read/save workers with cancelable reads and slow-I/O status. Accepted saves never silently exit on a close request.
+- **Three native platforms:** Debian .deb, macOS .app zip, Windows portable zip and NSIS user installer. Mac/Windows write through the existing open file handle plus a private recovery backup, **not** the same power-loss atomic rename as Linux. Windows/macOS builds are unsigned/unnotarized.
+- **Verification:** Linux real X11 keyboard, source-save/crash-restart checks, real Ubuntu GNOME Wayland window probe, native Windows/macOS CI build/test/package, CPU/RSS/fd budgets and scheduled endurance. See the v0.5 integrated 13-workstream report in docs/v0.5-integrated-13.md.
+
+Keyboard: Ctrl+1/2/3/4 switches Java/Rust/Compare/Lessons; Ctrl+PageDown/Up traverses large source windows; Ctrl+S saves the actual Rust source.
 
 ## v0.4 safety, UX and Linux release
 
@@ -62,26 +78,36 @@ Then choose **Open folder** for a real Cargo project or **Open .rs** for a singl
 cargo fmt --check
 cargo check --all-targets
 cargo test --all-targets
+cargo test integration_real_rust_analyzer_hover_completion_definition -- --ignored --nocapture
+cargo test integration_real_cargo_check_streams_clickable_diagnostics -- --ignored --nocapture
+cargo test integration_real_cargo_test_and_run_execute_only_when_requested -- --ignored --nocapture
 cargo clippy --all-targets -- -D warnings
 cargo build --release
 xvfb-run -a -s '-screen 0 1440x900x24' bash tests/gui-smoke.sh ./target/release/rustbridge
+xvfb-run -a -s '-screen 0 1440x900x24' bash tests/recovery-smoke.sh ./target/release/rustbridge
 xvfb-run -a -s '-screen 0 1440x900x24' bash tests/resource-smoke.sh ./target/release/rustbridge
+xvfb-run -a -s '-screen 0 1440x900x24' bash tests/soak.sh ./target/release/rustbridge 180
 bash scripts/package-deb.sh --skip-build
 ```
+
+Native package commands are OS-specific: on macOS run bash scripts/package-macos.sh --skip-build; in Windows PowerShell run ./scripts/package-windows.ps1 --skip-build. The native CI jobs additionally build the NSIS installer and validate each platform package.
 
 ## Performance and limits
 
 Measured observations, machine details and the exact benchmark method are in
-[docs/performance-baseline.md](docs/performance-baseline.md). The v0.3 Linux X11/Xvfb run includes visual screenshots and actual click,
-keyboard/save and external-change checks, plus reproducible projection probes.
-This is targeted native Linux GUI smoke and package validation, not a multi-platform acceptance claim.
+[docs/performance-baseline.md](docs/performance-baseline.md). The v0.5 Linux X11/Xvfb acceptance includes actual keyboard saves, CRLF-preserving
+wheel/keyboard navigation across the virtual editor window, SIGKILL recovery,
+idle CPU/RSS/FD gates and a 3-minute interactive soak. A native GNOME Wayland
+window protocol probe also passes. See docs/performance-baseline.md for methods
+and exact measurements. These are workstation observations, not a universal
+multi-platform or 24-hour endurance guarantee.
 
 File-name search is bounded to 100 matches and depth 12. The real directory tree
 is scanned on a worker and pages entries in groups of 180; all meaningful top-level
 directories are initially exposed, and users can expand more entries without a
 hidden total cap. Symlinks are displayed, not recursively followed; traversal
 depth 24 is reported explicitly. The source editor uses 240-line paging on files
-larger than or equal to 512 KiB; the original Rust document remains intact.
+larger than or equal to 512 KiB, with a sliding window and global line slider; the original Rust document remains intact.
 
 ## Architecture
 
@@ -98,10 +124,15 @@ larger than or equal to 512 KiB; the original Rust document remains intact.
 | `src/file_watch.rs` | Reusable background file identity/ctime/mtime monitoring |
 | `src/document_io.rs` | Async source open/save, generation-based cancellation and file limits |
 | `src/symbol_search.rs` | Bounded AST-only declaration candidate search (not a resolver) |
-| `scripts/package-deb.sh` / `tests/*.sh` | Native Linux package, GUI and resource smoke |
+| src/lessons.rs / src/lesson_quiz.rs | 12 Java↔Rust lessons, quizzes and mastery progress |
+| src/persistence.rs | Crash journals, atomic session snapshots and private recovery export |
+| src/lsp.rs | Opt-in rust-analyzer JSON-RPC client and UTF-16 position mapping |
+| src/cargo_runner.rs | User-approved Cargo check/test/run, cancellation and compiler diagnostics |
+| src/line_index.rs | Incremental UTF-8 source line-offset maintenance |
+| scripts/package-deb.sh / scripts/package-macos.sh / scripts/package-windows.ps1 | Native Linux/macOS/Windows packages |
+| tests/*.sh | Real GUI save, crash recovery, CPU/RSS/fd and endurance smoke |
 | `src/ui_fonts.rs` | OS font fallback for Chinese glyphs (no bundled font files) |
 | `examples/projection_probe.rs` | Release projection microbenchmark of full vs incremental processing |
-| `src/lessons.rs` | 12 introductory Java↔Rust lessons |
 | `examples/basics.rs` | Self-contained example |
 | `AGENTS.md` | Design principles, contracts, acceptance criteria |
 
@@ -111,16 +142,12 @@ larger than or equal to 512 KiB; the original Rust document remains intact.
 
 Text transforms never reorder source statements or insert/remove newlines, preserving line correspondence. Span maps and Unicode/CRLF handling are unit-tested. Original Rust source is not modified by Java View or Compare.
 
-## Still outside v0.4
+## Honest limits after v0.5
 
-- **Optional rust-analyzer diagnostics:** the sidebar can check availability and, on
-  demand, run its bounded, cancellable `diagnostics` command for an opened Cargo project.
-  Build scripts and proc macros are disabled for this check. It never starts an LSP session;
-  completion and go-to-definition remain outside the current scope. The executable is optional;
-  its absence never affects core reading or editing.
-- No debugging, Rust build/run actions for opened projects, installer for Windows/macOS, plugin marketplace, or full IDE replacement. Linux .deb packaging exists for native distribution.
-- No complete Java syntax conversion. Java view is intentionally partial and read-only.
-- Native window launches and selected GUI interactions are smoke-tested on Linux X11/Xvfb; full human acceptance remains necessary for each desktop environment.
-- Atomic save does not provide a perfect lock-free transaction against arbitrary uncooperative external writers; OS security metadata can force safe rejection. See [the v0.4 acceptance report](docs/v0.4-integrated-acceptance.md) for caveats.
+- **Semantics:** LSP is opt-in and may need indexing and Cargo configuration beyond default safe options. Java projection is not a type-resolved translator; Rust code executes only with explicit Cargo authorization.
+- **Source correctness:** cooperating RustBridge writers are serialized, but uncooperative editors can still race final Linux rename. Remote filesystem system calls can block despite worker deadlines checked between chunks.
+- **OS differences:** macOS and Windows preserve the file's metadata through its existing open handle and private rollback backup, not a power-loss-atomic rename. Linux has real automated X11 interaction; the Wayland window probe does not substitute for human usability acceptance.
+- **Distribution:** Windows/macOS artifacts are unsigned. No debugger, general plugin marketplace or complete general-purpose IDE replacement.
+- **Performance:** active software rendering can use substantial CPU even if idle use is low. 24-hour memory stability and all-platform IME remain separate release gates.
 
 MIT licensed. See [CHANGELOG.md](CHANGELOG.md).

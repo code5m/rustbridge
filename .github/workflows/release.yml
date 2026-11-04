@@ -1,0 +1,71 @@
+name: RustBridge tagged release
+on:
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: write
+jobs:
+  publish:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux
+          - os: macos-15
+            artifact: macos
+          - os: windows-2025
+            artifact: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-analyzer
+      - name: Native Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libx11-xcb-dev libgl1-mesa-dev libgl1-mesa-dri xvfb xdotool
+      - name: Check all supported native targets
+        run: cargo test --all-targets
+      - name: Real rust-analyzer JSON-RPC integration
+        run: cargo test integration_real_rust_analyzer_hover_completion_definition -- --ignored --nocapture
+      - name: Real Cargo process and diagnostic integration
+        run: cargo test integration_real_cargo_check_streams_clickable_diagnostics -- --ignored --nocapture
+      - name: Real Cargo test and run subprocess integration
+        run: cargo test integration_real_cargo_test_and_run_execute_only_when_requested -- --ignored --nocapture
+      - name: Build optimized release
+        run: cargo build --release
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: bash scripts/package-deb.sh --skip-build
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: bash scripts/package-macos.sh --skip-build
+      - name: Package Windows portable zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 --skip-build
+      - name: Package Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis --no-progress -y
+          $nsis = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'NSIS/makensis.exe'
+          $manifest = Get-Content Cargo.toml -Raw
+          $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          Set-Location $env:GITHUB_WORKSPACE
+          & $nsis "/DVERSION=$version" "$env:GITHUB_WORKSPACE/scripts/rustbridge-installer.nsi"
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS packaging failed' }
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/*.deb
+            dist/*.zip
+            dist/*.exe
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

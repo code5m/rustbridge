@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0 — Integrated Java-to-Rust learning and lifecycle work
+
+- Private crash-recovery journals, restartable editor/session state, 12 interactive lessons with progress.
+- Opt-in real rust-analyzer JSON-RPC LSP hover, completion and definitions with UTF-16 source mappings and no unsolicited edits.
+- User-confirmed Cargo check/test/run with cancelable processes, bounded output and clickable rustc diagnostics.
+- Cooperative save locking, independent asynchronous read/save workers and slow I/O notices, metadata-preserving macOS/Windows in-place writes with private rollback copies.
+- Unix save locking is verified across a real child process; Windows uses an exclusive source handle. The final Linux compare-to-rename race with non-cooperating editors remains an explicit limitation.
+- Windows session and crash-journal updates use native MoveFileExW replace-existing/write-through rather than rename-over-existing.
+- Incremental UTF-8 line offsets, restart restoration for project/file/mode/lesson/cursor/progress, graceful eframe on_exit session/journal flush and close-during-save lifecycle guards.
+- Native CI explicitly exercises real rust-analyzer LSP and Cargo diagnostic subprocess integrations on Linux, macOS and Windows; Linux also tests SIGKILL/relaunch recovery and idle CPU/RSS/fd budgets.
+- Incremental UTF-8 line offsets and sliding virtual source editing; fixed the egui scroll visibility idle CPU repaint loop.
+- Native Linux GUI/crash/CPU resource smokes, weekly endurance, Windows/macOS CI packaging and draft tag-release workflow.
+- Explicit limitations remain on unsigned software, uncooperative writers, uninterruptible OS I/O, cross-platform save atomicity and manual Wayland interaction.
+
 ## 0.4.0 — Single-branch finishing pass
 
 - Preserve supported Linux source metadata (mode, owner and readable xattrs/ACL labels) and refuse read-only or unsafe source saves.

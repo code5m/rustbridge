@@ -10,17 +10,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, rust-analyzer
       - name: Native and GUI smoke dependencies
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libx11-xcb-dev libgl1-mesa-dev libgl1-mesa-dri xvfb xdotool
       - run: cargo fmt --check
       - run: cargo check --all-targets
       - run: cargo test --all-targets
+      - name: Real rust-analyzer JSON-RPC integration
+        run: cargo test integration_real_rust_analyzer_hover_completion_definition -- --ignored --nocapture
+      - name: Real Cargo process and compiler-diagnostic integration
+        run: cargo test integration_real_cargo_check_streams_clickable_diagnostics -- --ignored --nocapture
+      - name: Real Cargo test and run subprocess integration
+        run: cargo test integration_real_cargo_test_and_run_execute_only_when_requested -- --ignored --nocapture
       - run: cargo clippy --all-targets -- -D warnings
       - name: Build optimized native binary
         run: cargo build --release
       - name: Native GUI real keyboard and save smoke (Xvfb)
         run: xvfb-run -a -s '-screen 0 1440x900x24' bash tests/gui-smoke.sh ./target/release/rustbridge
+      - name: Crash recovery survives SIGKILL and relaunch (Xvfb)
+        run: xvfb-run -a -s '-screen 0 1440x900x24' bash tests/recovery-smoke.sh ./target/release/rustbridge
       - name: Large-source idle resource smoke (Xvfb)
         run: xvfb-run -a -s '-screen 0 1440x900x24' bash tests/resource-smoke.sh ./target/release/rustbridge
       - name: Package Debian native app
@@ -39,4 +47,95 @@ jobs:
         with:
           name: rustbridge-linux-deb
           path: dist/*.deb
+          if-no-files-found: error
+  macos:
+    name: macOS native tests and .app
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-analyzer
+      - name: Rust formatting
+        run: cargo fmt --check
+      - name: Check native macOS source
+        run: cargo check --all-targets
+      - name: Verify macOS save, editor, and project tests
+        run: cargo test --all-targets
+      - name: Real rust-analyzer JSON-RPC integration
+        run: cargo test integration_real_rust_analyzer_hover_completion_definition -- --ignored --nocapture
+      - name: Real Cargo process and compiler-diagnostic integration
+        run: cargo test integration_real_cargo_check_streams_clickable_diagnostics -- --ignored --nocapture
+      - name: Real Cargo test and run subprocess integration
+        run: cargo test integration_real_cargo_test_and_run_execute_only_when_requested -- --ignored --nocapture
+      - name: Strict macOS lints
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build native macOS Release executable
+        run: cargo build --release
+      - name: Bundle installable drag-and-drop macOS app
+        run: bash scripts/package-macos.sh --skip-build
+      - name: Verify Apple app metadata and executable
+        run: |
+          plutil -lint dist/RustBridge.app/Contents/Info.plist
+          test -x dist/RustBridge.app/Contents/MacOS/rustbridge
+          file dist/RustBridge.app/Contents/MacOS/rustbridge
+          ls -lh dist/*.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustbridge-macos-app
+          path: dist/*.zip
+          if-no-files-found: error
+  windows:
+    name: Windows native tests and installer
+    runs-on: windows-2025
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-analyzer
+      - name: Rust formatting
+        run: cargo fmt --check
+      - name: Check Windows sources
+        run: cargo check --all-targets
+      - name: Verify Windows saving, editor and project tests
+        run: cargo test --all-targets
+      - name: Real rust-analyzer JSON-RPC integration
+        run: cargo test integration_real_rust_analyzer_hover_completion_definition -- --ignored --nocapture
+      - name: Real Cargo process and compiler-diagnostic integration
+        run: cargo test integration_real_cargo_check_streams_clickable_diagnostics -- --ignored --nocapture
+      - name: Real Cargo test and run subprocess integration
+        run: cargo test integration_real_cargo_test_and_run_execute_only_when_requested -- --ignored --nocapture
+      - name: Strict Windows lints
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build native Windows Release executable
+        run: cargo build --release
+      - name: Create unsigned portable Windows build
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 --skip-build
+      - name: Build NSIS user installer
+        shell: pwsh
+        run: |
+          choco install nsis --no-progress -y
+          $nsis = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'NSIS/makensis.exe'
+          if (-not (Test-Path $nsis)) { throw 'NSIS not installed' }
+          $manifest = Get-Content Cargo.toml -Raw
+          $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          Set-Location $env:GITHUB_WORKSPACE
+          & $nsis "/DVERSION=$version" "$env:GITHUB_WORKSPACE/scripts/rustbridge-installer.nsi"
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS packaging failed' }
+          Get-ChildItem dist/*.exe
+      - name: Verify Windows release artifacts
+        shell: pwsh
+        run: |
+          if (-not (Test-Path target/release/rustbridge.exe)) { throw 'Executable missing' }
+          if ((Get-ChildItem dist/*.zip).Count -eq 0) { throw 'Portable ZIP missing' }
+          if ((Get-ChildItem dist/*.exe).Count -eq 0) { throw 'Installer missing' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustbridge-windows-installer
+          path: |
+            dist/*.zip
+            dist/*.exe
           if-no-files-found: error
