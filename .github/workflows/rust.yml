@@ -40,3 +40,77 @@ jobs:
           name: rustbridge-linux-deb
           path: dist/*.deb
           if-no-files-found: error
+  macos:
+    name: macOS native tests and .app
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check native macOS source
+        run: cargo check --all-targets
+      - name: Verify macOS save, editor, and project tests
+        run: cargo test --all-targets
+      - name: Strict macOS lints
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build native macOS Release executable
+        run: cargo build --release
+      - name: Bundle installable drag-and-drop macOS app
+        run: bash scripts/package-macos.sh --skip-build
+      - name: Verify Apple app metadata and executable
+        run: |
+          plutil -lint dist/RustBridge.app/Contents/Info.plist
+          test -x dist/RustBridge.app/Contents/MacOS/rustbridge
+          file dist/RustBridge.app/Contents/MacOS/rustbridge
+          ls -lh dist/*.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustbridge-macos-app
+          path: dist/*.zip
+          if-no-files-found: error
+  windows:
+    name: Windows native tests and installer
+    runs-on: windows-2025
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check Windows sources
+        run: cargo check --all-targets
+      - name: Verify Windows saving, editor and project tests
+        run: cargo test --all-targets
+      - name: Strict Windows lints
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build native Windows Release executable
+        run: cargo build --release
+      - name: Create unsigned portable Windows build
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 --skip-build
+      - name: Build NSIS user installer
+        shell: pwsh
+        run: |
+          choco install nsis --no-progress -y
+          $nsis = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'NSIS/makensis.exe'
+          if (-not (Test-Path $nsis)) { throw 'NSIS not installed' }
+          $manifest = Get-Content Cargo.toml -Raw
+          $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          & $nsis "/DVERSION=$version" "scripts/rustbridge-installer.nsi"
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS packaging failed' }
+          Get-ChildItem dist/*.exe
+      - name: Verify Windows release artifacts
+        shell: pwsh
+        run: |
+          if (-not (Test-Path target/release/rustbridge.exe)) { throw 'Executable missing' }
+          if ((Get-ChildItem dist/*.zip).Count -eq 0) { throw 'Portable ZIP missing' }
+          if ((Get-ChildItem dist/*.exe).Count -eq 0) { throw 'Installer missing' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustbridge-windows-installer
+          path: |
+            dist/*.zip
+            dist/*.exe
+          if-no-files-found: error

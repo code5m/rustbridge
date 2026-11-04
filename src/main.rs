@@ -1,4 +1,5 @@
 mod analyzer;
+mod cargo_runner;
 mod code_view;
 mod document_io;
 mod editor_core;
@@ -7,8 +8,12 @@ mod editor_ui;
 mod file_search_worker;
 mod file_tree;
 mod file_watch;
+mod lesson_quiz;
 mod lessons;
+mod line_index;
+mod lsp;
 mod parser;
+mod persistence;
 mod projection_worker;
 mod safe_save;
 mod symbol_search;
@@ -71,8 +76,11 @@ struct App {
     io_revision: u64,
     opening: Option<(u64, PathBuf, u64)>,
     saving: Option<(u64, PathBuf, String)>,
+    opening_started: Option<std::time::Instant>,
+    saving_started: Option<std::time::Instant>,
     after_save_open: bool,
     after_save_close: bool,
+    discard_on_open: bool,
     symbol_worker: Option<symbol_search::SymbolSearch>,
     symbol_revision: u64,
     symbol_query: String,
@@ -87,12 +95,36 @@ struct App {
     editor_gutter_revision: u64,
     editor_page_start: usize,
     editor_page_target: usize,
+    editor_scroll_override: Option<f32>,
     lesson_return: Option<(Mode, Option<usize>)>,
     analyzer_status: String,
     analyzer_check: Option<std::sync::mpsc::Receiver<String>>,
     analyzer_diagnostics: Option<analyzer::DiagnosticTask>,
     analyzer_diagnostics_status: String,
     status: String,
+    state_store: Option<persistence::Store>,
+    state_worker: Option<persistence::PersistenceWorker>,
+    last_session: Option<persistence::Session>,
+    session_due: Option<std::time::Instant>,
+    recovery_due: Option<std::time::Instant>,
+    pending_recovery: Option<persistence::Journal>,
+    recovered_mode: Option<Mode>,
+    cursor_byte: usize,
+    completed_lessons: Vec<bool>,
+    quiz_choice: Option<usize>,
+    cargo_task: Option<cargo_runner::CargoTask>,
+    cargo_confirm: Option<cargo_runner::Action>,
+    cargo_log: Vec<String>,
+    cargo_diagnostics: Vec<cargo_runner::Diagnostic>,
+    cargo_status: String,
+    cargo_diag_target: Option<(PathBuf, usize, usize)>,
+    lsp_task: Option<lsp::LspTask>,
+    lsp_status: String,
+    lsp_ready: bool,
+    lsp_hover: String,
+    lsp_completions: Vec<lsp::Completion>,
+    lsp_definitions: Vec<lsp::Location>,
+    lsp_target: Option<(PathBuf, lsp::SpanPosition)>,
 }
 
 impl Default for App {
@@ -137,8 +169,11 @@ impl Default for App {
             io_revision: 0,
             opening: None,
             saving: None,
+            opening_started: None,
+            saving_started: None,
             after_save_open: false,
             after_save_close: false,
+            discard_on_open: false,
             symbol_worker: None,
             symbol_revision: 0,
             symbol_query: String::new(),
@@ -153,6 +188,7 @@ impl Default for App {
             editor_gutter_revision: 0,
             editor_page_start: 0,
             editor_page_target: 1,
+            editor_scroll_override: None,
             lesson_return: None,
             analyzer_status: "Not checked; core reading does not require rust-analyzer.".into(),
             analyzer_check: None,
@@ -160,13 +196,344 @@ impl Default for App {
             analyzer_diagnostics_status: "Diagnostics are off until requested for a Cargo project."
                 .into(),
             status: "Java view is an AST-aligned teaching aid, not compilable Java.".into(),
+            state_store: None,
+            state_worker: None,
+            last_session: None,
+            session_due: None,
+            recovery_due: None,
+            pending_recovery: None,
+            recovered_mode: None,
+            cursor_byte: 0,
+            completed_lessons: vec![false; lessons::LESSONS.len()],
+            quiz_choice: None,
+            cargo_task: None,
+            cargo_confirm: None,
+            cargo_log: Vec::new(),
+            cargo_diagnostics: Vec::new(),
+            cargo_status: "Cargo 检查、测试、运行需要手动授权，不会自动执行。".into(),
+            cargo_diag_target: None,
+            lsp_task: None,
+            lsp_status: "rust-analyzer LSP 未启动。按需启用，不在启动时索引项目。".into(),
+            lsp_ready: false,
+            lsp_hover: String::new(),
+            lsp_completions: Vec::new(),
+            lsp_definitions: Vec::new(),
+            lsp_target: None,
         }
     }
 }
 
 impl App {
-    fn open(&mut self, path: PathBuf) {
+    fn initialize_state(&mut self, restore_last_document: bool) {
+        let store = match persistence::Store::from_system() {
+            Ok(store) => store,
+            Err(error) => {
+                self.status = format!("Session storage unavailable: {error}");
+                return;
+            }
+        };
+        if let Some(session) = store.load_session() {
+            self.lesson = session.lesson.min(lessons::LESSONS.len().saturating_sub(1));
+            self.completed_lessons = normalized_completion(&session.completed_lessons);
+            self.cursor_byte = session.cursor_byte;
+            self.recovered_mode = Some(mode_from_name(&session.mode));
+            if restore_last_document {
+                self.root = session.root.filter(|p| p.is_dir());
+                self.cargo_project = self.root.as_ref().is_some_and(|p| is_cargo_root(p));
+                if let Some(path) = session.file.filter(|p| p.is_file()) {
+                    self.open_file(path);
+                } else if let Some(mode) = self.recovered_mode.take() {
+                    self.mode = mode;
+                }
+            }
+        }
+        self.state_worker = Some(persistence::PersistenceWorker::spawn(store.clone()));
+        self.state_store = Some(store);
+    }
+
+    fn session_snapshot(&self) -> persistence::Session {
+        persistence::Session {
+            root: self.root.clone(),
+            file: self.file.clone(),
+            mode: mode_name(self.mode).into(),
+            lesson: self.lesson,
+            cursor_byte: self.cursor_byte,
+            completed_lessons: self.completed_lessons.clone(),
+        }
+    }
+
+    fn mark_dirty_for_recovery(&mut self) {
+        self.recovery_due = Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
+    }
+    fn flush_recovery_journal(&mut self) {
+        self.recovery_due = None;
+        if let (Some(path), Some(worker)) = (self.file.clone(), self.state_worker.as_ref()) {
+            if self.dirty {
+                worker.send(persistence::Job::SaveJournal {
+                    path,
+                    baseline: self.saved_source.clone(),
+                    edited: self.rust.clone(),
+                });
+            } else {
+                worker.send(persistence::Job::DeleteJournal(path));
+            }
+        }
+    }
+    fn discard_current_recovery(&mut self) {
+        if let (Some(path), Some(worker)) = (self.file.as_ref(), self.state_worker.as_ref()) {
+            worker.send(persistence::Job::DeleteJournal(path.clone()));
+        }
+        self.pending_recovery = None;
+        self.recovery_due = None;
+    }
+    fn poll_persistence(&mut self) {
+        if self
+            .recovery_due
+            .is_some_and(|due| std::time::Instant::now() >= due)
+        {
+            self.flush_recovery_journal();
+        }
+        let session = self.session_snapshot();
+        if self.last_session.as_ref() != Some(&session) && self.session_due.is_none() {
+            self.session_due =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+        }
+        if self
+            .session_due
+            .is_some_and(|due| std::time::Instant::now() >= due)
+        {
+            if let Some(worker) = self.state_worker.as_ref() {
+                worker.send(persistence::Job::Session(session.clone()));
+            }
+            self.last_session = Some(session);
+            self.session_due = None;
+        }
+    }
+
+    fn start_lsp(&mut self) {
+        let Some(root) = self.root.clone().and_then(|p| p.canonicalize().ok()) else {
+            self.lsp_status = "请先打开实际 Cargo 项目目录。".into();
+            return;
+        };
+        if !is_cargo_root(&root) {
+            self.lsp_status = "当前目录缺少 Cargo.toml，无法初始化项目 LSP。".into();
+            return;
+        }
+        self.lsp_task = None;
+        let worker = lsp::LspTask::start(root);
+        if let Some(path) = self.file.as_ref().and_then(|p| p.canonicalize().ok()) {
+            worker.open(path, self.rust.clone(), self.revision);
+        }
+        self.lsp_task = Some(worker);
+        self.lsp_ready = false;
+        self.lsp_hover.clear();
+        self.lsp_completions.clear();
+        self.lsp_definitions.clear();
+        self.lsp_status = "正在初始化 rust-analyzer LSP；默认关闭 build.rs 与 proc macros。".into();
+    }
+    fn poll_lsp(&mut self) {
+        let Some(task) = self.lsp_task.as_ref() else {
+            return;
+        };
+        if !self
+            .root
+            .as_ref()
+            .is_some_and(|root| root.canonicalize().is_ok_and(|p| p == task.root))
+        {
+            task.cancel();
+            self.lsp_task = None;
+            self.lsp_ready = false;
+            return;
+        }
+        for event in task.poll() {
+            match event {
+                lsp::Event::Ready => {
+                    self.lsp_ready = true;
+                    self.lsp_status =
+                        "rust-analyzer LSP 已初始化；可以请求类型、补全和定义。".into();
+                }
+                lsp::Event::Status(text) => {
+                    self.lsp_status = text;
+                }
+                lsp::Event::Hover { revision, text } if revision == self.revision => {
+                    self.lsp_hover = text.chars().take(12000).collect();
+                    self.lsp_status = "rust-analyzer 悬浮信息已返回。".into();
+                }
+                lsp::Event::Completion { revision, items } if revision == self.revision => {
+                    self.lsp_completions = items;
+                    self.lsp_status = format!(
+                        "rust-analyzer 返回 {} 项补全候选。",
+                        self.lsp_completions.len()
+                    );
+                }
+                lsp::Event::Definition {
+                    revision,
+                    locations,
+                } if revision == self.revision => {
+                    self.lsp_definitions = locations;
+                    self.lsp_status = format!(
+                        "rust-analyzer 返回 {} 个定义位置。",
+                        self.lsp_definitions.len()
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    fn lsp_query(&mut self, kind: lsp::Kind) {
+        let Some(task) = self.lsp_task.as_ref() else {
+            return;
+        };
+        let byte = self
+            .selected
+            .and_then(|idx| self.projection.anchors.get(idx))
+            .map_or(self.cursor_byte, |anchor| anchor.rust.start);
+        let pos = lsp::position_for_byte(&self.rust, byte);
+        task.query(kind, self.revision, pos.line, pos.character);
+        self.lsp_status = format!("正在请求 {:?}，源版本 {}…", kind, self.revision);
+    }
+    fn insert_completion(&mut self, completion: lsp::Completion) {
+        if self.file.is_none() {
+            return;
+        }
+        if completion.text.contains('$') && completion.text.contains('{') {
+            self.lsp_status = "服务端给出了片段占位符；为避免破坏源码，暂不自动插入。".into();
+            return;
+        }
+        let cursor = self.cursor_byte.min(self.rust.len());
+        let range = match (&completion.start, &completion.end) {
+            (Some(start), Some(end)) => {
+                let Some(a) = lsp::byte_for_position(&self.rust, start) else {
+                    return;
+                };
+                let Some(b) = lsp::byte_for_position(&self.rust, end) else {
+                    return;
+                };
+                a..b
+            }
+            _ => {
+                let mut start = cursor;
+                while let Some((offset, ch)) = self.rust[..start].char_indices().last() {
+                    if ch == '_' || ch.is_alphanumeric() {
+                        start = offset;
+                    } else {
+                        break;
+                    }
+                }
+                start..cursor
+            }
+        };
+        if range.start > range.end
+            || range.end > self.rust.len()
+            || !self.rust.is_char_boundary(range.start)
+            || !self.rust.is_char_boundary(range.end)
+        {
+            return;
+        }
+        self.rust.replace_range(range.clone(), &completion.text);
+        self.cursor_byte = range.start + completion.text.len();
+        self.update_projection();
+        self.dirty = self.rust != self.saved_source;
+        self.mark_dirty_for_recovery();
+        self.lsp_completions.clear();
+        self.status = "已插入真实 rust-analyzer 补全文本；原始 Rust 文件尚未保存。".into();
+    }
+    fn jump_lsp_definition(&mut self, location: lsp::Location) {
         if self.dirty {
+            self.status = "当前文件仍有未保存修改，请保存后再跨文件跳转。".into();
+            return;
+        }
+        let position = lsp::SpanPosition {
+            line: location.line,
+            character: location.character,
+        };
+        if self.file.as_ref() == Some(&location.path) {
+            if let Some(byte) = lsp::byte_for_position(&self.rust, &position) {
+                self.editor_jump = Some(parser::ByteSpan {
+                    start: byte,
+                    end: byte,
+                });
+                self.mode = Mode::Rust;
+                self.cursor_byte = byte;
+            }
+        } else {
+            self.lsp_target = Some((location.path.clone(), position));
+            self.open_file(location.path);
+        }
+    }
+
+    fn start_cargo_action(&mut self, action: cargo_runner::Action) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        if self.dirty || self.saving.is_some() {
+            self.cargo_status = "当前 Rust 文件有未保存修改，请先保存再运行 Cargo。".into();
+            return;
+        }
+        if !is_cargo_root(&root) {
+            self.cargo_status = "只支持实际 Cargo.toml 根目录。".into();
+            return;
+        }
+        if self.cargo_task.is_some() {
+            self.cargo_status = "已有 Cargo 任务运行中。".into();
+            return;
+        }
+        self.cargo_log.clear();
+        self.cargo_diagnostics.clear();
+        self.cargo_status = format!("{} 已由用户明确批准，正在执行…", action.label());
+        self.cargo_task = Some(cargo_runner::CargoTask::start(root, action));
+    }
+    fn poll_cargo(&mut self) {
+        let Some(task) = self.cargo_task.as_ref() else {
+            return;
+        };
+        if self.root.as_ref() != Some(&task.root) {
+            task.cancel();
+        }
+        let mut finished = false;
+        for event in task.poll() {
+            match event {
+                cargo_runner::Event::Log(line) => {
+                    self.cargo_log.push(line);
+                    if self.cargo_log.len() > 200 {
+                        self.cargo_log.drain(0..self.cargo_log.len() - 200);
+                    }
+                }
+                cargo_runner::Event::Diagnostic(diagnostic) => {
+                    if self.cargo_diagnostics.len() < 200 {
+                        self.cargo_diagnostics.push(diagnostic);
+                    }
+                }
+                cargo_runner::Event::Finished(status) => {
+                    self.cargo_status = status;
+                    finished = true;
+                }
+            }
+        }
+        if finished {
+            self.cargo_task = None;
+        }
+    }
+    fn jump_to_cargo_diagnostic(&mut self, diag: cargo_runner::Diagnostic) {
+        if self.dirty {
+            self.status = "请先保存当前修改，再跳转诊断目标文件。".into();
+            return;
+        }
+        if self.file.as_ref() == Some(&diag.path) {
+            let span = diagnostic_location(&self.rust, diag.line, diag.column);
+            self.editor_jump = Some(span);
+            self.mode = Mode::Rust;
+        } else {
+            self.cargo_diag_target = Some((diag.path.clone(), diag.line, diag.column));
+            self.open_file(diag.path);
+        }
+    }
+
+    fn close_requires_confirmation(&self) -> bool {
+        self.dirty || self.saving.is_some()
+    }
+    fn open(&mut self, path: PathBuf) {
+        if self.dirty || self.saving.is_some() {
             self.pending_open = Some(path);
             return;
         }
@@ -178,6 +545,7 @@ impl App {
         self.io_revision += 1;
         let id = self.io_revision;
         self.opening = Some((id, path.clone(), self.revision));
+        self.opening_started = Some(std::time::Instant::now());
         self.document_io
             .get_or_insert_with(document_io::DocumentIo::new)
             .open(id, path);
@@ -185,6 +553,10 @@ impl App {
     }
 
     fn complete_open(&mut self, path: PathBuf, loaded: document_io::Loaded) {
+        if self.discard_on_open {
+            self.discard_current_recovery();
+            self.discard_on_open = false;
+        }
         self.disk_stamp = loaded.stamp;
         self.external_change = false;
         self.saved_source = loaded.source.clone();
@@ -199,14 +571,49 @@ impl App {
         self.editor_jump = None;
         self.editor_page_start = 0;
         self.editor_page_target = 1;
+        self.editor_scroll_override = None;
         self.scroll_follow = None;
         self.last_scroll = None;
-        self.mode = Mode::Java;
+        self.mode = self.recovered_mode.take().unwrap_or(Mode::Java);
+        if let Some(store) = self.state_store.as_ref() {
+            self.pending_recovery = store
+                .load_journal(&path)
+                .filter(|journal| journal.edited != self.rust);
+        }
+        if self.cursor_byte > 0 && self.cursor_byte < self.rust.len() {
+            self.editor_jump = Some(parser::ByteSpan {
+                start: self.cursor_byte,
+                end: self.cursor_byte,
+            });
+        }
         if let Some((target, span)) = self.symbol_target.take()
             && target == path
         {
             self.mode = Mode::Rust;
             self.editor_jump = Some(span);
+        }
+        if let Some((target, line, column)) = self.cargo_diag_target.take()
+            && target == path
+        {
+            let span = diagnostic_location(&self.rust, line, column);
+            self.editor_jump = Some(span);
+            self.mode = Mode::Rust;
+        }
+        if let Some((target, pos)) = self.lsp_target.take()
+            && target == path
+            && let Some(byte) = lsp::byte_for_position(&self.rust, &pos)
+        {
+            self.editor_jump = Some(parser::ByteSpan {
+                start: byte,
+                end: byte,
+            });
+            self.cursor_byte = byte;
+            self.mode = Mode::Rust;
+        }
+        if let Some(task) = self.lsp_task.as_ref()
+            && let Ok(path) = path.canonicalize()
+        {
+            task.open(path, self.rust.clone(), self.revision);
         }
         self.status = "Opened actual Rust file. Java teaching view is read-only.".into();
     }
@@ -224,9 +631,13 @@ impl App {
                     });
                     if matching {
                         self.opening = None;
+                        self.opening_started = None;
                         match result {
                             Ok(loaded) => self.complete_open(path, loaded),
-                            Err(error) => self.status = format!("Open failed: {error}"),
+                            Err(error) => {
+                                self.discard_on_open = false;
+                                self.status = format!("Open failed: {error}");
+                            }
                         }
                     }
                 }
@@ -242,8 +653,10 @@ impl App {
                         continue;
                     }
                     self.saving = None;
+                    self.saving_started = None;
                     match result {
                         Ok(outcome) => {
+                            let durable = matches!(&outcome, safe_save::SaveOutcome::Durable);
                             self.saved_source = content;
                             self.dirty = self.rust != self.saved_source;
                             self.disk_stamp = file_watch::file_stamp(&path).ok();
@@ -251,6 +664,7 @@ impl App {
                                 watch.set_target(path.clone(), self.disk_stamp.clone());
                             }
                             self.external_change = false;
+                            self.flush_recovery_journal();
                             self.status = match outcome {
                                 safe_save::SaveOutcome::Durable => {
                                     "Saved original Rust source".into()
@@ -259,12 +673,12 @@ impl App {
                                     format!("内容已写入磁盘，但目录同步失败，持久性未确认：{error}")
                                 }
                             };
-                            if !self.dirty && self.after_save_close {
+                            if !self.dirty && durable && self.after_save_close {
                                 self.after_save_close = false;
                                 self.confirm_close = false;
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
-                            if !self.dirty && self.after_save_open {
+                            if !self.dirty && durable && self.after_save_open {
                                 self.after_save_open = false;
                                 if let Some(next) = self.pending_open.take() {
                                     self.open_file(next);
@@ -309,8 +723,15 @@ impl App {
     }
 
     fn update_projection(&mut self) {
-        self.revision += 1;
         self.editor_line_starts = parser::line_starts(&self.rust);
+        self.schedule_projection_update();
+    }
+    fn source_edited(&mut self, previous: std::ops::Range<usize>, replacement: &str) {
+        line_index::apply_line_patch(&mut self.editor_line_starts, previous, replacement);
+        self.schedule_projection_update();
+    }
+    fn schedule_projection_update(&mut self) {
+        self.revision += 1;
         self.projection_pending = true;
         self.selected = None;
         self.jump_to = None;
@@ -334,6 +755,7 @@ impl App {
             .get_or_insert_with(document_io::DocumentIo::new)
             .save(id, path.clone(), self.saved_source.clone(), content.clone());
         self.saving = Some((id, path, content));
+        self.saving_started = Some(std::time::Instant::now());
         self.status = "正在后台安全保存 Rust 文件…".into();
     }
 
@@ -674,6 +1096,45 @@ impl App {
         ui.label(chinese.mistake);
         ui.small(lesson.common_mistake);
         ui.separator();
+        ui.strong("交互练习 · 选择正确答案");
+        let quiz = &lesson_quiz::QUIZZES[self.lesson];
+        ui.label(quiz.prompt);
+        for (index, choice) in quiz.choices.iter().enumerate() {
+            if ui
+                .selectable_label(
+                    self.quiz_choice == Some(index),
+                    format!("{} · {}", (b'A' + index as u8) as char, choice),
+                )
+                .clicked()
+            {
+                self.quiz_choice = Some(index);
+                if index == quiz.correct {
+                    self.completed_lessons[self.lesson] = true;
+                    self.status = format!("第 {} 课掌握完成，学习进度已保存。", self.lesson + 1);
+                }
+            }
+        }
+        if let Some(chosen) = self.quiz_choice {
+            ui.colored_label(
+                if chosen == quiz.correct {
+                    Color32::GREEN
+                } else {
+                    Color32::YELLOW
+                },
+                if chosen == quiz.correct {
+                    "回答正确 ✓"
+                } else {
+                    "还需巩固，看看下面的原理再试一次。"
+                },
+            );
+            ui.small(quiz.explanation);
+        }
+        let completed = self.completed_lessons.iter().filter(|&&done| done).count();
+        ui.small(format!(
+            "已掌握 {completed}/{} 个核心概念",
+            lessons::LESSONS.len()
+        ));
+        ui.separator();
         ui.horizontal(|ui| {
             if let Some((mode, anchor)) = self.lesson_return
                 && ui.button("← Back to code").clicked()
@@ -687,6 +1148,7 @@ impl App {
                 .clicked()
             {
                 self.lesson -= 1;
+                self.quiz_choice = None;
             }
             if ui
                 .add_enabled(
@@ -696,6 +1158,7 @@ impl App {
                 .clicked()
             {
                 self.lesson += 1;
+                self.quiz_choice = None;
             }
         });
     }
@@ -882,6 +1345,25 @@ impl App {
         if self.opening.is_some() {
             ui.spinner();
             ui.label("文件正在后台读取；当前源码保持原状。");
+            if let Some(started) = self.opening_started {
+                let elapsed = started.elapsed();
+                if elapsed > std::time::Duration::from_secs(20) {
+                    ui.colored_label(
+                        Color32::YELLOW,
+                        "读取耗时较长；网络文件系统调用可能不支持强制中断。",
+                    );
+                }
+                ui.label(format!("已等待 {} 秒", elapsed.as_secs()));
+            }
+            if ui.button("取消读取并保留当前文件").clicked() {
+                if let Some(io) = self.document_io.as_ref() {
+                    io.cancel_open();
+                }
+                self.opening = None;
+                self.opening_started = None;
+                self.discard_on_open = false;
+                self.status = "已取消当前打开请求；旧文件和未保存编辑保持不变。".into();
+            }
             return;
         }
         if self.projection_pending && matches!(self.mode, Mode::Java | Mode::Compare) {
@@ -899,7 +1381,33 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if std::env::var_os("RUSTBRIDGE_PERF_TRACE").is_some() {
+            static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let frame = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if frame % 400 == 0 {
+                eprintln!("TRACE_REPAINT_CAUSES {:?}", ctx.repaint_causes());
+            }
+            if frame % 40 == 0 {
+                eprintln!(
+                    "TRACE frame={} io_open={} io_save={} pending_proj={} pending_symbol={} search={} lsp={} cargo={} state_due={} recovery_due={} mode={} file={}",
+                    frame,
+                    self.opening.is_some(),
+                    self.saving.is_some(),
+                    self.projection_pending,
+                    self.symbol_pending,
+                    self.file_search_pending,
+                    self.lsp_task.is_some(),
+                    self.cargo_task.is_some(),
+                    self.session_due.is_some(),
+                    self.recovery_due.is_some(),
+                    mode_name(self.mode),
+                    self.file.as_ref().map_or("none", |_| "set")
+                );
+            }
+        }
         self.poll_document_io(ctx);
+        self.poll_cargo();
+        self.poll_lsp();
         // Watch real disk metadata off the event thread. Idle windows do not
         // repeatedly repaint just to poll file stamps.
         if let Some(path) = self.file.clone() {
@@ -932,6 +1440,11 @@ impl eframe::App for App {
             self.worker
                 .get_or_insert_with(projection_worker::ProjectionWorker::new)
                 .submit(self.revision, self.rust.clone());
+            if let (Some(task), Some(path)) = (self.lsp_task.as_ref(), self.file.as_ref())
+                && let Ok(path) = path.canonicalize()
+            {
+                task.change(path, self.rust.clone(), self.revision);
+            }
         }
         if let Some((revision, projection)) = self.worker.as_ref().and_then(|worker| worker.take())
             && revision == self.revision
@@ -977,7 +1490,9 @@ impl eframe::App for App {
             self.analyzer_diagnostics_status = result;
             self.analyzer_diagnostics = None;
         }
-        if self.opening.is_some()
+        if self.lsp_task.as_ref().is_some_and(|_| !self.lsp_ready)
+            || self.cargo_task.is_some()
+            || self.opening.is_some()
             || self.saving.is_some()
             || self.symbol_pending
             || self.projection_pending
@@ -987,7 +1502,10 @@ impl eframe::App for App {
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.dirty {
+        if ctx.input(|i| i.viewport().close_requested()) && self.close_requires_confirmation() {
+            if self.saving.is_some() {
+                self.after_save_close = true;
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm_close = true;
         }
@@ -1004,12 +1522,20 @@ impl eframe::App for App {
                         self.after_save_close = true;
                         self.save();
                     }
-                    if ui.button("Discard and close").clicked() {
+                    if ui
+                        .add_enabled(
+                            self.saving.is_none(),
+                            egui::Button::new("Discard and close"),
+                        )
+                        .clicked()
+                    {
+                        self.discard_current_recovery();
                         self.dirty = false;
                         self.confirm_close = false;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     if ui.button("Cancel").clicked() {
+                        self.after_save_close = false;
                         self.confirm_close = false;
                     }
                 });
@@ -1028,13 +1554,78 @@ impl eframe::App for App {
                         self.after_save_open = true;
                         self.save();
                     }
-                    if ui.button("Discard and open").clicked()
+                    if ui
+                        .add_enabled(self.saving.is_none(), egui::Button::new("Discard and open"))
+                        .clicked()
                         && let Some(path) = self.pending_open.take()
                     {
+                        self.discard_on_open = true;
                         self.open_file(path);
                     }
                     if ui.button("Cancel").clicked() {
                         self.pending_open = None;
+                    }
+                });
+            });
+        }
+        if let Some(action) = self.cargo_confirm {
+            egui::Modal::new(egui::Id::new("cargo_authorization")).show(ctx, |ui| {
+                ui.heading(format!("确认执行 {}", action.label()));
+                ui.label(
+                    "Cargo 可能运行项目的 build.rs、测试代码或程序本身，并访问本机文件与网络。",
+                );
+                ui.label("只有在信任该项目时才继续；不会自动执行。");
+                if let Some(root) = self.root.as_ref() {
+                    ui.monospace(root.display().to_string());
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("我信任此项目，执行").clicked() {
+                        self.cargo_confirm = None;
+                        self.start_cargo_action(action);
+                    }
+                    if ui.button("取消").clicked() {
+                        self.cargo_confirm = None;
+                    }
+                });
+            });
+        }
+        if let Some(journal) = self.pending_recovery.clone() {
+            egui::Modal::new(egui::Id::new("recover_unsaved")).show(ctx, |ui| {
+                let unchanged = journal.baseline == self.saved_source;
+                ui.heading("发现崩溃前未保存的 Rust 编辑");
+                ui.label(format!("文件：{}", journal.path.display()));
+                ui.label(if unchanged {
+                    "原始磁盘内容与编辑前一致。可以安全恢复到编辑器，仍需手动保存。"
+                } else {
+                    "磁盘文件已变化！不能直接恢复覆盖。请先导出恢复副本，并自行比对。"
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(unchanged, egui::Button::new("恢复到编辑器"))
+                        .clicked()
+                    {
+                        self.pending_recovery = None;
+                        self.rust = journal.edited.clone();
+                        self.update_projection();
+                        self.dirty = true;
+                        self.mark_dirty_for_recovery();
+                        self.status = "已恢复未保存缓冲区；尚未覆盖磁盘文件。".into();
+                    }
+                    if ui.button("导出恢复副本").clicked() {
+                        let destination = journal.path.with_extension("rustbridge-recovery.rs");
+                        let result = self
+                            .state_store
+                            .as_ref()
+                            .unwrap()
+                            .export_recovery(&journal, &destination);
+                        self.status = match result {
+                            Ok(()) => format!("恢复副本已导出：{}", destination.display()),
+                            Err(error) => format!("导出失败（不会覆盖）：{error}"),
+                        };
+                    }
+                    if ui.button("忽略并清除快照").clicked() {
+                        self.pending_recovery = None;
+                        self.discard_current_recovery();
                     }
                 });
             });
@@ -1081,7 +1672,8 @@ impl eframe::App for App {
             && self.rust.len() >= editor_core::LARGE_EDITOR_BYTES
         {
             if page_delta > 0 {
-                self.editor_page_start = (self.editor_page_start + editor_core::EDITOR_PAGE_LINES)
+                self.editor_page_start = (self.editor_page_start
+                    + editor_core::EDITOR_PAGE_LINES / 2)
                     .min(self.editor_line_starts.len().saturating_sub(1));
             } else {
                 self.editor_page_start = self
@@ -1103,6 +1695,16 @@ impl eframe::App for App {
                 if ui.button("Open folder").clicked()
                     && let Some(folder) = rfd::FileDialog::new().pick_folder()
                 {
+                    if let Some(task)=self.lsp_task.take(){task.cancel();}
+                    self.lsp_ready=false;
+                    self.lsp_status="项目已切换；LSP 已停止，请明确重新启动。".into();
+                    self.lsp_hover.clear();
+                    self.lsp_completions.clear();
+                    self.lsp_definitions.clear();
+                    if let Some(task)=self.cargo_task.take(){task.cancel();}
+                    self.cargo_diagnostics.clear();
+                    self.cargo_log.clear();
+                    self.cargo_status="新项目已打开；Cargo 任务需要重新授权。".into();
                     if let Some(task) = self.analyzer_diagnostics.take() { task.cancel(); }
                     self.analyzer_diagnostics_status = "已切换项目；原项目诊断已取消。".into();
                     self.dir_index = file_tree::DirectoryIndex::new();
@@ -1134,6 +1736,14 @@ impl eframe::App for App {
                 }
                 if self.dirty {
                     ui.colored_label(Color32::YELLOW, "● Unsaved");
+                }
+                if let Some(started)=self.saving_started{
+                    ui.spinner();
+                    ui.small(format!("安全保存中 {}s",started.elapsed().as_secs()));
+                    if started.elapsed()>std::time::Duration::from_secs(20){
+                        ui.colored_label(Color32::YELLOW,
+                            "存储设备响应慢；后台保存不能安全强制终止，请勿退出。");
+                    }
                 }
                 if self.external_change {
                     ui.colored_label(Color32::RED, "Disk changed outside the app");
@@ -1258,17 +1868,151 @@ impl eframe::App for App {
                     self.start_analyzer_diagnostics();
                 }
                 ui.separator();
-                ui.strong("Java 8 → Rust 对照课程");
+                ui.strong("rust-analyzer LSP · 按需启动");
+                ui.small("真实 JSON-RPC：类型悬浮、补全、定义跳转；取消时终止会话。");
+                ui.horizontal_wrapped(|ui| {
+                    if self.lsp_task.is_none() {
+                        if ui
+                            .add_enabled(self.cargo_project, egui::Button::new("启动 LSP"))
+                            .clicked()
+                        {
+                            self.start_lsp();
+                        }
+                    } else if ui.button("停止 LSP").clicked() {
+                        if let Some(task) = self.lsp_task.take() {
+                            task.cancel();
+                        }
+                        self.lsp_ready = false;
+                        self.lsp_status = "rust-analyzer LSP 已停止。".into();
+                    }
+                    if self.lsp_ready {
+                        for (kind, label) in [
+                            (lsp::Kind::Hover, "类型提示"),
+                            (lsp::Kind::Completion, "补全"),
+                            (lsp::Kind::Definition, "跳转定义"),
+                        ] {
+                            if ui.button(label).clicked() {
+                                self.lsp_query(kind);
+                            }
+                        }
+                    }
+                });
+                ui.small(&self.lsp_status);
+                if !self.lsp_hover.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .max_height(120.)
+                        .show(ui, |ui| {
+                            ui.monospace(&self.lsp_hover);
+                        });
+                }
+                if !self.lsp_completions.is_empty() {
+                    let items = self.lsp_completions.clone();
+                    ui.strong("可选补全（应用前请核对）");
+                    egui::ScrollArea::vertical()
+                        .max_height(120.)
+                        .show(ui, |ui| {
+                            for item in items {
+                                if ui.selectable_label(false, &item.label).clicked() {
+                                    self.insert_completion(item);
+                                }
+                            }
+                        });
+                }
+                if !self.lsp_definitions.is_empty() {
+                    let locations = self.lsp_definitions.clone();
+                    ui.strong("真实定义位置");
+                    for location in locations.into_iter().take(8) {
+                        let label = format!(
+                            "{}:{}:{}",
+                            location.path.display(),
+                            location.line + 1,
+                            location.character + 1
+                        );
+                        if ui.selectable_label(false, label).clicked() {
+                            self.jump_lsp_definition(location);
+                        }
+                    }
+                }
+                ui.separator();
+                ui.strong("Cargo 工程 / Build · Test · Run");
+                ui.small("手动确认后运行；cargo check 也可能执行 build.rs。");
+                ui.horizontal_wrapped(|ui| {
+                    for action in [
+                        cargo_runner::Action::Check,
+                        cargo_runner::Action::Test,
+                        cargo_runner::Action::Run,
+                    ] {
+                        if ui
+                            .add_enabled(
+                                self.cargo_project
+                                    && self.cargo_task.is_none()
+                                    && !self.dirty
+                                    && self.saving.is_none(),
+                                egui::Button::new(action.label()),
+                            )
+                            .clicked()
+                        {
+                            self.cargo_confirm = Some(action);
+                        }
+                    }
+                    if let Some(task) = self.cargo_task.as_ref()
+                        && ui.button("取消任务").clicked()
+                    {
+                        task.cancel();
+                    }
+                });
+                ui.small(&self.cargo_status);
+                let diagnostics = self.cargo_diagnostics.clone();
+                egui::ScrollArea::vertical()
+                    .max_height(170.)
+                    .show(ui, |ui| {
+                        for diag in diagnostics {
+                            let label = format!(
+                                "{} {}:{}:{} {}",
+                                diag.level,
+                                diag.path.file_name().unwrap_or_default().to_string_lossy(),
+                                diag.line,
+                                diag.column,
+                                diag.message
+                            );
+                            if ui
+                                .selectable_label(false, label)
+                                .on_hover_text(diag.path.display().to_string())
+                                .clicked()
+                            {
+                                self.jump_to_cargo_diagnostic(diag);
+                            }
+                        }
+                        for line in self.cargo_log.iter().rev().take(25) {
+                            ui.small(line);
+                        }
+                    });
+                ui.separator();
+                let complete_count = self.completed_lessons.iter().filter(|&&done| done).count();
+                ui.strong(format!(
+                    "Java 8 → Rust 课程 · {complete_count}/{}",
+                    lessons::LESSONS.len()
+                ));
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (idx, lesson) in lessons::LESSONS.iter().enumerate() {
                         if ui
                             .selectable_label(
                                 self.lesson == idx,
-                                format!("{:02} · {}", idx + 1, lesson.java),
+                                format!(
+                                    "{} {:02} · {}",
+                                    if self.completed_lessons.get(idx) == Some(&true) {
+                                        "✓"
+                                    } else {
+                                        "·"
+                                    },
+                                    idx + 1,
+                                    lesson.java
+                                ),
                             )
                             .clicked()
                         {
                             self.lesson = idx;
+                            self.quiz_choice = None;
                             self.mode = Mode::Learn;
                         }
                     }
@@ -1301,7 +2045,7 @@ impl eframe::App for App {
                 );
                 ui.weak(format!(
                     " · {} lines · AST aligned",
-                    self.rust.lines().count()
+                    self.editor_line_starts.len()
                 ));
             });
             ui.separator();
@@ -1311,7 +2055,47 @@ impl eframe::App for App {
             self.save();
             ctx.request_repaint();
         }
+        self.poll_persistence();
+        if self.recovery_due.is_some() || self.session_due.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
     }
+}
+
+fn diagnostic_location(source: &str, line: usize, column: usize) -> parser::ByteSpan {
+    let starts = parser::line_starts(source);
+    let start = *starts.get(line.saturating_sub(1)).unwrap_or(&0);
+    let end = *starts.get(line).unwrap_or(&source.len());
+    let range = &source[start..end];
+    let byte = range
+        .char_indices()
+        .nth(column.saturating_sub(1))
+        .map_or(end, |(offset, _)| start + offset);
+    parser::ByteSpan {
+        start: byte,
+        end: byte,
+    }
+}
+fn mode_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Java => "java",
+        Mode::Rust => "rust",
+        Mode::Compare => "compare",
+        Mode::Learn => "learn",
+    }
+}
+fn mode_from_name(value: &str) -> Mode {
+    match value {
+        "rust" => Mode::Rust,
+        "compare" => Mode::Compare,
+        "learn" => Mode::Learn,
+        _ => Mode::Java,
+    }
+}
+fn normalized_completion(list: &[bool]) -> Vec<bool> {
+    (0..lessons::LESSONS.len())
+        .map(|i| list.get(i).copied().unwrap_or(false))
+        .collect()
 }
 
 fn is_cargo_root(path: &Path) -> bool {
@@ -1335,6 +2119,7 @@ fn main() -> eframe::Result {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             let _ = ui_fonts::install_system_cjk_fallback(&cc.egui_ctx);
             let mut app = App::default();
+            app.initialize_state(startup_path.is_none());
             if let Some(path) = startup_path {
                 if path.is_dir() {
                     app.cargo_project = is_cargo_root(&path);
@@ -1355,6 +2140,30 @@ mod file_tests {
     use super::*;
     use crate::editor_core::{append_rust_syntax, editor_page_bounds};
 
+    #[test]
+    fn closing_a_background_save_always_requires_confirmation() {
+        let mut app = App::default();
+        assert!(!app.close_requires_confirmation());
+        app.dirty = true;
+        assert!(app.close_requires_confirmation());
+        app.dirty = false;
+        let path = std::env::temp_dir().join("rustbridge-lifecycle.rs");
+        app.saving = Some((2, path, "new".into()));
+        assert!(app.close_requires_confirmation());
+    }
+    #[test]
+    fn failed_open_never_discards_the_last_dirty_buffer() {
+        let mut app = App::default();
+        app.rust.push_str("\n// unsaved");
+        app.dirty = true;
+        let before = app.rust.clone();
+        app.discard_on_open = true;
+        app.open_file(std::env::temp_dir().join("this-path-does-not-exist-failed-open.rs"));
+        app.wait_for_document_io();
+        assert_eq!(app.rust, before);
+        assert!(app.dirty);
+        assert!(!app.discard_on_open);
+    }
     #[test]
     fn external_changes_and_deletion_block_save() {
         let path =

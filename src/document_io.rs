@@ -1,4 +1,4 @@
-//! File I/O occurs on one bounded background worker, never inside an egui draw callback.
+//! Source opens and saves run on two separately bounded background workers, never in egui.
 //! Open requests are supersedable; saves are explicit, serialized and never silently cancelled.
 use crate::{
     file_watch::{FileStamp, file_stamp},
@@ -17,6 +17,7 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
+    time::{Duration, Instant},
 };
 pub const MAX_DOCUMENT_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -70,52 +71,69 @@ impl DocumentIo {
             cv: Condvar::new(),
             latest_open: AtomicU64::new(0),
         });
-        let work = Arc::clone(&shared);
         let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            loop {
-                let job = {
-                    let mut state = work.state.lock().unwrap();
-                    while state.queue.is_empty() && !state.closed {
-                        state = work.cv.wait(state).unwrap();
-                    }
-                    if state.closed && state.queue.is_empty() {
+        // A hung remote filesystem read cannot prevent an unrelated explicit
+        // source save from progressing: two fixed workers handle separate queues.
+        for open_role in [true, false] {
+            let work = Arc::clone(&shared);
+            let sender = sender.clone();
+            thread::spawn(move || {
+                loop {
+                    let job = {
+                        let mut state = work.state.lock().unwrap();
+                        loop {
+                            let index = state
+                                .queue
+                                .iter()
+                                .position(|job| matches!(job, Job::Open { .. }) == open_role);
+                            if let Some(index) = index {
+                                break state.queue.remove(index);
+                            }
+                            if state.closed {
+                                break None;
+                            }
+                            state = work.cv.wait(state).unwrap();
+                        }
+                    };
+                    let Some(job) = job else {
                         return;
-                    }
-                    state.queue.pop_front().unwrap()
-                };
-                let reply = match job {
-                    Job::Open { id, path } => {
-                        if work.latest_open.load(Ordering::Acquire) != id {
-                            continue;
+                    };
+                    let reply = match job {
+                        Job::Open { id, path } => {
+                            if work.latest_open.load(Ordering::Acquire) != id {
+                                continue;
+                            }
+                            let result = read_capped(
+                                &path,
+                                || work.latest_open.load(Ordering::Relaxed) != id,
+                                Duration::from_secs(30),
+                            );
+                            if work.latest_open.load(Ordering::Acquire) != id {
+                                continue;
+                            }
+                            Reply::Open { id, path, result }
                         }
-                        let result =
-                            read_capped(&path, || work.latest_open.load(Ordering::Relaxed) != id);
-                        if work.latest_open.load(Ordering::Acquire) != id {
-                            continue;
-                        }
-                        Reply::Open { id, path, result }
-                    }
-                    Job::Save {
-                        id,
-                        path,
-                        expected,
-                        content,
-                    } => {
-                        let result = save_if_unchanged(&path, &expected, &content);
-                        Reply::Save {
+                        Job::Save {
                             id,
                             path,
+                            expected,
                             content,
-                            result,
+                        } => {
+                            let result = save_if_unchanged(&path, &expected, &content);
+                            Reply::Save {
+                                id,
+                                path,
+                                content,
+                                result,
+                            }
                         }
+                    };
+                    if sender.send(reply).is_err() {
+                        return;
                     }
-                };
-                if sender.send(reply).is_err() {
-                    return;
                 }
-            }
-        });
+            });
+        }
         Self { shared, receiver }
     }
     pub fn open(&self, id: u64, path: PathBuf) {
@@ -123,7 +141,7 @@ impl DocumentIo {
         self.shared.latest_open.store(id, Ordering::Release);
         state.queue.retain(|job| !matches!(job, Job::Open { .. }));
         state.queue.push_back(Job::Open { id, path });
-        self.shared.cv.notify_one();
+        self.shared.cv.notify_all();
     }
     pub fn save(&self, id: u64, path: PathBuf, expected: String, content: String) {
         let mut state = self.shared.state.lock().unwrap();
@@ -142,7 +160,13 @@ impl DocumentIo {
                 content,
             },
         );
-        self.shared.cv.notify_one();
+        self.shared.cv.notify_all();
+    }
+    pub fn cancel_open(&self) {
+        let mut state = self.shared.state.lock().unwrap();
+        self.shared.latest_open.store(u64::MAX, Ordering::Release);
+        state.queue.retain(|job| !matches!(job, Job::Open { .. }));
+        self.shared.cv.notify_all();
     }
     pub fn take(&self) -> Option<Reply> {
         self.receiver.try_recv().ok()
@@ -161,11 +185,12 @@ impl Drop for DocumentIo {
         s.queue.retain(|job| matches!(job, Job::Save { .. }));
         s.closed = true;
         self.shared.latest_open.store(u64::MAX, Ordering::Release);
-        self.shared.cv.notify_one();
+        self.shared.cv.notify_all();
     }
 }
 
-fn read_capped(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<Loaded> {
+fn read_capped(path: &Path, cancelled: impl Fn() -> bool, timeout: Duration) -> io::Result<Loaded> {
+    let started = Instant::now();
     if path.extension().is_none_or(|ext| ext != "rs") {
         return Err(io::Error::other("Only real .rs files are supported."));
     }
@@ -194,6 +219,12 @@ fn read_capped(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<Loaded> 
     let mut buffer = Vec::with_capacity(size.min(1024 * 1024) as usize);
     let mut chunk = [0u8; 64 * 1024];
     loop {
+        if started.elapsed() >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Source read exceeded deadline; filesystem call cannot be interrupted.",
+            ));
+        }
         if cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -270,10 +301,20 @@ mod tests {
         let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
         let start = std::time::Instant::now();
-        let result = read_capped(&path, || false);
+        let result = read_capped(&path, || false, Duration::from_secs(5));
         assert!(result.is_err());
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn read_deadline_is_enforced_even_if_source_is_regular() {
+        let dir = std::env::temp_dir().join(format!("rustbridge-timeout-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("timeout.rs");
+        fs::write(&path, vec![b'a'; 32 * 1024]).unwrap();
+        assert!(read_capped(&path, || false, Duration::ZERO).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -285,7 +326,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_DOCUMENT_BYTES + 1)
             .unwrap();
-        assert!(read_capped(&path, || false).is_err());
+        assert!(read_capped(&path, || false, Duration::from_secs(5)).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 }

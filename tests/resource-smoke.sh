@@ -9,6 +9,7 @@ cleanup() {
   rm -rf "$DIR"
 }
 trap cleanup EXIT
+export RUSTBRIDGE_STATE_DIR="$DIR/state"
 unset WAYLAND_DISPLAY
 export WINIT_UNIX_BACKEND=x11 XDG_SESSION_TYPE=x11 GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1
 python3 - "$DIR/large.rs" <<'PY'

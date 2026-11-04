@@ -1,0 +1,34 @@
+name: RustBridge GUI endurance
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'Linux interactive large-Rust-source soak duration (1-60 minutes)'
+        required: false
+        default: '15'
+  schedule:
+    - cron: '20 3 * * 0'
+permissions:
+  contents: read
+jobs:
+  linux-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libx11-xcb-dev libgl1-mesa-dev libgl1-mesa-dri xvfb xdotool
+      - name: Native Release build once
+        run: cargo build --release
+      - name: Interactive large-file memory/fd endurance
+        shell: bash
+        env:
+          REQUESTED_MINUTES: ${{ github.event.inputs.minutes }}
+        run: |
+          MINUTES="$REQUESTED_MINUTES"
+          if [[ -z "$MINUTES" ]]; then MINUTES=30; fi
+          if ! [[ "$MINUTES" =~ ^[0-9]+$ ]]; then exit 2; fi
+          if (( MINUTES < 1 || MINUTES > 60 )); then exit 2; fi
+          xvfb-run -a -s '-screen 0 1440x900x24' \
+            bash tests/soak.sh ./target/release/rustbridge "$(( MINUTES * 60 ))"

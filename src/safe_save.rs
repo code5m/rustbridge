@@ -16,6 +16,11 @@ use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
 };
 
+#[cfg(any(windows, target_os = "macos"))]
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +40,38 @@ impl Drop for PendingTemp {
 
 fn conflict(message: &str) -> io::Error {
     io::Error::other(message)
+}
+#[cfg(unix)]
+fn lock_concurrent_rustbridge_saves(path: &Path) -> io::Result<File> {
+    use std::{
+        hash::{Hash, Hasher},
+        os::fd::AsRawFd,
+        os::unix::fs::OpenOptionsExt,
+    };
+    let canonical = path.canonicalize()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    let dir = crate::persistence::Store::from_system()?
+        .directory()
+        .join("locks");
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let target = dir.join(format!("{:016x}.lock", hasher.finish()));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(target)?;
+    // SAFETY: live owned file descriptor, nonblocking advisory mutex per real path.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        return Err(io::Error::other(
+            "Another RustBridge process is saving this file. Retry after it finishes.",
+        ));
+    }
+    Ok(file)
 }
 
 pub fn save_if_unchanged(path: &Path, expected: &str, content: &str) -> io::Result<SaveOutcome> {
@@ -59,6 +96,10 @@ fn save_with_hooks(
     before_commit: impl FnOnce() -> io::Result<()>,
     sync_directory: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<SaveOutcome> {
+    // A stable per-path OS advisory lock serializes cooperating RustBridge
+    // processes across rename. It does NOT lock out unrelated editors.
+    #[cfg(unix)]
+    let _save_lock = lock_concurrent_rustbridge_saves(path)?;
     let original_meta = fs::symlink_metadata(path)?;
     if original_meta.file_type().is_symlink() || !original_meta.is_file() {
         return Err(conflict(
@@ -88,11 +129,11 @@ fn save_with_hooks(
             return Err(conflict("Current file owner has no write permission."));
         }
     }
-    // Unknown platform-specific metadata and replacement semantics are not silently discarded.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    return Err(conflict(
-        "Metadata-preserving atomic save has not been implemented on this platform.",
-    ));
+    // On macOS/Windows an in-place handle write retains ACLs and file identity,
+    // unlike a naive rename. It is accompanied by a private fsynced rollback
+    // copy; unlike the Linux stage+rename it is NOT power-loss atomic.
+    #[cfg(any(windows, target_os = "macos"))]
+    return portable_save_in_place(path, expected, content, before_commit, sync_directory);
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -165,6 +206,92 @@ fn save_with_hooks(
             Ok(()) => Ok(SaveOutcome::Durable),
             Err(error) => Ok(SaveOutcome::CommittedDurabilityUncertain(error.to_string())),
         }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn portable_save_in_place(
+    path: &Path,
+    expected: &str,
+    content: &str,
+    before_commit: impl FnOnce() -> io::Result<()>,
+    sync_directory: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<SaveOutcome> {
+    // The original handle remains open for the entire transaction, preserving
+    // security descriptors, alternate streams, Finder tags and ownership.
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(windows)]
+    {
+        options.share_mode(0);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.permissions().readonly() {
+        return Err(conflict(
+            "Refusing to edit unsupported or read-only source.",
+        ));
+    }
+    let mut actual = String::new();
+    file.read_to_string(&mut actual)?;
+    if actual != expected {
+        return Err(conflict(
+            "File changed externally before save; write denied.",
+        ));
+    }
+    if expected == content {
+        return Ok(SaveOutcome::Durable);
+    }
+    before_commit()?;
+    // Create an independent, user-private rollback before a non-atomic in-place
+    // write, so a crash can be recovered manually even on Windows/macOS.
+    let backup_dir = crate::persistence::Store::from_system()?
+        .directory()
+        .join("write-backups");
+    fs::create_dir_all(&backup_dir)?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let counter = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let backup = backup_dir.join(format!("backup-{}-{counter:016x}.rs", std::process::id()));
+    {
+        let mut stage = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)?;
+        stage.write_all(expected.as_bytes())?;
+        stage.sync_all()?;
+    }
+    // Keep the backup when the write fails, leaving a recovery option.
+    file.seek(SeekFrom::Start(0))?;
+    let commit = (|| {
+        file.write_all(content.as_bytes())?;
+        file.set_len(content.len() as u64)?;
+        file.sync_all()
+    })();
+    if let Err(error) = commit {
+        let _ = file.seek(SeekFrom::Start(0));
+        let restored = file
+            .write_all(expected.as_bytes())
+            .and_then(|()| file.set_len(expected.len() as u64))
+            .and_then(|()| file.sync_all());
+        if restored.is_err() {
+            return Err(io::Error::other(format!(
+                "Save failed and rollback could not be verified: {error}. Backup: {}",
+                backup.display()
+            )));
+        }
+        return Err(error);
+    }
+    let _ = fs::remove_file(&backup);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match sync_directory(parent) {
+        Ok(()) => Ok(SaveOutcome::Durable),
+        Err(error) => Ok(SaveOutcome::CommittedDurabilityUncertain(error.to_string())),
     }
 }
 
@@ -252,6 +379,43 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+    #[cfg(unix)]
+    #[test]
+    fn multiple_rustbridge_process_saves_cannot_commit_simultaneously() {
+        use std::sync::{Arc, Barrier};
+        let dir = fixture();
+        let path = dir.join("shared.rs");
+        fs::write(&path, "base").unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let path_worker = path.clone();
+        let entered_worker = entered.clone();
+        let release_worker = release.clone();
+        let first = std::thread::spawn(move || {
+            save_with_hooks(
+                &path_worker,
+                "base",
+                "first",
+                || {
+                    entered_worker.wait();
+                    release_worker.wait();
+                    Ok(())
+                },
+                sync_parent,
+            )
+        });
+        entered.wait();
+        let competing = save_if_unchanged(&path, "base", "second");
+        assert!(
+            competing.is_err(),
+            "competing RustBridge writer must not override a locked save"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "base");
+        release.wait();
+        assert_eq!(first.join().unwrap().unwrap(), SaveOutcome::Durable);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn atomic_save_and_rollback() {

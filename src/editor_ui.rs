@@ -3,7 +3,7 @@ use super::editor_core::{
     EDITOR_PAGE_LINES, LARGE_EDITOR_BYTES, append_rust_syntax, editor_page_bounds,
     line_number_gutter,
 };
-use crate::{App, editor_eol, parser};
+use crate::{App, editor_eol, line_index, parser};
 use eframe::egui::{self, Color32};
 
 impl App {
@@ -125,13 +125,22 @@ impl App {
         let mut output = output.expect("Rust source editor always renders");
         if output.response.changed() {
             let original_view = editor_eol::for_display(&self.rust);
-            self.rust = editor_eol::apply_display_edit(&self.rust, &original_view, &editor_text);
-            self.update_projection();
+            let updated = editor_eol::apply_display_edit(&self.rust, &original_view, &editor_text);
+            let (physical_range, insert) = line_index::minimal_diff(&self.rust, &updated);
+            let range = physical_range.clone();
+            let inserted = insert.to_owned();
+            self.rust = updated;
+            self.source_edited(range, &inserted);
             self.dirty = self.rust != self.saved_source;
+            self.mark_dirty_for_recovery();
             self.editor_find = None;
             self.editor_jump = None;
             self.selected = None;
             self.status = "Source edited; updating the reading projection.".into();
+        }
+        if let Some(cursor) = output.cursor_range {
+            let displayed = parser::char_to_byte(&editor_text, cursor.primary.index);
+            self.cursor_byte = editor_eol::display_to_original(&self.rust, displayed);
         }
         if !self.projection_pending
             && output.response.clicked()
@@ -173,45 +182,32 @@ impl App {
                 .editor_line_starts
                 .partition_point(|&begin| begin <= span.start)
                 .saturating_sub(1);
-            self.editor_page_start = (line / EDITOR_PAGE_LINES) * EDITOR_PAGE_LINES;
+            self.editor_page_start = line.saturating_sub(EDITOR_PAGE_LINES / 2);
             self.editor_page_target = line + 1;
+            self.editor_scroll_override = None;
         }
-        self.editor_page_start = self.editor_page_start.min(lines.saturating_sub(1));
+        self.editor_page_start = self
+            .editor_page_start
+            .min(lines.saturating_sub(EDITOR_PAGE_LINES));
         ui.horizontal_wrapped(|ui| {
-            ui.colored_label(
-                Color32::YELLOW,
-                format!(
-                    "大文件分页编辑 · 只渲染当前 {} 行，其余原始文件保持不变",
-                    EDITOR_PAGE_LINES
-                ),
+            ui.colored_label(Color32::YELLOW, "大文件连续浏览 · 只加载少量编辑行");
+            ui.label(format!("全文件 {} 行", lines));
+            let response = ui.add(
+                egui::Slider::new(&mut self.editor_page_target, 1..=lines.max(1))
+                    .text("全局行位置"),
             );
-            if ui
-                .add_enabled(self.editor_page_start > 0, egui::Button::new("上一页"))
-                .clicked()
-            {
-                self.editor_page_start = self.editor_page_start.saturating_sub(EDITOR_PAGE_LINES);
-            }
-            if ui
-                .add_enabled(
-                    self.editor_page_start + EDITOR_PAGE_LINES < lines,
-                    egui::Button::new("下一页"),
-                )
-                .clicked()
-            {
-                self.editor_page_start += EDITOR_PAGE_LINES;
-            }
-            ui.label("行:");
-            ui.add(egui::DragValue::new(&mut self.editor_page_target).range(1..=lines.max(1)));
-            if ui.button("跳转").clicked() {
-                self.editor_page_start = ((self.editor_page_target.saturating_sub(1))
-                    / EDITOR_PAGE_LINES)
-                    * EDITOR_PAGE_LINES;
+            if response.changed() {
+                self.editor_page_start = self
+                    .editor_page_target
+                    .saturating_sub(1)
+                    .min(lines.saturating_sub(EDITOR_PAGE_LINES));
+                self.editor_scroll_override = Some(0.);
             }
         });
         let first = self.editor_page_start;
         let last = (first + EDITOR_PAGE_LINES).min(lines);
         ui.small(format!(
-            "当前显示第 {}–{} 行 / 总计 {} 行；跨页修改仍保存到同一个真实 .rs 文件。",
+            "当前编辑窗口第 {}–{} 行 / 总计 {} 行；滚轮、Ctrl+PageDown、上方滑条可连续导航整份文件。",
             first + 1,
             last,
             lines
@@ -261,33 +257,66 @@ impl App {
             ui.fonts_mut(|fonts| fonts.layout_job(job))
         };
         let mut output = None;
-        egui::ScrollArea::both()
-            .id_salt(("rust_page_scroll", &self.file, first))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(line_numbers).monospace().weak())
-                            .selectable(false),
-                    );
-                    output = Some(
-                        egui::TextEdit::multiline(&mut page)
-                            .id_salt(("rust_page_editor", &self.file, first))
-                            .font(egui::TextStyle::Monospace)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .layouter(&mut layouter)
-                            .show(ui),
-                    );
-                });
+        let mut scroll_area = egui::ScrollArea::both()
+            .id_salt(("rust_virtual_scroll", &self.file, first))
+            .auto_shrink([false, false]);
+        if let Some(offset) = self.editor_scroll_override.take() {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+        }
+        let scroll_result = scroll_area.show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(line_numbers).monospace().weak())
+                        .selectable(false),
+                );
+                output = Some(
+                    egui::TextEdit::multiline(&mut page)
+                        .id_salt(("rust_page_editor", &self.file, first))
+                        .font(egui::TextStyle::Monospace)
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .layouter(&mut layouter)
+                        .show(ui),
+                );
             });
+        });
+        let wheel = ui.input(|input| input.raw_scroll_delta.y);
+        let hovered = ui.rect_contains_pointer(scroll_result.inner_rect);
+        let max_y = (scroll_result.content_size.y - scroll_result.inner_rect.height()).max(0.);
+        let shift_lines = EDITOR_PAGE_LINES / 2;
+        if hovered
+            && wheel < -0.1
+            && scroll_result.state.offset.y >= max_y - 8.
+            && first + EDITOR_PAGE_LINES < lines
+        {
+            let next = (first + shift_lines).min(lines.saturating_sub(EDITOR_PAGE_LINES));
+            let moved = next - first;
+            self.editor_page_start = next;
+            self.editor_page_target = next + 1;
+            self.editor_scroll_override =
+                Some((scroll_result.state.offset.y - moved as f32 * 18.).max(0.));
+            ui.ctx().request_repaint();
+        } else if hovered && wheel > 0.1 && scroll_result.state.offset.y <= 8. && first > 0 {
+            let next = first.saturating_sub(shift_lines);
+            let moved = first - next;
+            self.editor_page_start = next;
+            self.editor_page_target = next + 1;
+            self.editor_scroll_override = Some(scroll_result.state.offset.y + moved as f32 * 18.);
+            ui.ctx().request_repaint();
+        }
         if let Some(mut output) = output {
             if output.response.changed() {
                 let original_view = editor_eol::for_display(&physical_page);
                 let patch = editor_eol::apply_display_edit(&physical_page, &original_view, &page);
                 self.rust.replace_range(range.clone(), &patch);
-                self.update_projection();
+                self.source_edited(range.clone(), &patch);
+                if let Some(cursor) = output.cursor_range {
+                    let visible = parser::char_to_byte(&page, cursor.primary.index);
+                    self.cursor_byte =
+                        range.start + editor_eol::display_to_original(&patch, visible);
+                }
                 self.dirty = self.rust != self.saved_source;
+                self.mark_dirty_for_recovery();
                 self.editor_find = None;
                 self.selected = None;
                 self.status = "大文件当前页已编辑；后台增量重建 AST 投影。".into();
@@ -301,6 +330,13 @@ impl App {
                     byte.checked_sub(1)
                         .and_then(|b| self.projection.rust_anchor(b))
                 });
+            }
+            if !output.response.changed()
+                && let Some(cursor) = output.cursor_range
+            {
+                let displayed = parser::char_to_byte(&page, cursor.primary.index);
+                self.cursor_byte =
+                    range.start + editor_eol::display_to_original(&physical_page, displayed);
             }
             if let Some(span) = target.filter(|s| s.start >= range.start && s.end <= range.end) {
                 use egui::text::{CCursor, CCursorRange};
