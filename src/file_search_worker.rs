@@ -111,11 +111,19 @@ fn search(request: &Request, is_cancelled: impl Fn() -> bool) -> Vec<PathBuf> {
             let path = entry.path();
             let name = entry.file_name();
             let excluded = matches!(name.to_str(), Some(".git" | "target" | "node_modules"));
-            if path.is_dir() {
+            // Never follow symlinks while scanning: avoid cycles and leaving the selected root.
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
                 if request.show_excluded || !excluded {
                     pending.push_back((path, depth + 1));
                 }
-            } else if path.extension().is_some_and(|extension| extension == "rs")
+            } else if kind.is_file()
+                && path.extension().is_some_and(|extension| extension == "rs")
                 && name.to_string_lossy().to_lowercase().contains(&query)
             {
                 results.push(path);

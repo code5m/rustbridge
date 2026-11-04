@@ -1,12 +1,23 @@
 mod analyzer;
 mod code_view;
+mod editor_core;
+mod editor_eol;
+mod editor_ui;
 mod file_search_worker;
+mod file_tree;
+mod file_watch;
 mod lessons;
 mod parser;
 mod projection_worker;
+mod safe_save;
+mod ui_fonts;
 
+use editor_core::line_number_gutter;
 use eframe::egui::{self, Color32};
+use file_watch::{FileStamp, file_stamp};
+use safe_save::save_if_unchanged;
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -17,206 +28,6 @@ enum Mode {
     Rust,
     Compare,
     Learn,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FileStamp {
-    len: u64,
-    modified: Option<std::time::SystemTime>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SyntaxToken {
-    Comment,
-    String,
-    Word,
-    Plain,
-}
-
-fn quoted_end(rest: &str, quote: char) -> usize {
-    let mut escaped = false;
-    for (offset, character) in rest[1..].char_indices() {
-        if character == '\n' || character == '\r' {
-            break;
-        }
-        if character == quote && !escaped {
-            return offset + 2;
-        }
-        escaped = character == '\\' && !escaped;
-        if character != '\\' {
-            escaped = false;
-        }
-    }
-    1
-}
-
-fn raw_string_end(rest: &str) -> Option<usize> {
-    let bytes = rest.as_bytes();
-    let prefix = if rest.starts_with("br") {
-        2
-    } else if rest.starts_with('r') {
-        1
-    } else {
-        return None;
-    };
-    let hashes = bytes[prefix..]
-        .iter()
-        .take_while(|byte| **byte == b'#')
-        .count();
-    if bytes.get(prefix + hashes) != Some(&b'"') {
-        return None;
-    }
-    let terminator = format!("\"{}", "#".repeat(hashes));
-    rest[prefix + hashes + 1..]
-        .find(&terminator)
-        .map(|offset| prefix + hashes + 1 + offset + terminator.len())
-        .or(Some(rest.len()))
-}
-
-fn block_comment_end(rest: &str) -> usize {
-    let mut depth = 1;
-    let mut index = 2;
-    while index + 1 < rest.len() {
-        match &rest[index..index + 2] {
-            "/*" => {
-                depth += 1;
-                index += 2;
-            }
-            "*/" => {
-                depth -= 1;
-                index += 2;
-                if depth == 0 {
-                    return index;
-                }
-            }
-            _ => index += rest[index..].chars().next().unwrap().len_utf8(),
-        }
-    }
-    rest.len()
-}
-
-fn next_rust_token(rest: &str) -> (usize, SyntaxToken) {
-    if rest.starts_with("//") {
-        return (rest.find('\n').unwrap_or(rest.len()), SyntaxToken::Comment);
-    }
-    if rest.starts_with("/*") {
-        return (block_comment_end(rest), SyntaxToken::Comment);
-    }
-    if let Some(end) = raw_string_end(rest) {
-        return (end, SyntaxToken::String);
-    }
-    if rest.starts_with("b\"") {
-        return (1 + quoted_end(&rest[1..], '"'), SyntaxToken::String);
-    }
-    if rest.starts_with("b'") {
-        return (1 + quoted_end(&rest[1..], '\''), SyntaxToken::String);
-    }
-    if rest.starts_with('"') {
-        return (quoted_end(rest, '"'), SyntaxToken::String);
-    }
-    if rest.starts_with('\'') {
-        return (quoted_end(rest, '\''), SyntaxToken::String);
-    }
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|character| character.is_alphabetic() || character == '_')
-    {
-        return (
-            rest.char_indices()
-                .find(|(_, character)| !character.is_alphanumeric() && *character != '_')
-                .map_or(rest.len(), |(end, _)| end),
-            SyntaxToken::Word,
-        );
-    }
-    (rest.chars().next().unwrap().len_utf8(), SyntaxToken::Plain)
-}
-
-fn append_rust_syntax(
-    job: &mut egui::text::LayoutJob,
-    text: &str,
-    font: &egui::FontId,
-    base: Color32,
-    active: Option<parser::ByteSpan>,
-) {
-    let format = |color, start: usize, end: usize| egui::TextFormat {
-        font_id: font.clone(),
-        color,
-        background: if active.is_some_and(|span| span.start < end && start < span.end) {
-            Color32::from_rgb(53, 103, 155)
-        } else {
-            Color32::TRANSPARENT
-        },
-        ..Default::default()
-    };
-    let keyword = |word: &str| {
-        matches!(
-            word,
-            "as" | "async"
-                | "await"
-                | "break"
-                | "const"
-                | "continue"
-                | "crate"
-                | "dyn"
-                | "else"
-                | "enum"
-                | "extern"
-                | "false"
-                | "fn"
-                | "for"
-                | "if"
-                | "impl"
-                | "in"
-                | "let"
-                | "loop"
-                | "match"
-                | "mod"
-                | "move"
-                | "mut"
-                | "pub"
-                | "ref"
-                | "return"
-                | "self"
-                | "Self"
-                | "static"
-                | "struct"
-                | "super"
-                | "trait"
-                | "true"
-                | "type"
-                | "unsafe"
-                | "use"
-                | "where"
-                | "while"
-        )
-    };
-    let mut index = 0;
-    while index < text.len() {
-        let rest = &text[index..];
-        let (length, kind) = next_rust_token(rest);
-        let end = index + length;
-        let token = &text[index..end];
-        let color = if kind == SyntaxToken::Comment {
-            Color32::from_rgb(112, 142, 112)
-        } else if kind == SyntaxToken::String {
-            Color32::from_rgb(202, 162, 98)
-        } else if kind == SyntaxToken::Word && keyword(token) {
-            Color32::from_rgb(126, 188, 247)
-        } else {
-            base
-        };
-        job.append(token, 0.0, format(color, index, end));
-        index = end;
-    }
-}
-
-fn line_number_gutter(text: &str) -> String {
-    let line_count = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    (1..=line_count)
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 struct App {
@@ -241,6 +52,8 @@ struct App {
     confirm_close: bool,
     pending_open: Option<PathBuf>,
     show_excluded: bool,
+    dir_index: file_tree::DirectoryIndex,
+    directory_limits: HashMap<PathBuf, usize>,
     file_query: String,
     search_results: Vec<PathBuf>,
     file_search_worker: Option<file_search_worker::FileSearchWorker>,
@@ -249,10 +62,15 @@ struct App {
     recent_files: Vec<PathBuf>,
     disk_stamp: Option<FileStamp>,
     external_change: bool,
-    next_disk_check: std::time::Instant,
+    file_watch: Option<file_watch::FileWatch>,
     editor_query: String,
     editor_find: Option<parser::ByteSpan>,
     editor_jump: Option<parser::ByteSpan>,
+    editor_line_starts: Vec<usize>,
+    editor_gutter: String,
+    editor_gutter_revision: u64,
+    editor_page_start: usize,
+    editor_page_target: usize,
     lesson_return: Option<(Mode, Option<usize>)>,
     analyzer_status: String,
     analyzer_check: Option<std::sync::mpsc::Receiver<String>>,
@@ -264,6 +82,8 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         let rust = include_str!("../examples/basics.rs").to_owned();
+        let editor_line_starts = parser::line_starts(&rust);
+        let editor_gutter = line_number_gutter(&rust);
         Self {
             root: None,
             cargo_project: false,
@@ -286,6 +106,8 @@ impl Default for App {
             confirm_close: false,
             pending_open: None,
             show_excluded: false,
+            dir_index: file_tree::DirectoryIndex::new(),
+            directory_limits: HashMap::new(),
             file_query: String::new(),
             search_results: Vec::new(),
             file_search_worker: None,
@@ -294,10 +116,15 @@ impl Default for App {
             recent_files: Vec::new(),
             disk_stamp: None,
             external_change: false,
-            next_disk_check: std::time::Instant::now(),
+            file_watch: None,
             editor_query: String::new(),
             editor_find: None,
             editor_jump: None,
+            editor_line_starts,
+            editor_gutter,
+            editor_gutter_revision: 0,
+            editor_page_start: 0,
+            editor_page_target: 1,
             lesson_return: None,
             analyzer_status: "Not checked; core reading does not require rust-analyzer.".into(),
             analyzer_check: None,
@@ -321,6 +148,7 @@ impl App {
     fn open_file(&mut self, path: PathBuf) {
         match fs::read_to_string(&path) {
             Ok(text) => {
+                self.file_watch = None;
                 self.disk_stamp = file_stamp(&path).ok();
                 self.external_change = false;
                 self.saved_source = text.clone();
@@ -333,6 +161,8 @@ impl App {
                 self.jump_to = None;
                 self.editor_find = None;
                 self.editor_jump = None;
+                self.editor_page_start = 0;
+                self.editor_page_target = 1;
                 self.scroll_follow = None;
                 self.last_scroll = None;
                 self.mode = Mode::Java;
@@ -350,6 +180,7 @@ impl App {
 
     fn update_projection(&mut self) {
         self.revision += 1;
+        self.editor_line_starts = parser::line_starts(&self.rust);
         self.projection_pending = true;
         self.selected = None;
         self.jump_to = None;
@@ -374,44 +205,98 @@ impl App {
     }
 
     fn directory(&mut self, ui: &mut egui::Ui, dir: &Path, depth: usize) {
-        if depth > 7 {
+        if depth > 24 {
+            ui.small("目录深度超过 24 层，请直接使用「Open folder」进入此目录。");
             return;
         }
-        let dir_entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(error) => {
-                ui.colored_label(Color32::YELLOW, format!("Cannot read folder: {error}"));
-                return;
+        match self.dir_index.get_or_request(dir.to_path_buf()) {
+            file_tree::Snapshot::Loading => {
+                ui.small("正在后台读取真实目录…");
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(90));
             }
-        };
-        let mut entries = Vec::new();
-        for entry in dir_entries {
-            match entry {
-                Ok(entry) => entries.push(entry),
-                Err(error) => {
-                    ui.colored_label(Color32::YELLOW, format!("Cannot read entry: {error}"));
-                }
+            file_tree::Snapshot::Error(error) => {
+                ui.colored_label(Color32::YELLOW, format!("无法读取目录: {error}"));
             }
-        }
-        entries.sort_by_key(|entry| (!entry.path().is_dir(), entry.file_name()));
-        for entry in entries.into_iter().take(180) {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if path.is_dir() {
-                if !self.show_excluded
-                    && [".git", "target", "node_modules"].contains(&name.as_str())
+            file_tree::Snapshot::Ready(entries) => {
+                let total = entries
+                    .iter()
+                    .filter(|entry| {
+                        self.show_excluded
+                            || !matches!(entry.name.as_str(), ".git" | "target" | "node_modules")
+                    })
+                    .count();
+                // A user must always be able to see every meaningful top-level
+                // directory without a pagination click. Files beyond the page
+                // limit remain available through explicit "show more".
+                let root_dirs = if depth == 0 {
+                    entries
+                        .iter()
+                        .filter(|entry| {
+                            (self.show_excluded
+                                || !matches!(
+                                    entry.name.as_str(),
+                                    ".git" | "target" | "node_modules"
+                                ))
+                                && entry.kind == file_tree::EntryKind::Directory
+                        })
+                        .count()
+                } else {
+                    0
+                };
+                let default_limit = root_dirs.max(180);
+                let limit = self
+                    .directory_limits
+                    .get(dir)
+                    .copied()
+                    .unwrap_or(default_limit);
+                let show_excluded = self.show_excluded;
+                for entry in entries
+                    .iter()
+                    .filter(|entry| {
+                        show_excluded
+                            || !matches!(entry.name.as_str(), ".git" | "target" | "node_modules")
+                    })
+                    .take(limit)
                 {
-                    continue;
+                    match entry.kind {
+                        file_tree::EntryKind::Directory => {
+                            egui::CollapsingHeader::new(format!("▸ {}", entry.name))
+                                .id_salt(&entry.path)
+                                .show(ui, |ui| self.directory(ui, &entry.path, depth + 1));
+                        }
+                        file_tree::EntryKind::RustFile => {
+                            if ui
+                                .selectable_label(
+                                    self.file.as_ref() == Some(&entry.path),
+                                    format!("  {}", entry.name),
+                                )
+                                .clicked()
+                            {
+                                self.open(entry.path.clone());
+                            }
+                        }
+                        file_tree::EntryKind::OtherFile => {
+                            ui.label(egui::RichText::new(format!("  {}", entry.name)).weak())
+                                .on_hover_text("真实文件；当前版本只编辑 Rust .rs 文件");
+                        }
+                        file_tree::EntryKind::Symlink => {
+                            ui.label(
+                                egui::RichText::new(format!("  ↗ {}（符号链接）", entry.name))
+                                    .weak(),
+                            )
+                            .on_hover_text("为了避免目录循环，不自动递归进入符号链接");
+                        }
+                    }
                 }
-                egui::CollapsingHeader::new(format!("▸ {name}"))
-                    .id_salt(&path)
-                    .show(ui, |ui| self.directory(ui, &path, depth + 1));
-            } else if path.extension().is_some_and(|ext| ext == "rs")
-                && ui
-                    .selectable_label(self.file.as_ref() == Some(&path), format!("  {name}"))
-                    .clicked()
-            {
-                self.open(path);
+                if total > limit
+                    && ui
+                        .button(format!("显示更多目录项（已显示 {limit} / {total}）"))
+                        .clicked()
+                {
+                    self.directory_limits
+                        .insert(dir.to_path_buf(), limit.saturating_add(180));
+                }
             }
         }
     }
@@ -460,11 +345,12 @@ impl App {
             return;
         };
         let current = file_stamp(path).ok();
-        if current != self.disk_stamp {
-            self.external_change = true;
+        let changed = current != self.disk_stamp;
+        if changed && !self.external_change {
             self.status =
                 "File changed outside RustBridge; save is blocked until you reopen it.".into();
         }
+        self.external_change = changed;
     }
 
     fn check_analyzer(&mut self) {
@@ -480,42 +366,19 @@ impl App {
                 "Open a Cargo project before requesting diagnostics.".into();
             return;
         };
-        self.analyzer_diagnostics_status =
-            "rust-analyzer is checking this project in the background…".into();
-        self.analyzer_diagnostics = Some(analyzer::DiagnosticTask::start(root));
-    }
-
-    fn find_next_in_editor(&mut self) {
-        let query = self.editor_query.trim();
-        if query.is_empty() {
-            self.editor_find = None;
-            self.editor_jump = None;
+        if self.dirty
+            && self
+                .file
+                .as_ref()
+                .is_some_and(|path| path.starts_with(&root))
+        {
+            self.analyzer_diagnostics_status =
+                "当前 Rust 文件有未保存修改：请先保存；诊断工具读取的是磁盘内容。".into();
             return;
         }
-        let start = self.editor_find.map_or(0, |span| span.end);
-        let offset = self.rust[start..]
-            .find(query)
-            .or_else(|| self.rust[..start].find(query));
-        if let Some(offset) = offset {
-            let span = parser::ByteSpan {
-                start: if offset < start {
-                    offset
-                } else {
-                    start + offset
-                },
-                end: if offset < start {
-                    offset
-                } else {
-                    start + offset
-                } + query.len(),
-            };
-            self.editor_find = Some(span);
-            self.editor_jump = Some(span);
-            self.status = format!("Found Rust text at byte {}.", span.start);
-        } else {
-            self.editor_find = None;
-            self.status = "Text not found in the original Rust source.".into();
-        }
+        self.analyzer_diagnostics_status =
+            format!("正在诊断 {}（仅使用磁盘文件；超时 45 秒）…", root.display());
+        self.analyzer_diagnostics = Some(analyzer::DiagnosticTask::start(root));
     }
 
     fn select(&mut self, index: usize, from_java_only: bool) {
@@ -556,36 +419,35 @@ impl App {
 
     fn read_only(&mut self, ui: &mut egui::Ui, java: bool) {
         let jump = self.jump_to.take();
-        let result =
-            if java {
-                ui.colored_label(Color32::YELLOW,
-                "Java mental model · click a highlighted symbol to reveal the paired Rust source");
-                code_view::show(
-                    ui,
-                    &self.projection.java,
-                    &self.projection,
-                    code_view::ViewOptions {
-                        id: "java_only",
-                        side: code_view::Side::Java,
-                        selected: self.selected,
-                        jump_to: jump,
-                        scroll_to: None,
-                    },
-                )
-            } else {
-                code_view::show(
-                    ui,
-                    &self.rust,
-                    &self.projection,
-                    code_view::ViewOptions {
-                        id: "rust_only",
-                        side: code_view::Side::Rust,
-                        selected: self.selected,
-                        jump_to: jump,
-                        scroll_to: None,
-                    },
-                )
-            };
+        let result = if java {
+            ui.colored_label(Color32::YELLOW,
+                "Java 心智阅读模式 · 点击蓝色标记查看实际 Rust；这不是可编译 Java，复杂语义以 Rust 原文为准。");
+            code_view::show(
+                ui,
+                &self.projection.java,
+                &self.projection,
+                code_view::ViewOptions {
+                    id: "java_only",
+                    side: code_view::Side::Java,
+                    selected: self.selected,
+                    jump_to: jump,
+                    scroll_to: None,
+                },
+            )
+        } else {
+            code_view::show(
+                ui,
+                &self.rust,
+                &self.projection,
+                code_view::ViewOptions {
+                    id: "rust_only",
+                    side: code_view::Side::Rust,
+                    selected: self.selected,
+                    jump_to: jump,
+                    scroll_to: None,
+                },
+            )
+        };
         if let Some(index) = result.clicked {
             self.select(index, java);
         }
@@ -651,110 +513,9 @@ impl App {
         }
     }
 
-    fn editor(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Real Rust source · editable");
-            if ui.button("Save · Ctrl+S").clicked() {
-                self.save();
-            }
-        });
-        ui.horizontal(|ui| {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.editor_query)
-                    .hint_text("Find in original Rust…")
-                    .desired_width(220.),
-            );
-            if ui.button("Find next").clicked()
-                || (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-            {
-                self.find_next_in_editor();
-            }
-        });
-        let active = self
-            .selected
-            .and_then(|idx| self.projection.anchors.get(idx))
-            .map(|anchor| anchor.rust)
-            .or(self.editor_find);
-        let jump = self
-            .jump_to
-            .take()
-            .and_then(|idx| self.projection.anchors.get(idx))
-            .map(|anchor| anchor.rust);
-        let cursor_target = jump.or(self.editor_jump.take());
-
-        // This is deliberately lexical highlighting only. Tree-sitter remains the source of links.
-        let mut layouter = |ui: &egui::Ui, content: &dyn egui::TextBuffer, _width: f32| {
-            let text = content.as_str();
-            let mut job = egui::text::LayoutJob::default();
-            job.wrap.max_width = f32::INFINITY;
-            let font = egui::TextStyle::Monospace.resolve(ui.style());
-            let active = active.filter(|span| {
-                span.end <= text.len()
-                    && text.is_char_boundary(span.start)
-                    && text.is_char_boundary(span.end)
-            });
-            append_rust_syntax(&mut job, text, &font, ui.visuals().text_color(), active);
-            ui.fonts_mut(|fonts| fonts.layout_job(job))
-        };
-        let line_numbers = line_number_gutter(&self.rust);
-        let mut output = None;
-        egui::ScrollArea::both()
-            .id_salt(("rust_source_editor_scroll", &self.file))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(line_numbers).monospace().weak())
-                            .selectable(false),
-                    );
-                    output = Some(
-                        egui::TextEdit::multiline(&mut self.rust)
-                            .id_salt(("rust_source_editor", &self.file))
-                            .font(egui::TextStyle::Monospace)
-                            .code_editor()
-                            .desired_width(f32::INFINITY)
-                            .layouter(&mut layouter)
-                            .show(ui),
-                    );
-                });
-            });
-        let mut output = output.expect("Rust source editor always renders");
-        if output.response.changed() {
-            self.update_projection();
-            self.dirty = self.rust != self.saved_source;
-            self.editor_find = None;
-            self.editor_jump = None;
-            self.selected = None;
-            self.status = "Source edited; updating the reading projection.".into();
-        }
-        if !self.projection_pending
-            && output.response.clicked()
-            && let Some(cursor) = output.cursor_range
-        {
-            let byte = parser::char_to_byte(&self.rust, cursor.primary.index);
-            self.selected = self.projection.rust_anchor(byte).or_else(|| {
-                byte.checked_sub(1)
-                    .and_then(|before| self.projection.rust_anchor(before))
-            });
-        }
-        if let Some(span) = cursor_target
-            && span.end <= self.rust.len()
-        {
-            use egui::text::{CCursor, CCursorRange};
-            let start = self.rust[..span.start].chars().count();
-            let end = self.rust[..span.end].chars().count();
-            output.state.cursor.set_char_range(Some(CCursorRange::two(
-                CCursor::new(start),
-                CCursor::new(end),
-            )));
-            output.state.store(ui.ctx(), output.response.id);
-            ui.scroll_to_cursor(Some(egui::Align::Center));
-            ui.ctx().request_repaint();
-        }
-    }
-
     fn lessons(&mut self, ui: &mut egui::Ui) {
         let lesson = &lessons::LESSONS[self.lesson];
+        let chinese = &lessons::CHINESE_LESSONS[self.lesson];
         ui.heading(format!(
             "Lesson {} / {}: {} → {}",
             self.lesson + 1,
@@ -762,8 +523,9 @@ impl App {
             lesson.java,
             lesson.rust
         ));
-        ui.strong("Key difference");
-        ui.label(lesson.why);
+        ui.strong("核心区别 / Key difference");
+        ui.label(chinese.difference);
+        ui.small(lesson.why);
         ui.small("Examples are teaching sketches. Check the real Rust source and compiler before treating them as production code.");
         ui.separator();
         ui.columns(2, |columns| {
@@ -773,8 +535,9 @@ impl App {
             columns[1].monospace(lesson.rust_code);
         });
         ui.separator();
-        ui.strong("Common mistake");
-        ui.label(lesson.common_mistake);
+        ui.strong("Java 程序员常见误区 / Common mistake");
+        ui.label(chinese.mistake);
+        ui.small(lesson.common_mistake);
         ui.separator();
         ui.horizontal(|ui| {
             if let Some((mode, anchor)) = self.lesson_return
@@ -803,13 +566,44 @@ impl App {
     }
 
     fn right_guide(&mut self, ui: &mut egui::Ui) {
-        ui.heading("AST correspondence");
-        ui.small("Precise token spans · syntax-level, not symbol resolution");
+        ui.heading("Java ↔ Rust 概念说明");
+        ui.small("AST 精确对应位置；并非类型解析或可编译 Java 转换");
         ui.separator();
         if self.projection_pending {
             ui.label("Updating projection; links are temporarily unavailable.");
             return;
         }
+        let insights: Vec<_> = self
+            .projection
+            .java_insights
+            .iter()
+            .take(60)
+            .cloned()
+            .collect();
+        egui::CollapsingHeader::new(format!(
+            "Java 结构导览（{} 项）",
+            self.projection.java_insights.len()
+        ))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.small(
+                "把真实 struct / trait / impl 翻译成 Java 开发者熟悉的结构语言，不猜测类型身份。",
+            );
+            for item in insights {
+                if ui
+                    .selectable_label(false, &item.headline)
+                    .on_hover_text(item.explanation)
+                    .clicked()
+                    && let Some(idx) = self.projection.rust_anchor(item.rust_byte)
+                {
+                    self.select(idx, self.mode == Mode::Java);
+                }
+            }
+            if self.projection.java_insights.len() > 60 {
+                ui.small("结构较多，列表只展示前 60 项；其余可以通过源码锚点访问。");
+            }
+        });
+        ui.separator();
         if self.projection.warning {
             ui.colored_label(
                 Color32::YELLOW,
@@ -905,9 +699,29 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if std::time::Instant::now() >= self.next_disk_check {
-            self.next_disk_check = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            self.check_external_change();
+        // Watch real disk metadata off the event thread. Idle windows do not
+        // repeatedly repaint just to poll file stamps.
+        if let Some(path) = self.file.clone() {
+            if self
+                .file_watch
+                .as_ref()
+                .is_none_or(|watch| watch.path() != path)
+            {
+                self.file_watch = Some(file_watch::FileWatch::new(
+                    path,
+                    self.disk_stamp.clone(),
+                    ctx.clone(),
+                ));
+            }
+            if self
+                .file_watch
+                .as_ref()
+                .is_some_and(|watch| watch.changed())
+            {
+                self.check_external_change();
+            }
+        } else {
+            self.file_watch = None;
         }
         if self
             .projection_due
@@ -934,6 +748,17 @@ impl eframe::App for App {
             self.analyzer_status = result;
             self.analyzer_check = None;
         }
+        // Diagnostic results belong to the project that launched the task.
+        if self
+            .analyzer_diagnostics
+            .as_ref()
+            .is_some_and(|task| self.root.as_ref() != Some(task.project_root()))
+        {
+            if let Some(task) = self.analyzer_diagnostics.take() {
+                task.cancel();
+            }
+            self.analyzer_diagnostics_status = "项目已切换，旧诊断已取消。".into();
+        }
         if let Some(result) = self
             .analyzer_diagnostics
             .as_ref()
@@ -945,6 +770,7 @@ impl eframe::App for App {
         if self.projection_pending
             || self.file_search_pending
             || self.analyzer_diagnostics.is_some()
+            || self.analyzer_check.is_some()
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -1001,9 +827,10 @@ impl eframe::App for App {
                 });
             });
         }
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
-            self.save();
-        }
+        // Capture Ctrl+S before TextEdit can consume the event, but only save
+        // AFTER the editor has applied all changes from this frame.
+        let save_shortcut =
+            ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::S));
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("RustBridge");
@@ -1018,6 +845,10 @@ impl eframe::App for App {
                 if ui.button("Open folder").clicked()
                     && let Some(folder) = rfd::FileDialog::new().pick_folder()
                 {
+                    if let Some(task) = self.analyzer_diagnostics.take() { task.cancel(); }
+                    self.analyzer_diagnostics_status = "已切换项目；原项目诊断已取消。".into();
+                    self.dir_index = file_tree::DirectoryIndex::new();
+                    self.directory_limits.clear();
                     self.cargo_project = is_cargo_root(&folder);
                     self.root = Some(folder);
                     self.refresh_file_search();
@@ -1029,10 +860,10 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 for (mode, label) in [
-                    (Mode::Java, "☕ Java View"),
-                    (Mode::Rust, "🦀 Rust Source"),
-                    (Mode::Compare, "◫ Linked Compare"),
-                    (Mode::Learn, "Lessons"),
+                    (Mode::Java, "☕ Java 阅读"),
+                    (Mode::Rust, "🦀 Rust 源码"),
+                    (Mode::Compare, "◫ 双栏对照"),
+                    (Mode::Learn, "分页学习"),
                 ] {
                     if ui.selectable_label(self.mode == mode, label).clicked() {
                         self.mode = mode;
@@ -1055,15 +886,20 @@ impl eframe::App for App {
             .resizable(true)
             .default_width(210.)
             .show(ctx, |ui| {
-                ui.heading("Real project files");
-                ui.small("Filesystem truth; .rs filter");
+                ui.heading("真实项目文件 / Project");
+                ui.small("目录直接来自文件系统；只编辑 .rs，其他文件仍显示。");
                 let excluded_changed = ui
                     .checkbox(
                         &mut self.show_excluded,
                         "Show .git, target and node_modules",
                     )
                     .changed();
-                ui.small("At most 180 entries per folder; maximum depth 8.");
+                ui.small("真实文件树；每页 180 项，可逐页展开，目录在后台读取。");
+                if ui.button("刷新目录").clicked() {
+                    self.dir_index = file_tree::DirectoryIndex::new();
+                    self.directory_limits.clear();
+                    self.refresh_file_search();
+                }
                 let changed = ui
                     .add(
                         egui::TextEdit::singleline(&mut self.file_query)
@@ -1121,16 +957,28 @@ impl eframe::App for App {
                     ui.strong("Recent Rust files");
                     let recent = self.recent_files.clone();
                     for path in recent {
-                        if ui.selectable_label(self.file.as_ref() == Some(&path), path.display().to_string()).clicked() {
+                        if ui
+                            .selectable_label(
+                                self.file.as_ref() == Some(&path),
+                                path.display().to_string(),
+                            )
+                            .clicked()
+                        {
                             self.open(path);
                         }
                     }
                 }
                 ui.separator();
-                ui.strong("Optional rust-analyzer");
-                ui.small("Diagnostics are opt-in; no LSP session, completion, or definition lookup is started.");
+                ui.strong("可选 rust-analyzer / 诊断");
+                ui.small("手动触发；诊断磁盘中已保存的文件，不启动 LSP、补全或定义跳转。");
                 ui.label(&self.analyzer_status);
-                if ui.add_enabled(self.analyzer_check.is_none(), egui::Button::new("Check availability")).clicked() {
+                if ui
+                    .add_enabled(
+                        self.analyzer_check.is_none(),
+                        egui::Button::new("Check availability"),
+                    )
+                    .clicked()
+                {
                     self.check_analyzer();
                 }
                 ui.separator();
@@ -1140,13 +988,16 @@ impl eframe::App for App {
                         task.cancel();
                     }
                 } else if ui
-                    .add_enabled(self.cargo_project && self.root.is_some(), egui::Button::new("Check Cargo diagnostics"))
+                    .add_enabled(
+                        self.cargo_project && self.root.is_some(),
+                        egui::Button::new("Check Cargo diagnostics"),
+                    )
                     .clicked()
                 {
                     self.start_analyzer_diagnostics();
                 }
                 ui.separator();
-                ui.strong("Java 8 → Rust lessons");
+                ui.strong("Java 8 → Rust 对照课程");
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (idx, lesson) in lessons::LESSONS.iter().enumerate() {
                         if ui
@@ -1195,25 +1046,11 @@ impl eframe::App for App {
             ui.separator();
             self.body(ui);
         });
+        if save_shortcut {
+            self.save();
+            ctx.request_repaint();
+        }
     }
-}
-
-fn save_if_unchanged(path: &Path, expected: &str, text: &str) -> std::io::Result<()> {
-    let current = fs::read_to_string(path)?;
-    if current != expected {
-        return Err(std::io::Error::other(
-            "File changed externally; save blocked to protect both versions. Copy your edits before reopening.",
-        ));
-    }
-    fs::write(path, text)
-}
-
-fn file_stamp(path: &Path) -> std::io::Result<FileStamp> {
-    let metadata = fs::metadata(path)?;
-    Ok(FileStamp {
-        len: metadata.len(),
-        modified: metadata.modified().ok(),
-    })
 }
 
 fn is_cargo_root(path: &Path) -> bool {
@@ -1221,6 +1058,9 @@ fn is_cargo_root(path: &Path) -> bool {
 }
 
 fn main() -> eframe::Result {
+    // Optional path is convenient for headless GUI acceptance and local workflows.
+    // Only a real directory or existing Rust source file is accepted.
+    let startup_path = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1320., 820.])
@@ -1230,9 +1070,21 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "RustBridge — Java 8 → Rust",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::<App>::default())
+            let _ = ui_fonts::install_system_cjk_fallback(&cc.egui_ctx);
+            let mut app = App::default();
+            if let Some(path) = startup_path {
+                if path.is_dir() {
+                    app.cargo_project = is_cargo_root(&path);
+                    app.root = Some(path);
+                } else if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                    app.open_file(path);
+                } else {
+                    app.status = "参数必须是实际目录或可读的 .rs 文件。".into();
+                }
+            }
+            Ok(Box::new(app))
         }),
     )
 }
@@ -1240,6 +1092,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod file_tests {
     use super::*;
+    use crate::editor_core::{append_rust_syntax, editor_page_bounds};
 
     #[test]
     fn external_changes_and_deletion_block_save() {
@@ -1344,6 +1197,12 @@ mod file_tests {
                 .iter()
                 .all(|lesson| !lesson.common_mistake.is_empty())
         );
+        assert_eq!(lessons::LESSONS.len(), lessons::CHINESE_LESSONS.len());
+        assert!(
+            lessons::CHINESE_LESSONS
+                .iter()
+                .all(|lesson| !lesson.difference.is_empty() && !lesson.mistake.is_empty())
+        );
     }
 
     #[test]
@@ -1428,6 +1287,28 @@ mod file_tests {
     }
 
     #[test]
+    fn find_next_handles_relative_offsets_and_multibyte_text() {
+        let mut app = App {
+            rust: "foo foo".into(),
+            editor_query: "foo".into(),
+            ..App::default()
+        };
+        app.find_next_in_editor();
+        assert_eq!(app.editor_find, Some(parser::ByteSpan { start: 0, end: 3 }));
+        app.find_next_in_editor();
+        assert_eq!(app.editor_find, Some(parser::ByteSpan { start: 4, end: 7 }));
+        app.find_next_in_editor();
+        assert_eq!(app.editor_find, Some(parser::ByteSpan { start: 0, end: 3 }));
+        app.rust = "你好🦀 你好".into();
+        app.editor_find = None;
+        app.editor_query = "你好".into();
+        app.find_next_in_editor();
+        assert_eq!(app.editor_find.unwrap().start, 0);
+        app.find_next_in_editor();
+        assert_eq!(app.editor_find.unwrap().start, "你好🦀 ".len());
+    }
+
+    #[test]
     fn lexical_highlighter_keeps_source_bytes_and_marks_keywords() {
         let source = "fn main() { // note\nlet value = \"text\"; }";
         let mut job = egui::text::LayoutJob::default();
@@ -1486,6 +1367,21 @@ mod file_tests {
             &source[section.byte_range.clone()] == "b'a'"
                 && section.format.color == Color32::from_rgb(202, 162, 98)
         }));
+    }
+
+    #[test]
+    fn page_bounds_preserve_crlf_utf8_and_trailing_lines() {
+        let text = "你🦀\r\na\nb\n";
+        let starts = parser::line_starts(text);
+        assert_eq!(
+            editor_page_bounds(&starts, 0, 1, text.len()),
+            0..("你🦀\r\n".len())
+        );
+        assert_eq!(
+            &text[editor_page_bounds(&starts, 1, 2, text.len())],
+            "a\nb\n"
+        );
+        assert_eq!(&text[editor_page_bounds(&starts, 3, 1, text.len())], "");
     }
 
     #[test]

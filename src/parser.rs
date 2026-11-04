@@ -2,7 +2,7 @@
 //! A projection is a teaching aid, not a Java transpiler or a name resolver.
 
 use std::collections::HashMap;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{InputEdit, Node, ParseOptions, Parser, Point, Tree};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteSpan {
@@ -36,12 +36,23 @@ pub struct Anchor {
     pub explanation: &'static str,
 }
 
+#[derive(Clone, Debug)]
+pub struct JavaInsight {
+    pub rust_byte: usize,
+    pub headline: String,
+    pub explanation: &'static str,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Projection {
     pub java: String,
     pub anchors: Vec<Anchor>,
     /// All linked occurrences grouped by their original line; rewrites preserve line breaks.
     pub anchors_by_line: Vec<Vec<usize>>,
+    /// Cached offsets used by the virtualized code panes.
+    pub rust_line_starts: Vec<usize>,
+    pub java_line_starts: Vec<usize>,
+    pub java_insights: Vec<JavaInsight>,
     pub warning: bool,
 }
 
@@ -94,6 +105,9 @@ struct Collector<'a> {
     edits: Vec<Edit>,
     drafts: Vec<Draft>,
     seen: HashMap<(usize, usize), usize>,
+    cancelled: &'a dyn Fn() -> bool,
+    visited: usize,
+    insights: Vec<JavaInsight>,
 }
 
 impl Collector<'_> {
@@ -172,17 +186,75 @@ impl Collector<'_> {
         }
     }
 
-    fn walk(&mut self, node: Node<'_>) {
+    fn describe_java_structure(&mut self, node: Node<'_>) {
+        let name = |field: &str| {
+            node.child_by_field_name(field)
+                .and_then(|n| n.utf8_text(self.source.as_bytes()).ok())
+        };
+        let insight = match node.kind() {
+            "struct_item" => name("name").map(|n| {
+                (
+                    node.child_by_field_name("name").unwrap().start_byte(),
+                    format!("Java class {n} ≈ Rust struct {n} + impl"),
+                    "struct 定义数据字段；impl 才是方法所在位置。它们不是 Java 继承的等价物。",
+                )
+            }),
+            "trait_item" => name("name").map(|n| {
+                (
+                    node.child_by_field_name("name").unwrap().start_byte(),
+                    format!("Java interface {n} ≈ Rust trait {n}"),
+                    "trait 表示行为契约；默认实现、trait object 与 Java 接口存在语义区别。",
+                )
+            }),
+            "enum_item" => name("name").map(|n| {
+                (
+                    node.child_by_field_name("name").unwrap().start_byte(),
+                    format!("Rust enum {n} ≈ Java sealed 类型族（近似）"),
+                    "Rust enum 变体可以携带数据；不要直接按 Java 枚举常量理解。",
+                )
+            }),
+            "impl_item" => {
+                let actual_type = name("type").unwrap_or("未知类型");
+                let trait_name = name("trait");
+                Some((
+                    node.start_byte(),
+                    if let Some(t) = trait_name {
+                        format!("Java: {actual_type} implements {t}（仅语法类比）")
+                    } else {
+                        format!("Java: {actual_type} 的方法实现块（impl）")
+                    },
+                    "Rust 把实现从类型声明中分离；此处不是 Java 类继承。仅根据 AST 结构提供解释。",
+                ))
+            }
+            _ => None,
+        };
+        if let Some((rust_byte, headline, explanation)) = insight {
+            self.insights.push(JavaInsight {
+                rust_byte,
+                headline,
+                explanation,
+            });
+        }
+    }
+
+    fn walk(&mut self, node: Node<'_>) -> bool {
+        self.visited += 1;
+        if self.visited.is_multiple_of(128) && (self.cancelled)() {
+            return false;
+        }
         if node.is_error() || node.is_missing() || node.kind() == "macro_invocation" {
-            return;
+            return true;
         }
         if node.has_error() {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                self.walk(child);
+                if !self.walk(child) {
+                    return false;
+                }
             }
-            return;
+            return true;
         }
+        self.describe_java_structure(node);
         match node.kind() {
             "struct_item" => {
                 self.keyword(node, "struct", Some("class"), "class ↔ struct",
@@ -231,8 +303,11 @@ impl Collector<'_> {
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            self.walk(child);
+            if !self.walk(child) {
+                return false;
+            }
         }
+        true
     }
 
     fn leaf(&mut self, node: Node<'_>) {
@@ -241,9 +316,9 @@ impl Collector<'_> {
             "type_identifier" => {
                 let (topic, detail, replacement) = match text {
                     "Option" => ("Option<T> ↔ Optional<T>",
-                        "Convention-based reading only: Option has Some/None, not null. A type resolver is needed to confirm this identifier refers to std::option::Option.", Some("Optional")),
+                        "若这是标准库 Option<T>，可以类比 Java Optional<T>；未解析到类型身份前保留 Rust 原名，避免误改用户自定义类型。", None),
                     "Vec" => ("Vec<T> ↔ ArrayList<T>",
-                        "Convention-based reading only: Vec is an owned contiguous growable array, not a Java object reference.", Some("ArrayList")),
+                        "若这是标准库 Vec<T>，可类比 Java ArrayList<T>；当前尚无 type resolver，原名必须保留。", None),
                     "Result" => ("Result<T,E> ↔ explicit errors",
                         "Result encodes Ok or Err. The ? operator propagates compatible errors; this is not automatic exception throwing.", None),
                     "HashMap" => ("HashMap<K,V> ↔ Map<K,V>",
@@ -326,7 +401,7 @@ fn map_span(span: ByteSpan, edits: &[Edit], offsets: &[isize]) -> Option<ByteSpa
     })
 }
 
-fn line_starts(source: &str) -> Vec<usize> {
+pub fn line_starts(source: &str) -> Vec<usize> {
     let mut starts = vec![0];
     for (byte, _) in source.match_indices('\n') {
         starts.push(byte + 1);
@@ -351,34 +426,128 @@ pub fn char_to_byte(source: &str, char_index: usize) -> usize {
         .map_or(source.len(), |(byte, _)| byte)
 }
 
+/// Incremental Tree-sitter parser scoped to one file/document owner.
+pub struct ProjectionEngine {
+    parser: Parser,
+    previous: Option<(String, Tree)>,
+}
+
+impl ProjectionEngine {
+    pub fn new() -> Result<Self, String> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .map_err(|error| format!("Rust grammar unavailable: {error}"))?;
+        Ok(Self {
+            parser,
+            previous: None,
+        })
+    }
+
+    /// Returns None when superseded/cancelled. A failed parse never poisons the old tree.
+    pub fn project(&mut self, source: &str, cancelled: &dyn Fn() -> bool) -> Option<Projection> {
+        if cancelled() {
+            return None;
+        }
+        let previous_tree = self.previous.as_ref().map(|(old, tree)| {
+            let mut tree = tree.clone();
+            if old != source {
+                tree.edit(&minimal_edit(old, source));
+            }
+            tree
+        });
+        let mut progress = |_state: &tree_sitter::ParseState| cancelled();
+        let options = ParseOptions::new().progress_callback(&mut progress);
+        let mut input = |byte: usize, _point: Point| &source.as_bytes()[byte..];
+        let parsed =
+            self.parser
+                .parse_with_options(&mut input, previous_tree.as_ref(), Some(options));
+        let Some(tree) = parsed else {
+            self.parser.reset();
+            return None;
+        };
+        if cancelled() {
+            return None;
+        }
+        let projection = project_tree(source, &tree, cancelled)?;
+        if cancelled() {
+            return None;
+        }
+        self.previous = Some((source.to_owned(), tree));
+        Some(projection)
+    }
+}
+
+fn source_point(source: &str, byte: usize) -> Point {
+    let previous = &source[..byte];
+    let row = previous.bytes().filter(|&value| value == b'\n').count();
+    let column = byte - previous.rfind('\n').map_or(0, |line| line + 1);
+    Point::new(row, column)
+}
+
+/// UTF-8-safe one-change diff for Tree::edit; byte positions match Tree-sitter Point columns.
+fn minimal_edit(old: &str, new: &str) -> InputEdit {
+    let common = old
+        .bytes()
+        .zip(new.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut start = common;
+    while !old.is_char_boundary(start) || !new.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut old_end = old.len();
+    let mut new_end = new.len();
+    while old_end > start
+        && new_end > start
+        && old.as_bytes()[old_end - 1] == new.as_bytes()[new_end - 1]
+    {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    // The identical suffix may have been counted through a multibyte code point.
+    while !old.is_char_boundary(old_end) || !new.is_char_boundary(new_end) {
+        old_end += 1;
+        new_end += 1;
+    }
+    InputEdit {
+        start_byte: start,
+        old_end_byte: old_end,
+        new_end_byte: new_end,
+        start_position: source_point(old, start),
+        old_end_position: source_point(old, old_end),
+        new_end_position: source_point(new, new_end),
+    }
+}
+
 /// Every successful mapping links the SAME AST token occurrence in the original and projected texts.
 /// Unsupported syntax is preserved. This does not resolve symbols or prove Java/Rust equivalence.
 pub fn project(source: &str) -> Projection {
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .is_err()
-    {
-        return Projection {
-            java: source.into(),
+    ProjectionEngine::new()
+        .ok()
+        .and_then(|mut engine| engine.project(source, &|| false))
+        .unwrap_or_else(|| Projection {
+            java: source.to_owned(),
+            rust_line_starts: line_starts(source),
+            java_line_starts: line_starts(source),
             warning: true,
             ..Default::default()
-        };
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return Projection {
-            java: source.into(),
-            warning: true,
-            ..Default::default()
-        };
-    };
+        })
+}
+
+fn project_tree(source: &str, tree: &Tree, cancelled: &dyn Fn() -> bool) -> Option<Projection> {
     let mut collector = Collector {
         source,
         edits: Vec::new(),
         drafts: Vec::new(),
         seen: HashMap::new(),
+        cancelled,
+        visited: 0,
+        insights: Vec::new(),
     };
-    collector.walk(tree.root_node());
+    if !collector.walk(tree.root_node()) || cancelled() {
+        return None;
+    }
     collector.edits.sort_by_key(|edit| edit.rust.start);
     // Reject overlapping replacement spans rather than generate an incorrect offset map.
     let mut non_overlapping = Vec::new();
@@ -403,6 +572,9 @@ pub fn project(source: &str) -> Projection {
     let java_lines = line_starts(&java);
     let mut anchors = Vec::new();
     for draft in collector.drafts {
+        if cancelled() {
+            return None;
+        }
         if let Some(projected) = map_span(draft.rust, &non_overlapping, &offsets) {
             anchors.push(Anchor {
                 rust: draft.rust,
@@ -421,12 +593,15 @@ pub fn project(source: &str) -> Projection {
     for (index, anchor) in anchors.iter().enumerate() {
         anchors_by_line[anchor.rust_at.line].push(index);
     }
-    Projection {
+    Some(Projection {
         java,
         anchors,
         anchors_by_line,
+        rust_line_starts: rust_lines,
+        java_line_starts: java_lines,
+        java_insights: collector.insights,
         warning: tree.root_node().has_error(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -476,11 +651,11 @@ mod tests {
         let p = project(src);
         assert!(
             p.java
-                .contains("/*method*/ f() { var a: Optional<ArrayList<i32>> = None; var b = 1; }")
+                .contains("/*method*/ f() { var a: Option<Vec<i32>> = None; var b = 1; }")
         );
         assert_links(src);
         let a = p.anchors.iter().find(|a| a.symbol == "Option").unwrap();
-        assert_eq!(&p.java[a.java.start..a.java.end], "Optional");
+        assert_eq!(&p.java[a.java.start..a.java.end], "Option");
     }
 
     #[test]
@@ -515,12 +690,26 @@ mod tests {
                 .iter()
                 .any(|a| a.topic == "Option<T> ↔ Optional<T>")
         );
-        // A type resolver is not present, so even familiar names are explicitly marked convention-based.
+        // Familiar type names are not rewritten without semantic type resolution.
+        assert!(p.java.contains("class Option {"));
+        assert!(p.java.contains("var y: Option"));
         assert!(
             p.anchors
                 .iter()
-                .any(|a| a.explanation.contains("type resolver"))
+                .any(|a| a.explanation.contains("未解析到类型身份"))
         );
+    }
+
+    #[test]
+    fn custom_type_names_are_never_rewritten_by_name_only() {
+        let source =
+            "struct Option { value: i32 }\nstruct Vec { count: usize }\nfn f(x: Option, y: Vec) {}";
+        let projection = project(source);
+        assert!(projection.java.contains("class Option {"));
+        assert!(projection.java.contains("class Vec {"));
+        assert!(!projection.java.contains("Optional"));
+        assert!(!projection.java.contains("ArrayList"));
+        assert_links(source);
     }
 
     #[test]
@@ -570,6 +759,68 @@ mod tests {
         assert_eq!(p.rust_anchor(6), None); // space between keyword and name
         assert_eq!(char_to_byte("中a", 1), 3);
         assert_eq!(char_to_byte("中a", 2), 4);
+    }
+
+    #[test]
+    fn incremental_edit_matches_full_parse_for_unicode_and_multiline() {
+        let mut engine = ProjectionEngine::new().unwrap();
+        let originals = [
+            "struct User { name: String }",
+            "struct 用户 { name: String }",
+            "struct 用户 {\n name: Option<String>,\n visit: u32\n }",
+            "struct 用户 {\n name: Option<String>,\n visits: u32\n }",
+            "",
+            "fn main() { let hello = \"你好🦀\"; }",
+        ];
+        for source in originals {
+            let incremental = engine.project(source, &|| false).unwrap();
+            let full = project(source);
+            assert_eq!(incremental.java, full.java);
+            assert_eq!(incremental.anchors.len(), full.anchors.len());
+            assert_eq!(incremental.rust_line_starts, full.rust_line_starts);
+            assert_eq!(incremental.java_line_starts, full.java_line_starts);
+        }
+    }
+
+    #[test]
+    fn structural_java_lens_explains_impl_and_trait() {
+        let source = "struct User { name: String }\ntrait Greeter {}\nimpl Greeter for User {}\nimpl User {}";
+        let p = project(source);
+        assert!(
+            p.java_insights
+                .iter()
+                .any(|i| i.headline.contains("class User"))
+        );
+        assert!(
+            p.java_insights
+                .iter()
+                .any(|i| i.headline.contains("interface Greeter"))
+        );
+        assert!(
+            p.java_insights
+                .iter()
+                .any(|i| i.headline.contains("User implements Greeter"))
+        );
+        assert!(
+            p.java_insights
+                .iter()
+                .any(|i| i.headline.contains("User 的方法"))
+        );
+    }
+
+    #[test]
+    fn cancelled_projection_is_not_published() {
+        let mut engine = ProjectionEngine::new().unwrap();
+        let ok = engine.project("struct Original {}", &|| false).unwrap();
+        assert_eq!(ok.java, "class Original {}");
+        assert!(engine.project("struct Other {}", &|| true).is_none());
+        assert_eq!(
+            engine
+                .project("struct Original {}", &|| false)
+                .unwrap()
+                .java,
+            ok.java
+        );
     }
 
     #[test]

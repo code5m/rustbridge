@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 — Single-branch integrated correctness and resource hardening
+
+- Fix confirmed Chinese UTF-8 block-comment panic, search-next relative byte offsets, and unsafe custom type-name rewrites.
+- Make source saves atomic via temporary-file fsync/rename; protect against common external changes and test rollback on errors.
+- Move real directory scanning off UI thread, page long directories, avoid symlink recursion.
+- Reuse Tree-sitter incrementally and cancel superseded parses; cache read-only line indices.
+- Add bounded 240-line Rust editor pages for large files, plus reversible CRLF/LF display mapping for small and paged editing that preserves untouched source line endings.
+- Scope optional diagnostics to its project; cancel process groups, enforce timeouts, and explicitly signal disk-only checks.
+- Add Chinese Java structure insights, course explanations and operating-system CJK font fallback.
+- Split editor, line ending conversion, filesystem safety, directory indexing, file monitoring and font logic into independent modules.
+- Add regression coverage (51 main tests and 13 repeated parser tests in the probe example), console projection probe, real Xvfb screenshots, native keyboard save/CRLF acceptance and performance evaluation.
+
+
+
 ## 0.2.0 — AST-linked learning views
 
 - Replaced fragile whole-line rewrites with token-level Tree-sitter-based educational transformations.
