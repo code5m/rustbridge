@@ -1,5 +1,6 @@
 mod analyzer;
 mod code_view;
+mod document_io;
 mod editor_core;
 mod editor_eol;
 mod editor_ui;
@@ -10,15 +11,18 @@ mod lessons;
 mod parser;
 mod projection_worker;
 mod safe_save;
+mod symbol_search;
 mod ui_fonts;
 
 use editor_core::line_number_gutter;
 use eframe::egui::{self, Color32};
 use file_watch::{FileStamp, file_stamp};
+#[cfg(test)]
 use safe_save::save_if_unchanged;
+#[cfg(test)]
+use std::fs;
 use std::{
     collections::HashMap,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -63,6 +67,18 @@ struct App {
     disk_stamp: Option<FileStamp>,
     external_change: bool,
     file_watch: Option<file_watch::FileWatch>,
+    document_io: Option<document_io::DocumentIo>,
+    io_revision: u64,
+    opening: Option<(u64, PathBuf, u64)>,
+    saving: Option<(u64, PathBuf, String)>,
+    after_save_open: bool,
+    after_save_close: bool,
+    symbol_worker: Option<symbol_search::SymbolSearch>,
+    symbol_revision: u64,
+    symbol_query: String,
+    symbol_hits: Vec<symbol_search::Declaration>,
+    symbol_pending: bool,
+    symbol_target: Option<(PathBuf, parser::ByteSpan)>,
     editor_query: String,
     editor_find: Option<parser::ByteSpan>,
     editor_jump: Option<parser::ByteSpan>,
@@ -117,6 +133,18 @@ impl Default for App {
             disk_stamp: None,
             external_change: false,
             file_watch: None,
+            document_io: None,
+            io_revision: 0,
+            opening: None,
+            saving: None,
+            after_save_open: false,
+            after_save_close: false,
+            symbol_worker: None,
+            symbol_revision: 0,
+            symbol_query: String::new(),
+            symbol_hits: Vec::new(),
+            symbol_pending: false,
+            symbol_target: None,
             editor_query: String::new(),
             editor_find: None,
             editor_jump: None,
@@ -146,29 +174,131 @@ impl App {
     }
 
     fn open_file(&mut self, path: PathBuf) {
-        match fs::read_to_string(&path) {
-            Ok(text) => {
-                self.file_watch = None;
-                self.disk_stamp = file_stamp(&path).ok();
-                self.external_change = false;
-                self.saved_source = text.clone();
-                self.rust = text;
-                self.dirty = false;
-                self.update_projection();
-                self.file = Some(path);
-                self.record_recent_file();
-                self.selected = None;
-                self.jump_to = None;
-                self.editor_find = None;
-                self.editor_jump = None;
-                self.editor_page_start = 0;
-                self.editor_page_target = 1;
-                self.scroll_follow = None;
-                self.last_scroll = None;
-                self.mode = Mode::Java;
-                self.status = "Opened actual Rust file. Java teaching view is read-only.".into();
+        // Reading from slow disks/network mounts never blocks the rendering thread.
+        self.io_revision += 1;
+        let id = self.io_revision;
+        self.opening = Some((id, path.clone(), self.revision));
+        self.document_io
+            .get_or_insert_with(document_io::DocumentIo::new)
+            .open(id, path);
+        self.status = "正在后台读取 Rust 文件…".into();
+    }
+
+    fn complete_open(&mut self, path: PathBuf, loaded: document_io::Loaded) {
+        self.disk_stamp = loaded.stamp;
+        self.external_change = false;
+        self.saved_source = loaded.source.clone();
+        self.rust = loaded.source;
+        self.dirty = false;
+        self.update_projection();
+        self.file = Some(path.clone());
+        self.record_recent_file();
+        self.selected = None;
+        self.jump_to = None;
+        self.editor_find = None;
+        self.editor_jump = None;
+        self.editor_page_start = 0;
+        self.editor_page_target = 1;
+        self.scroll_follow = None;
+        self.last_scroll = None;
+        self.mode = Mode::Java;
+        if let Some((target, span)) = self.symbol_target.take()
+            && target == path
+        {
+            self.mode = Mode::Rust;
+            self.editor_jump = Some(span);
+        }
+        self.status = "Opened actual Rust file. Java teaching view is read-only.".into();
+    }
+
+    fn poll_document_io(&mut self, ctx: &egui::Context) {
+        while let Some(reply) = self
+            .document_io
+            .as_ref()
+            .and_then(document_io::DocumentIo::take)
+        {
+            match reply {
+                document_io::Reply::Open { id, path, result } => {
+                    let matching = self.opening.as_ref().is_some_and(|(pending, p, rev)| {
+                        *pending == id && p == &path && *rev == self.revision
+                    });
+                    if matching {
+                        self.opening = None;
+                        match result {
+                            Ok(loaded) => self.complete_open(path, loaded),
+                            Err(error) => self.status = format!("Open failed: {error}"),
+                        }
+                    }
+                }
+                document_io::Reply::Save {
+                    id,
+                    path,
+                    content,
+                    result,
+                } => {
+                    if !self.saving.as_ref().is_some_and(|(pending, p, snapshot)| {
+                        *pending == id && *p == path && *snapshot == content
+                    }) {
+                        continue;
+                    }
+                    self.saving = None;
+                    match result {
+                        Ok(outcome) => {
+                            self.saved_source = content;
+                            self.dirty = self.rust != self.saved_source;
+                            self.disk_stamp = file_watch::file_stamp(&path).ok();
+                            if let Some(watch) = self.file_watch.as_mut() {
+                                watch.set_target(path.clone(), self.disk_stamp.clone());
+                            }
+                            self.external_change = false;
+                            self.status = match outcome {
+                                safe_save::SaveOutcome::Durable => {
+                                    "Saved original Rust source".into()
+                                }
+                                safe_save::SaveOutcome::CommittedDurabilityUncertain(error) => {
+                                    format!("内容已写入磁盘，但目录同步失败，持久性未确认：{error}")
+                                }
+                            };
+                            if !self.dirty && self.after_save_close {
+                                self.after_save_close = false;
+                                self.confirm_close = false;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            if !self.dirty && self.after_save_open {
+                                self.after_save_open = false;
+                                if let Some(next) = self.pending_open.take() {
+                                    self.open_file(next);
+                                }
+                            }
+                            if self.dirty {
+                                self.after_save_close = false;
+                                self.after_save_open = false;
+                                self.status.push_str("；保存过程中又有新修改，请再次保存。");
+                            }
+                        }
+                        Err(error) => {
+                            self.after_save_close = false;
+                            self.after_save_open = false;
+                            self.status =
+                                format!("Save failed (original source preserved): {error}");
+                        }
+                    }
+                }
             }
-            Err(error) => self.status = format!("Open failed: {error}"),
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_for_document_io(&mut self) {
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let ctx = egui::Context::default();
+        while self.opening.is_some() || self.saving.is_some() {
+            self.poll_document_io(&ctx);
+            assert!(
+                std::time::Instant::now() < limit,
+                "Document I/O did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -189,19 +319,22 @@ impl App {
     }
 
     fn save(&mut self) {
-        match &self.file {
-            Some(path) => match save_if_unchanged(path, &self.saved_source, &self.rust) {
-                Ok(()) => {
-                    self.dirty = false;
-                    self.saved_source.clone_from(&self.rust);
-                    self.disk_stamp = file_stamp(path).ok();
-                    self.external_change = false;
-                    self.status = "Saved original Rust source".into();
-                }
-                Err(error) => self.status = format!("Save failed: {error}"),
-            },
-            None => self.status = "Example is not saved: open an existing .rs file first.".into(),
+        if self.saving.is_some() {
+            self.status = "保存任务已经在后台运行，请勿重复提交。".into();
+            return;
         }
+        let Some(path) = self.file.clone() else {
+            self.status = "Example is read-only; open a real .rs file to save.".into();
+            return;
+        };
+        self.io_revision += 1;
+        let id = self.io_revision;
+        let content = self.rust.clone();
+        self.document_io
+            .get_or_insert_with(document_io::DocumentIo::new)
+            .save(id, path.clone(), self.saved_source.clone(), content.clone());
+        self.saving = Some((id, path, content));
+        self.status = "正在后台安全保存 Rust 文件…".into();
     }
 
     fn directory(&mut self, ui: &mut egui::Ui, dir: &Path, depth: usize) {
@@ -219,6 +352,8 @@ impl App {
                 ui.colored_label(Color32::YELLOW, format!("无法读取目录: {error}"));
             }
             file_tree::Snapshot::Ready(entries) => {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs(3));
                 let total = entries
                     .iter()
                     .filter(|entry| {
@@ -649,10 +784,70 @@ impl App {
                     self.mode = Mode::Learn;
                 }
             });
+            if let Some(root) = self.root.clone()
+                && ui
+                    .add_enabled(
+                        !self.symbol_pending,
+                        egui::Button::new("在项目中查找同名声明（仅语法匹配）"),
+                    )
+                    .clicked()
+            {
+                self.symbol_revision += 1;
+                self.symbol_query = anchor.symbol;
+                self.symbol_pending = true;
+                self.symbol_hits.clear();
+                self.symbol_worker
+                    .get_or_insert_with(symbol_search::SymbolSearch::new)
+                    .submit(self.symbol_revision, root, self.symbol_query.clone());
+            }
         } else {
             ui.label(
                 "Choose a highlighted symbol in Java or Rust to see its exact paired occurrence.",
             );
+        }
+        if self.symbol_pending {
+            ui.spinner();
+            ui.small("正在后台查找真实 Rust 声明…");
+        }
+        if !self.symbol_hits.is_empty() {
+            ui.separator();
+            ui.strong(format!(
+                "同名声明候选：{}（{} 项）",
+                self.symbol_query,
+                self.symbol_hits.len()
+            ));
+            ui.small("仅 AST 同名声明，不推断类型、模块可见性或真实定义归属。");
+            let hits: Vec<_> = self.symbol_hits.iter().take(35).cloned().collect();
+            egui::ScrollArea::vertical()
+                .max_height(165.)
+                .show(ui, |ui| {
+                    for hit in hits {
+                        let label = format!(
+                            "{} — {} :{} [{}]",
+                            hit.name,
+                            hit.path.file_name().unwrap_or_default().to_string_lossy(),
+                            hit.line + 1,
+                            hit.kind
+                        );
+                        if ui
+                            .selectable_label(false, label)
+                            .on_hover_text(hit.path.display().to_string())
+                            .clicked()
+                        {
+                            let span = parser::ByteSpan {
+                                start: hit.byte_start,
+                                end: hit.byte_end,
+                            };
+                            if self.file.as_ref() == Some(&hit.path) {
+                                self.mode = Mode::Rust;
+                                self.editor_jump = Some(span);
+                            } else {
+                                self.symbol_target = Some((hit.path.clone(), span));
+                                self.open(hit.path);
+                            }
+                        }
+                    }
+                });
         }
         ui.separator();
         ui.strong("Outline · declarations / concepts");
@@ -684,6 +879,11 @@ impl App {
     }
 
     fn body(&mut self, ui: &mut egui::Ui) {
+        if self.opening.is_some() {
+            ui.spinner();
+            ui.label("文件正在后台读取；当前源码保持原状。");
+            return;
+        }
         if self.projection_pending && matches!(self.mode, Mode::Java | Mode::Compare) {
             ui.label("Updating projection in the background…");
             return;
@@ -699,14 +899,15 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_document_io(ctx);
         // Watch real disk metadata off the event thread. Idle windows do not
         // repeatedly repaint just to poll file stamps.
         if let Some(path) = self.file.clone() {
-            if self
-                .file_watch
-                .as_ref()
-                .is_none_or(|watch| watch.path() != path)
-            {
+            if let Some(watch) = self.file_watch.as_mut() {
+                if watch.path() != path {
+                    watch.set_target(path, self.disk_stamp.clone());
+                }
+            } else {
                 self.file_watch = Some(file_watch::FileWatch::new(
                     path,
                     self.disk_stamp.clone(),
@@ -740,6 +941,15 @@ impl eframe::App for App {
             self.status = "Reading projection updated.".into();
         }
         self.update_file_search_results();
+        if let Some((rev, hits)) = self
+            .symbol_worker
+            .as_ref()
+            .and_then(symbol_search::SymbolSearch::take)
+            && rev == self.symbol_revision
+        {
+            self.symbol_hits = hits;
+            self.symbol_pending = false;
+        }
         if let Some(result) = self
             .analyzer_check
             .as_ref()
@@ -767,7 +977,10 @@ impl eframe::App for App {
             self.analyzer_diagnostics_status = result;
             self.analyzer_diagnostics = None;
         }
-        if self.projection_pending
+        if self.opening.is_some()
+            || self.saving.is_some()
+            || self.symbol_pending
+            || self.projection_pending
             || self.file_search_pending
             || self.analyzer_diagnostics.is_some()
             || self.analyzer_check.is_some()
@@ -784,12 +997,12 @@ impl eframe::App for App {
                 ui.label("Your changes have not been saved.");
                 ui.label(&self.status);
                 ui.horizontal(|ui| {
-                    if ui.button("Save and close").clicked() {
+                    if ui
+                        .add_enabled(self.saving.is_none(), egui::Button::new("Save and close"))
+                        .clicked()
+                    {
+                        self.after_save_close = true;
                         self.save();
-                        if !self.dirty {
-                            self.confirm_close = false;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
                     }
                     if ui.button("Discard and close").clicked() {
                         self.dirty = false;
@@ -808,13 +1021,12 @@ impl eframe::App for App {
                 ui.label("Save or discard your edits before switching files.");
                 ui.label(&self.status);
                 ui.horizontal(|ui| {
-                    if ui.button("Save and open").clicked() {
+                    if ui
+                        .add_enabled(self.saving.is_none(), egui::Button::new("Save and open"))
+                        .clicked()
+                    {
+                        self.after_save_open = true;
                         self.save();
-                        if !self.dirty
-                            && let Some(path) = self.pending_open.take()
-                        {
-                            self.open(path);
-                        }
                     }
                     if ui.button("Discard and open").clicked()
                         && let Some(path) = self.pending_open.take()
@@ -829,8 +1041,54 @@ impl eframe::App for App {
         }
         // Capture Ctrl+S before TextEdit can consume the event, but only save
         // AFTER the editor has applied all changes from this frame.
-        let save_shortcut =
-            ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::S));
+        let (save_shortcut, mode_shortcut, page_delta) = ctx.input(|i| {
+            let mod_pressed = i.modifiers.ctrl || i.modifiers.command;
+            let requested_mode = if !mod_pressed {
+                None
+            } else if i.key_pressed(egui::Key::Num1) {
+                Some(Mode::Java)
+            } else if i.key_pressed(egui::Key::Num2) {
+                Some(Mode::Rust)
+            } else if i.key_pressed(egui::Key::Num3) {
+                Some(Mode::Compare)
+            } else if i.key_pressed(egui::Key::Num4) {
+                Some(Mode::Learn)
+            } else {
+                None
+            };
+            let page_delta = if !mod_pressed {
+                0_i32
+            } else if i.key_pressed(egui::Key::PageDown) {
+                1
+            } else if i.key_pressed(egui::Key::PageUp) {
+                -1
+            } else {
+                0
+            };
+            (
+                mod_pressed && i.key_pressed(egui::Key::S),
+                requested_mode,
+                page_delta,
+            )
+        });
+        if let Some(mode) = mode_shortcut {
+            self.mode = mode;
+            self.last_scroll = None;
+            self.jump_to = self.selected;
+        }
+        if page_delta != 0
+            && self.mode == Mode::Rust
+            && self.rust.len() >= editor_core::LARGE_EDITOR_BYTES
+        {
+            if page_delta > 0 {
+                self.editor_page_start = (self.editor_page_start + editor_core::EDITOR_PAGE_LINES)
+                    .min(self.editor_line_starts.len().saturating_sub(1));
+            } else {
+                self.editor_page_start = self
+                    .editor_page_start
+                    .saturating_sub(editor_core::EDITOR_PAGE_LINES);
+            }
+        }
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("RustBridge");
@@ -849,6 +1107,9 @@ impl eframe::App for App {
                     self.analyzer_diagnostics_status = "已切换项目；原项目诊断已取消。".into();
                     self.dir_index = file_tree::DirectoryIndex::new();
                     self.directory_limits.clear();
+                    self.symbol_revision+=1;
+                    self.symbol_hits.clear();
+                    self.symbol_pending=false;
                     self.cargo_project = is_cargo_root(&folder);
                     self.root = Some(folder);
                     self.refresh_file_search();
@@ -1117,6 +1378,7 @@ mod file_tests {
         let missing =
             std::env::temp_dir().join(format!("rustbridge-missing-{}", std::process::id()));
         app.open_file(missing);
+        app.wait_for_document_io();
         assert!(app.dirty);
         assert_eq!(app.rust, previous);
         assert!(app.status.starts_with("Open failed:"));
@@ -1223,7 +1485,8 @@ mod file_tests {
 
     #[test]
     fn reload_disk_copy_never_discards_unsaved_source_without_confirmation() {
-        let path = std::env::temp_dir().join(format!("rustbridge-reload-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("rustbridge-reload-{}.rs", std::process::id()));
         fs::write(&path, "disk version").unwrap();
         let mut app = App {
             file: Some(path.clone()),
@@ -1238,6 +1501,7 @@ mod file_tests {
         app.dirty = false;
         app.pending_open = None;
         app.reload_disk_copy();
+        app.wait_for_document_io();
         assert_eq!(app.rust, "disk version");
         fs::remove_file(path).unwrap();
     }

@@ -1,10 +1,11 @@
 //! Lazy asynchronous directory index. egui never calls read_dir or sorts entries.
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::PathBuf,
     sync::{Arc, Condvar, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,8 +32,9 @@ pub enum Snapshot {
 
 #[derive(Default)]
 struct State {
-    scans: HashMap<PathBuf, Snapshot>,
+    scans: HashMap<PathBuf, (Snapshot, Instant)>,
     queue: VecDeque<PathBuf>,
+    queued: HashSet<PathBuf>,
     closed: bool,
 }
 struct Shared {
@@ -61,7 +63,9 @@ impl DirectoryIndex {
                     if state.closed {
                         return;
                     }
-                    state.queue.pop_front().unwrap()
+                    let dir = state.queue.pop_front().unwrap();
+                    state.queued.remove(&dir);
+                    dir
                 };
                 let snapshot = match read_directory(&directory) {
                     Ok(entries) => Snapshot::Ready(Arc::new(entries)),
@@ -71,18 +75,37 @@ impl DirectoryIndex {
                 if state.closed {
                     return;
                 }
-                state.scans.insert(directory, snapshot);
+                state.scans.insert(directory, (snapshot, Instant::now()));
             }
         });
         Self { shared }
     }
 
     pub fn get_or_request(&self, directory: PathBuf) -> Snapshot {
+        self.get_or_request_at(directory, Duration::from_secs(3))
+    }
+
+    fn get_or_request_at(&self, directory: PathBuf, max_age: Duration) -> Snapshot {
         let mut state = self.shared.state.lock().unwrap();
-        if let Some(existing) = state.scans.get(&directory) {
-            return existing.clone();
+        let now = Instant::now();
+        if let Some((snapshot, updated)) = state.scans.get(&directory) {
+            let snapshot = snapshot.clone();
+            if now.duration_since(*updated) >= max_age {
+                // Serve the last complete snapshot while refreshing: no UI flicker.
+                if state.queued.insert(directory.clone()) {
+                    state.queue.push_back(directory.clone());
+                    self.shared.ready.notify_one();
+                }
+                if let Some((_, last)) = state.scans.get_mut(&directory) {
+                    *last = now;
+                }
+            }
+            return snapshot;
         }
-        state.scans.insert(directory.clone(), Snapshot::Loading);
+        state
+            .scans
+            .insert(directory.clone(), (Snapshot::Loading, now));
+        state.queued.insert(directory.clone());
         state.queue.push_back(directory);
         self.shared.ready.notify_one();
         Snapshot::Loading
@@ -168,6 +191,41 @@ mod tests {
                     thread::sleep(Duration::from_millis(10));
                 }
             }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn real_directory_refreshes_after_external_creation() {
+        let root = std::env::temp_dir().join(format!(
+            "rustbridge-tree-refresh-{}-{}",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.rs"), "").unwrap();
+        let worker = DirectoryIndex::new();
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Snapshot::Ready(entries) =
+                worker.get_or_request_at(root.clone(), Duration::from_millis(25))
+                && entries.len() == 1
+            {
+                break;
+            }
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        fs::write(root.join("b.rs"), "").unwrap();
+        loop {
+            if let Snapshot::Ready(entries) =
+                worker.get_or_request_at(root.clone(), Duration::from_millis(25))
+                && entries.len() == 2
+            {
+                break;
+            }
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
         }
         fs::remove_dir_all(root).unwrap();
     }

@@ -8,7 +8,7 @@ RustBridge is written in Rust (egui/eframe + Tree-sitter). There is no JVM, Elec
 
 ![RustBridge Java / Rust learner view with OS CJK font fallback](docs/images/rustbridge-zh-hardening.png)
 
-## What works — v0.3
+## What works — v0.4
 
 - **Java View (default):** open a real `.rs` file and read a conservative AST-based Java-inspired projection.
 - **Linked Compare:** left Java projection, right actual Rust; click a highlighted method, field, type or keyword in **either** pane to select its exact corresponding AST token occurrence, highlight both, and jump to the same source location.
@@ -22,6 +22,16 @@ RustBridge is written in Rust (egui/eframe + Tree-sitter). There is no JVM, Elec
 - **Learn:** 12 paged Java 8 ↔ Rust language concepts, with short code examples.
 - **Conservative syntax handling:** Tree-sitter AST recognition, no automatic macro expansion, warnings on malformed syntax; unrecognized Rust syntax stays Rust.
 - **Large-file support:** visible-row rendering and per-line indexed AST links, without scanning the entire AST for every visible line.
+
+## v0.4 safety, UX and Linux release
+
+- **Safer Linux saving:** reject read-only source; preserve verified file mode, owner and readable extended attributes (including ACL/security labels) or refuse to save. Distinguish committed-but-durability-uncertain status after a successful rename.
+- **Non-blocking source I/O:** read/save on a background worker with latest-open cancellation, 32 MiB safety cap and nonblocking Unix special-file detection; the window remains responsive during regular file I/O.
+- **Reliable external change awareness:** reusable background observer compares ctime/inode/device/mtime/size, detecting same-sized changes with restored mtime. Real directory contents revalidate automatically when viewed.
+- **Mixed newline editing:** prevent standalone CR, LF and CRLF from merging across an edit seam; deterministic fuzz regressions cover Unicode and mixed line endings.
+- **Learning navigation:** an optional AST-only same-name declaration search over actual Rust files; candidates are NOT resolved definitions, and clicking opens the source location. Keyboard access: Ctrl+1 (Java), Ctrl+2 (Rust), Ctrl+3 (Compare), Ctrl+4 (Lessons); for large Rust files Ctrl+PageDown / Ctrl+PageUp navigates editor pages.
+- **Native Linux package + CI:** `scripts/package-deb.sh` creates a Debian package; CI builds the Release binary once, tests real keyboard-based X11/Xvfb GUI saves and source resources, extracts and tests the packaged binary.
+- **Release / acceptance:** see [the v0.4 hardening and acceptance report](docs/v0.4-integrated-acceptance.md) for exact scope and remaining limitations. No bundled system fonts.
 
 ## v0.3 safety and performance changes
 
@@ -38,7 +48,7 @@ RustBridge is written in Rust (egui/eframe + Tree-sitter). There is no JVM, Elec
 Install the Rust toolchain via https://rustup.rs and native X11 / Wayland graphics development libraries required by eframe. On Ubuntu/Debian:
 
 ```bash
-sudo apt-get install -y build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev libx11-xcb-dev libgl1-mesa-dev
+sudo apt-get install -y build-essential pkg-config libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libx11-xcb-dev libgl1-mesa-dev
 git clone https://github.com/code5m/rustbridge.git
 cd rustbridge
 cargo run
@@ -53,6 +63,10 @@ cargo fmt --check
 cargo check --all-targets
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
+cargo build --release
+xvfb-run -a -s '-screen 0 1440x900x24' bash tests/gui-smoke.sh ./target/release/rustbridge
+xvfb-run -a -s '-screen 0 1440x900x24' bash tests/resource-smoke.sh ./target/release/rustbridge
+bash scripts/package-deb.sh --skip-build
 ```
 
 ## Performance and limits
@@ -60,7 +74,7 @@ cargo clippy --all-targets -- -D warnings
 Measured observations, machine details and the exact benchmark method are in
 [docs/performance-baseline.md](docs/performance-baseline.md). The v0.3 Linux X11/Xvfb run includes visual screenshots and actual click,
 keyboard/save and external-change checks, plus reproducible projection probes.
-This is targeted native GUI smoke validation, not a multi-platform acceptance claim.
+This is targeted native Linux GUI smoke and package validation, not a multi-platform acceptance claim.
 
 File-name search is bounded to 100 matches and depth 12. The real directory tree
 is scanned on a worker and pages entries in groups of 180; all meaningful top-level
@@ -81,7 +95,10 @@ larger than or equal to 512 KiB; the original Rust document remains intact.
 | `src/projection_worker.rs` | Reusable incremental Tree-sitter parser and revision cancellation |
 | `src/safe_save.rs` | Staged atomic writes and external-editor conflict checks |
 | `src/analyzer.rs` | Opt-in process-scoped rust-analyzer diagnostic checks |
-| `src/file_watch.rs` | Background disk stamp monitoring, repaint only when data changes |
+| `src/file_watch.rs` | Reusable background file identity/ctime/mtime monitoring |
+| `src/document_io.rs` | Async source open/save, generation-based cancellation and file limits |
+| `src/symbol_search.rs` | Bounded AST-only declaration candidate search (not a resolver) |
+| `scripts/package-deb.sh` / `tests/*.sh` | Native Linux package, GUI and resource smoke |
 | `src/ui_fonts.rs` | OS font fallback for Chinese glyphs (no bundled font files) |
 | `examples/projection_probe.rs` | Release projection microbenchmark of full vs incremental processing |
 | `src/lessons.rs` | 12 introductory Java↔Rust lessons |
@@ -90,20 +107,20 @@ larger than or equal to 512 KiB; the original Rust document remains intact.
 
 ## Precision and scope
 
-**Precise** means the same *syntactic occurrence* has byte-accurate spans in both views. It does **not** yet mean cross-file definition lookup, type inference, trait resolution, lifetime checking, or macro expansion. Analogies such as `Option` ≈ `Optional` and `Vec` ≈ `ArrayList` are **explanatory hints only**: without a real type resolver, Rust identifiers are retained unchanged so a user-defined type cannot be misrepresented. Always check the original Rust and explanatory panel.
+**Precise** means the same *syntactic occurrence* has byte-accurate spans in both views. It does **not** mean resolved cross-file definition lookup (only syntax-based same-name candidates), type inference, trait resolution, lifetime checking, or macro expansion. Analogies such as `Option` ≈ `Optional` and `Vec` ≈ `ArrayList` are **explanatory hints only**: without a real type resolver, Rust identifiers are retained unchanged so a user-defined type cannot be misrepresented. Always check the original Rust and explanatory panel.
 
 Text transforms never reorder source statements or insert/remove newlines, preserving line correspondence. Span maps and Unicode/CRLF handling are unit-tested. Original Rust source is not modified by Java View or Compare.
 
-## Still outside v0.3
+## Still outside v0.4
 
 - **Optional rust-analyzer diagnostics:** the sidebar can check availability and, on
   demand, run its bounded, cancellable `diagnostics` command for an opened Cargo project.
   Build scripts and proc macros are disabled for this check. It never starts an LSP session;
   completion and go-to-definition remain outside the current scope. The executable is optional;
   its absence never affects core reading or editing.
-- No debugging, Rust build/run actions for opened projects, installation bundles, plugin marketplace, or full IDE replacement.
+- No debugging, Rust build/run actions for opened projects, installer for Windows/macOS, plugin marketplace, or full IDE replacement. Linux .deb packaging exists for native distribution.
 - No complete Java syntax conversion. Java view is intentionally partial and read-only.
 - Native window launches and selected GUI interactions are smoke-tested on Linux X11/Xvfb; full human acceptance remains necessary for each desktop environment.
-- Atomic save does not provide a perfect lock-free transaction against arbitrary uncooperative external writers; see [the hardening report](docs/hardening-2026-11-04.md) for caveats.
+- Atomic save does not provide a perfect lock-free transaction against arbitrary uncooperative external writers; OS security metadata can force safe rejection. See [the v0.4 acceptance report](docs/v0.4-integrated-acceptance.md) for caveats.
 
 MIT licensed. See [CHANGELOG.md](CHANGELOG.md).

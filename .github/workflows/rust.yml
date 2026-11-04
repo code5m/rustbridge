@@ -5,14 +5,38 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libx11-xcb-dev libgl1-mesa-dev
+      - name: Native and GUI smoke dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libx11-xcb-dev libgl1-mesa-dev libgl1-mesa-dri xvfb xdotool
       - run: cargo fmt --check
       - run: cargo check --all-targets
-      - run: cargo test
+      - run: cargo test --all-targets
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Build optimized native binary
+        run: cargo build --release
+      - name: Native GUI real keyboard and save smoke (Xvfb)
+        run: xvfb-run -a -s '-screen 0 1440x900x24' bash tests/gui-smoke.sh ./target/release/rustbridge
+      - name: Large-source idle resource smoke (Xvfb)
+        run: xvfb-run -a -s '-screen 0 1440x900x24' bash tests/resource-smoke.sh ./target/release/rustbridge
+      - name: Package Debian native app
+        run: bash scripts/package-deb.sh --skip-build
+      - name: Inspect and extract Debian package
+        run: |
+          PACKAGE="$(find dist -name 'rustbridge_*.deb' -print -quit)"
+          dpkg-deb --info "$PACKAGE"
+          mkdir -p /tmp/rustbridge-deb-install
+          dpkg-deb -x "$PACKAGE" /tmp/rustbridge-deb-install
+          test -x /tmp/rustbridge-deb-install/usr/bin/rustbridge
+          test -f /tmp/rustbridge-deb-install/usr/share/applications/rustbridge.desktop
+      - name: Smoke extracted release package (Xvfb)
+        run: xvfb-run -a -s '-screen 0 1440x900x24' bash tests/gui-smoke.sh /tmp/rustbridge-deb-install/usr/bin/rustbridge
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustbridge-linux-deb
+          path: dist/*.deb
+          if-no-files-found: error

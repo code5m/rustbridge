@@ -48,3 +48,13 @@ Roadmap: optional rust-analyzer for resolved identities and go-to-definition; ri
 - Measure performance with repeatable workloads. Record idle/active CPU, RSS, file size and hardware; debug Xvfb results are not release desktop acceptance.
 
 - Display CRLF sources as LF only in the editing widget; restore only the changed physical byte span on save, preserving unaffected mixed line endings. Verify insertion, deletion and Unicode cursor offset mapping.
+
+
+## v0.4 safety and acceptance contracts
+
+- File I/O to open and save actual Rust source happens on the serialized background worker; supersede older opens, do not silently cancel accepted saves. Reject nonregular files and overly large input.
+- Never overwrite an owner-readonly file through a parent-directory rename. On Linux, copy and verify available xattrs, file permissions, UID/GID or reject rather than dropping ACL/security metadata. After rename, directory sync failure must be reported as **already committed**.
+- File watcher is reusable, compares inode/ctime/size/mtime, and does not create a long-lived thread for every opened file. The directory index automatically revalidates without changing actual path layout.
+- Java learning symbol navigation is an AST-only *same-name declaration candidate* service; do not claim actual cross-crate type inference or semantic go-to-definition.
+- Release quality requires not only fmt/check/tests/clippy but real X11/Xvfb keyboard saves and CRLF assertions, a bounded resource measurement, and a verified .deb artifact. Do not bundle CJK font files.
+- Preserve original files on failures and keep all integrated fixes in one branch/PR until a single gated merge into main.

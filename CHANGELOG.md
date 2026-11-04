@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0 — Single-branch finishing pass
+
+- Preserve supported Linux source metadata (mode, owner and readable xattrs/ACL labels) and refuse read-only or unsafe source saves.
+- Distinguish a committed rename with uncertain directory durability from a pre-commit failure.
+- Move source reading and saving off the GUI thread; cap source size and reject nonregular .rs files without blocking Unix FIFO opens.
+- Automatically refresh real directory indexes and reuse one file watcher that detects inode/ctime changes.
+- Correct mixed lone-CR/LF/CRLF editing seams; add deterministic randomized Unicode/newline regression tests.
+- Introduce bounded AST declaration candidate search for cross-file learning, explicitly not a semantic definition resolver.
+- Add Ctrl+1..4 mode switching and Ctrl+PageDown/PageUp large-file navigation for keyboard-first workflow and GUI regression stability.
+- Add real GUI keyboard/CRLF save tests, Linux Release resource smoke, Debian .deb packaging and packaged-binary CI validation.
+- Keep all v0.4 changes on one review branch before the final single merge to main.
+
 ## 0.3.0 — Single-branch integrated correctness and resource hardening
 
 - Fix confirmed Chinese UTF-8 block-comment panic, search-next relative byte offsets, and unsafe custom type-name rewrites.

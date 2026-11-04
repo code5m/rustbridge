@@ -5,7 +5,7 @@
 
 /// Translate CRLF pairs for display. Original code stays in the Document.
 pub fn for_display(original: &str) -> String {
-    original.replace("\r\n", "\n")
+    original.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Map a UTF-8 byte boundary in original Rust into the normalized widget.
@@ -35,15 +35,36 @@ pub fn display_to_original(original: &str, display: usize) -> usize {
     (display + removed).min(original.len())
 }
 
-fn nearest_line_ending_is_crlf(original: &str, physical: usize) -> bool {
-    if let Some(relative) = original[physical..].find('\n') {
-        let newline = physical + relative;
-        return newline > 0 && original.as_bytes()[newline - 1] == b'\r';
+#[derive(Clone, Copy)]
+enum LineEnding {
+    Lf,
+    CrLf,
+    Cr,
+}
+
+fn nearest_line_ending(original: &str, physical: usize) -> LineEnding {
+    fn ending_at(text: &str, index: usize) -> Option<LineEnding> {
+        match text.as_bytes().get(index) {
+            Some(b'\r') if text.as_bytes().get(index + 1) == Some(&b'\n') => Some(LineEnding::CrLf),
+            Some(b'\r') => Some(LineEnding::Cr),
+            Some(b'\n') => Some(LineEnding::Lf),
+            _ => None,
+        }
     }
-    if let Some(newline) = original[..physical].rfind('\n') {
-        return newline > 0 && original.as_bytes()[newline - 1] == b'\r';
+    if let Some(offset) = original[physical..].find(['\n', '\r']) {
+        return ending_at(original, physical + offset).unwrap_or(LineEnding::Lf);
     }
-    false
+    if let Some(offset) = original[..physical].rfind(['\n', '\r']) {
+        // Prefer the CR of a CRLF pair (otherwise a preceding LF is ambiguous).
+        if original.as_bytes()[offset] == b'\n'
+            && offset > 0
+            && original.as_bytes()[offset - 1] == b'\r'
+        {
+            return LineEnding::CrLf;
+        }
+        return ending_at(original, offset).unwrap_or(LineEnding::Lf);
+    }
+    LineEnding::Lf
 }
 
 /// Patch just the changed interval; untouched mixed CRLF/LF sections stay intact.
@@ -79,17 +100,54 @@ pub fn apply_display_edit(original: &str, before: &str, edited: &str) -> String 
     let physical_start = display_to_original(original, prefix);
     let physical_end = display_to_original(original, old_end);
     let insertion = &edited[prefix..new_end];
-    let replacement = if nearest_line_ending_is_crlf(original, physical_start) {
-        insertion.replace('\n', "\r\n")
-    } else {
-        insertion.to_owned()
+    let replacement = match nearest_line_ending(original, physical_start) {
+        LineEnding::CrLf => insertion.replace('\n', "\r\n"),
+        LineEnding::Cr => insertion.replace('\n', "\r"),
+        LineEnding::Lf => insertion.to_owned(),
     };
-    let mut result =
-        String::with_capacity(original.len() - (physical_end - physical_start) + replacement.len());
-    result.push_str(&original[..physical_start]);
-    result.push_str(&replacement);
-    result.push_str(&original[physical_end..]);
+    let prefix = &original[..physical_start];
+    let suffix = &original[physical_end..];
+    let mut result = String::with_capacity(prefix.len() + replacement.len() + suffix.len());
+    append_physical_atoms(&mut result, prefix);
+    append_physical_atoms(&mut result, &replacement);
+    append_physical_atoms(&mut result, suffix);
+    debug_assert_eq!(
+        for_display(&result),
+        edited,
+        "newline mapping must be reversible"
+    );
     result
+}
+
+/// Preserve the original physical line endings as individual logical atoms.
+/// If an edit joins an original lone CR and an independent LF, encode that LF
+/// as CR rather than accidentally forming a single CRLF token. A chain of
+/// adjacent line endings is repaired left-to-right without collapsing lines.
+fn append_physical_atoms(out: &mut String, physical: &str) {
+    let bytes = physical.as_bytes();
+    let mut begin = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let value = bytes[index];
+        if value != b'\n' && value != b'\r' {
+            index += 1;
+            continue;
+        }
+        out.push_str(&physical[begin..index]);
+        if value == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            out.push_str("\r\n");
+            index += 2;
+        } else {
+            out.push(if value == b'\n' && out.ends_with('\r') {
+                '\r'
+            } else {
+                value as char
+            });
+            index += 1;
+        }
+        begin = index;
+    }
+    out.push_str(&physical[begin..]);
 }
 
 #[cfg(test)]
@@ -147,6 +205,69 @@ mod tests {
             let physical = display_to_original(original, position);
             assert!(original.is_char_boundary(physical));
             assert_eq!(original_to_display(original, physical), position);
+        }
+    }
+
+    #[test]
+    fn lone_cr_boundaries_are_not_eaten() {
+        let original = "\r// \r";
+        let before = for_display(original);
+        assert_eq!(before, "\n// \n");
+        let edited = "\n\n// \n";
+        let saved = apply_display_edit(original, &before, edited);
+        assert_eq!(for_display(&saved), edited);
+        assert_eq!(saved, "\r\r// \r");
+    }
+
+    #[test]
+    fn joining_adjacent_cr_and_lf_never_loses_a_newline() {
+        let original = "\raa\r\n\n\r\n";
+        let before = for_display(original);
+        let edited = "\n\n\n";
+        let result = apply_display_edit(original, &before, edited);
+        assert_eq!(for_display(&result), edited);
+
+        let original = "\n🦀b\r🦀\n/\n\n baa/x\n";
+        let before = for_display(original);
+        let edited = format!("{}\n{}", &before[..7], &before[13..]);
+        let result = apply_display_edit(original, &before, &edited);
+        assert_eq!(for_display(&result), edited);
+    }
+
+    #[test]
+    fn randomized_mixed_eol_edits_are_reversible() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+        let mut seed = 0x4138ae38bdffe21_u64;
+        let pieces = ["a", "b", "中文", "🦀", "\r\n", "\n", "\r", "x", "/", " "];
+        let inserts = ["", "a", "中", "🦀", "\n", "\na", "abc", "\n中", "a\n"];
+        for trial in 0..6000 {
+            let mut original = String::new();
+            for _ in 0..(next(&mut seed) % 18 + 1) {
+                original.push_str(pieces[(next(&mut seed) % pieces.len() as u64) as usize]);
+            }
+            let before = for_display(&original);
+            let bounds: Vec<_> = before
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([before.len()])
+                .collect();
+            let a = (next(&mut seed) % bounds.len() as u64) as usize;
+            let b = (next(&mut seed) % bounds.len() as u64) as usize;
+            let start = bounds[a.min(b)];
+            let end = bounds[a.max(b)];
+            let insert = inserts[(next(&mut seed) % inserts.len() as u64) as usize];
+            let edited = format!("{}{}{}", &before[..start], insert, &before[end..]);
+            let actual = apply_display_edit(&original, &before, &edited);
+            assert_eq!(
+                for_display(&actual),
+                edited,
+                "trial={trial} original={original:?}"
+            );
         }
     }
 
