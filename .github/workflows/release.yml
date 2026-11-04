@@ -55,7 +55,8 @@ jobs:
           $nsis = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'NSIS/makensis.exe'
           $manifest = Get-Content Cargo.toml -Raw
           $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
-          & $nsis "/DVERSION=$version" "scripts/rustbridge-installer.nsi"
+          Set-Location $env:GITHUB_WORKSPACE
+          & $nsis "/DVERSION=$version" "$env:GITHUB_WORKSPACE/scripts/rustbridge-installer.nsi"
           if ($LASTEXITCODE -ne 0) { throw 'NSIS packaging failed' }
       - uses: softprops/action-gh-release@v2
         with:
