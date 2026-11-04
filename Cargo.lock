@@ -2252,9 +2252,10 @@ dependencies = [
 
 [[package]]
 name = "rustbridge"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
+ "libc",
  "rfd",
  "tree-sitter",
  "tree-sitter-rust",

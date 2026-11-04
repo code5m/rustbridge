@@ -63,3 +63,63 @@ workload with equivalent mappings remain unmeasured. File scanning and editing s
 have synchronous work. The current projection worker debounces requests but does not
 perform incremental Tree-sitter updates or cancel a parse already in progress. Do not
 interpret the figures above as proof of a performance target.
+
+
+## RustBridge v0.3 integrated hardening observations — 2026-11-04
+
+These are *additional*, repeatable exploratory measurements of the **uncommitted v0.3 hardening
+branch** on the same shared AMD Ryzen 7 5700U / 14 GiB Linux workstation.
+The older sections above describe historical commits, not the current code.
+
+### Projection benchmark
+
+Run:
+
+```bash
+cargo run --release --example projection_probe -- examples/basics.rs
+cargo run --release --example projection_probe -- /path/to/zlib-rs-0.6.8/src/inflate.rs
+cargo run --release --example projection_probe -- /path/to/glow-0.16.0/src/gl46.rs
+```
+
+The test reads one real source once, measures one cold projection, then
+five fresh full projections and five sequential Tree-sitter incremental edits appending
+a short comment. The numbers below are the 5-sample median, excluding file I/O and UI
+rendering. Full projection and incremental parsing do not perform equivalent work,
+so this is a useful comparison of real user workloads, **not** a scientific apples-to-apples
+parser optimization benchmark.
+
+| Source | Bytes / physical lines | AST anchors | Cold ms | Full median ms | Incremental median ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RustBridge basics | 639 / 30 | 61 | 0.481 | 0.297 | 0.108 |
+| zlib-rs 0.6.8 inflate.rs | 102,440 / 2,735 | 4,913 | 36.448 | 33.223 | 15.173 |
+| glow 0.16.0 gl46.rs | 1,546,756 / 37,803 | 56,954 | 517.362 | 549.924 | 146.516 |
+
+### Native GUI idle resource measurement
+
+Build with `cargo build --release`, run `target/release/rustbridge <real .rs>` on
+X11 using an isolated Xvfb 1440×900x24 display, preload the selected file,
+wait 8 s, then sample process `utime + stime`, `VmRSS` and number of
+`/proc/<pid>/fd` entries, 5 s apart. CPU is **one-core equivalent**
+`100 × delta_ticks / (5 × CLK_TCK)`. Debug binaries, Wayland window-manager behavior,
+and machine system-wide CPU are not included.
+
+| Workload | Prior 1-second UI repaint polling (sample) | After asynchronous metadata watcher (sample) | After RSS KiB | After FD count |
+| --- | ---: | ---: | ---: | ---: |
+| basics.rs, small | 3.2% one core | 0.0% one core | 125,496 → 125,496 | 10 → 10 |
+| gl46.rs, 1.55 MB | 3.8% one core | 0.0% one core | 181,884 → 181,884 | 10 → 10 |
+
+The process showed no CPU tick changes within the 5 s observation window
+following the change to background file metadata observation. This confirms
+the **sampled idle** regression is addressed on this machine, not that all
+platforms, running projects or longer sessions will sustain 0.00% CPU.
+Release binary was approximately 9.7 MiB with the optimized profile.
+
+### Real native GUI coverage and gaps
+
+Xvfb screenshots verified Chinese fonts without bundling font files, a Rust AST-linked
+Java reading view, live Rust view, comparison interactions, opening a 37,803-line
+real file, selecting page 2 (line 241 onward), and external modification alerts.
+Keyboard focus and Ctrl+S were separately verified with an isolated temp source.
+Normal desktop integration and reproducible cold-start latency, activity under
+continuous typing and scrolling, long-running memory budgets, rapid workspace switching,
+and multi-platform tests require separate acceptance.

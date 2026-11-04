@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.0 — Single-branch finishing pass
+
+- Preserve supported Linux source metadata (mode, owner and readable xattrs/ACL labels) and refuse read-only or unsafe source saves.
+- Distinguish a committed rename with uncertain directory durability from a pre-commit failure.
+- Move source reading and saving off the GUI thread; cap source size and reject nonregular .rs files without blocking Unix FIFO opens.
+- Automatically refresh real directory indexes and reuse one file watcher that detects inode/ctime changes.
+- Correct mixed lone-CR/LF/CRLF editing seams; add deterministic randomized Unicode/newline regression tests.
+- Introduce bounded AST declaration candidate search for cross-file learning, explicitly not a semantic definition resolver.
+- Add Ctrl+1..4 mode switching and Ctrl+PageDown/PageUp large-file navigation for keyboard-first workflow and GUI regression stability.
+- Add real GUI keyboard/CRLF save tests, Linux Release resource smoke, Debian .deb packaging and packaged-binary CI validation.
+- Keep all v0.4 changes on one review branch before the final single merge to main.
+
+## 0.3.0 — Single-branch integrated correctness and resource hardening
+
+- Fix confirmed Chinese UTF-8 block-comment panic, search-next relative byte offsets, and unsafe custom type-name rewrites.
+- Make source saves atomic via temporary-file fsync/rename; protect against common external changes and test rollback on errors.
+- Move real directory scanning off UI thread, page long directories, avoid symlink recursion.
+- Reuse Tree-sitter incrementally and cancel superseded parses; cache read-only line indices.
+- Add bounded 240-line Rust editor pages for large files, plus reversible CRLF/LF display mapping for small and paged editing that preserves untouched source line endings.
+- Scope optional diagnostics to its project; cancel process groups, enforce timeouts, and explicitly signal disk-only checks.
+- Add Chinese Java structure insights, course explanations and operating-system CJK font fallback.
+- Split editor, line ending conversion, filesystem safety, directory indexing, file monitoring and font logic into independent modules.
+- Add regression coverage (51 main tests and 13 repeated parser tests in the probe example), console projection probe, real Xvfb screenshots, native keyboard save/CRLF acceptance and performance evaluation.
+
+
+
 ## 0.2.0 — AST-linked learning views
 
 - Replaced fragile whole-line rewrites with token-level Tree-sitter-based educational transformations.

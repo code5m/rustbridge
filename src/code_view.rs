@@ -38,13 +38,13 @@ pub fn show(
         jump_to,
         scroll_to,
     } = options;
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut line_starts = Vec::with_capacity(lines.len());
-    let mut byte = 0;
-    for line in &lines {
-        line_starts.push(byte);
-        byte += line.len() + 1;
-    }
+    // The parser computed these byte offsets once per document revision.
+    // Avoid re-splitting a 40k-line file on every egui repaint.
+    let line_starts = match side {
+        Side::Java => &projection.java_line_starts,
+        Side::Rust => &projection.rust_line_starts,
+    };
+    let lines = line_starts.len();
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace) + 6.0;
     let jump_line = jump_to
         .and_then(|idx| projection.anchors.get(idx))
@@ -63,11 +63,13 @@ pub fn show(
         scroll = scroll.vertical_scroll_offset(y);
     }
     let mut clicked = None;
-    let output = scroll.show_rows(ui, row_height, lines.len(), |ui, visible| {
+    let output = scroll.show_rows(ui, row_height, lines, |ui, visible| {
         for line_number in visible {
-            let line = lines[line_number];
             let begin = line_starts[line_number];
-            let end = begin + line.len();
+            let end = line_starts
+                .get(line_number + 1)
+                .map(|next| next.saturating_sub(1))
+                .unwrap_or(text.len());
             ui.horizontal(|row| {
                 row.spacing_mut().item_spacing.x = 0.0;
                 row.set_min_height(row_height);
