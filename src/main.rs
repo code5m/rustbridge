@@ -224,6 +224,23 @@ impl Default for App {
 }
 
 impl App {
+    fn flush_shutdown_state(&self) {
+        if let Some(worker) = self.state_worker.as_ref() {
+            worker.send(persistence::Job::Session(self.session_snapshot()));
+            if let Some(path) = self.file.clone() {
+                if self.dirty {
+                    worker.send(persistence::Job::SaveJournal {
+                        path,
+                        baseline: self.saved_source.clone(),
+                        edited: self.rust.clone(),
+                    });
+                } else {
+                    worker.send(persistence::Job::DeleteJournal(path));
+                }
+            }
+        }
+    }
+
     fn initialize_state(&mut self, restore_last_document: bool) {
         let store = match persistence::Store::from_system() {
             Ok(store) => store,
@@ -232,20 +249,28 @@ impl App {
                 return;
             }
         };
+        self.initialize_state_from_store(store, restore_last_document);
+    }
+    fn initialize_state_from_store(
+        &mut self,
+        store: persistence::Store,
+        restore_last_document: bool,
+    ) {
         if let Some(session) = store.load_session() {
             self.lesson = session.lesson.min(lessons::LESSONS.len().saturating_sub(1));
             self.completed_lessons = normalized_completion(&session.completed_lessons);
             self.cursor_byte = session.cursor_byte;
             self.recovered_mode = Some(mode_from_name(&session.mode));
             if restore_last_document {
-                self.root = session.root.filter(|p| p.is_dir());
+                self.root = session.root.clone().filter(|p| p.is_dir());
                 self.cargo_project = self.root.as_ref().is_some_and(|p| is_cargo_root(p));
-                if let Some(path) = session.file.filter(|p| p.is_file()) {
+                if let Some(path) = session.file.clone().filter(|p| p.is_file()) {
                     self.open_file(path);
                 } else if let Some(mode) = self.recovered_mode.take() {
                     self.mode = mode;
                 }
             }
+            self.last_session = Some(session);
         }
         self.state_worker = Some(persistence::PersistenceWorker::spawn(store.clone()));
         self.state_store = Some(store);
@@ -580,7 +605,7 @@ impl App {
                 .load_journal(&path)
                 .filter(|journal| journal.edited != self.rust);
         }
-        if self.cursor_byte > 0 && self.cursor_byte < self.rust.len() {
+        if self.cursor_byte <= self.rust.len() && self.rust.is_char_boundary(self.cursor_byte) {
             self.editor_jump = Some(parser::ByteSpan {
                 start: self.cursor_byte,
                 end: self.cursor_byte,
@@ -673,6 +698,15 @@ impl App {
                                     format!("内容已写入磁盘，但目录同步失败，持久性未确认：{error}")
                                 }
                             };
+                            if !durable {
+                                // The content crossed the commit point, but the user
+                                // must explicitly acknowledge uncertain directory durability.
+                                if self.after_save_close {
+                                    self.confirm_close = true;
+                                }
+                                self.after_save_close = false;
+                                self.after_save_open = false;
+                            }
                             if !self.dirty && durable && self.after_save_close {
                                 self.after_save_close = false;
                                 self.confirm_close = false;
@@ -1326,19 +1360,21 @@ impl App {
             .take(250)
             .map(|(idx, anchor)| (idx, anchor.rust_at.line, anchor.symbol.clone(), anchor.kind))
             .collect();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for (idx, line, name, kind) in outline {
-                if ui
-                    .selectable_label(
-                        self.selected == Some(idx),
-                        format!("L{}  {} · {}", line + 1, name, kind),
-                    )
-                    .clicked()
-                {
-                    self.select(idx, self.mode == Mode::Java);
+        egui::ScrollArea::vertical()
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .show(ui, |ui| {
+                for (idx, line, name, kind) in outline {
+                    if ui
+                        .selectable_label(
+                            self.selected == Some(idx),
+                            format!("L{}  {} · {}", line + 1, name, kind),
+                        )
+                        .clicked()
+                    {
+                        self.select(idx, self.mode == Mode::Java);
+                    }
                 }
-            }
-        });
+            });
     }
 
     fn body(&mut self, ui: &mut egui::Ui) {
@@ -1381,30 +1417,6 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if std::env::var_os("RUSTBRIDGE_PERF_TRACE").is_some() {
-            static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let frame = FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if frame % 400 == 0 {
-                eprintln!("TRACE_REPAINT_CAUSES {:?}", ctx.repaint_causes());
-            }
-            if frame % 40 == 0 {
-                eprintln!(
-                    "TRACE frame={} io_open={} io_save={} pending_proj={} pending_symbol={} search={} lsp={} cargo={} state_due={} recovery_due={} mode={} file={}",
-                    frame,
-                    self.opening.is_some(),
-                    self.saving.is_some(),
-                    self.projection_pending,
-                    self.symbol_pending,
-                    self.file_search_pending,
-                    self.lsp_task.is_some(),
-                    self.cargo_task.is_some(),
-                    self.session_due.is_some(),
-                    self.recovery_due.is_some(),
-                    mode_name(self.mode),
-                    self.file.as_ref().map_or("none", |_| "set")
-                );
-            }
-        }
         self.poll_document_io(ctx);
         self.poll_cargo();
         self.poll_lsp();
@@ -1511,23 +1523,34 @@ impl eframe::App for App {
         }
         if self.confirm_close {
             egui::Modal::new(egui::Id::new("confirm_close")).show(ctx, |ui| {
-                ui.heading("Unsaved changes");
-                ui.label("Your changes have not been saved.");
+                let durability_uncertain = self.status.contains("持久性未确认");
+                ui.heading(if durability_uncertain {
+                    "内容已提交，但目录持久性未确认"
+                } else {
+                    "Unsaved changes"
+                });
                 ui.label(&self.status);
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(self.saving.is_none(), egui::Button::new("Save and close"))
-                        .clicked()
+                    if self.dirty
+                        && ui
+                            .add_enabled(self.saving.is_none(), egui::Button::new("Save and close"))
+                            .clicked()
                     {
                         self.after_save_close = true;
                         self.save();
                     }
-                    if ui
-                        .add_enabled(
-                            self.saving.is_none(),
-                            egui::Button::new("Discard and close"),
-                        )
-                        .clicked()
+                    if durability_uncertain {
+                        if ui.button("确认警告并关闭").clicked() {
+                            self.confirm_close = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    } else if self.dirty
+                        && ui
+                            .add_enabled(
+                                self.saving.is_none(),
+                                egui::Button::new("Discard and close"),
+                            )
+                            .clicked()
                     {
                         self.discard_current_recovery();
                         self.dirty = false;
@@ -1547,20 +1570,32 @@ impl eframe::App for App {
                 ui.label("Save or discard your edits before switching files.");
                 ui.label(&self.status);
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(self.saving.is_none(), egui::Button::new("Save and open"))
-                        .clicked()
-                    {
-                        self.after_save_open = true;
-                        self.save();
-                    }
-                    if ui
-                        .add_enabled(self.saving.is_none(), egui::Button::new("Discard and open"))
-                        .clicked()
-                        && let Some(path) = self.pending_open.take()
-                    {
-                        self.discard_on_open = true;
-                        self.open_file(path);
+                    let durability_uncertain = self.status.contains("持久性未确认");
+                    if durability_uncertain && !self.dirty {
+                        if ui.button("继续打开（内容已写入，持久性未确认）").clicked()
+                            && let Some(path) = self.pending_open.take()
+                        {
+                            self.open_file(path);
+                        }
+                    } else if self.dirty {
+                        if ui
+                            .add_enabled(self.saving.is_none(), egui::Button::new("Save and open"))
+                            .clicked()
+                        {
+                            self.after_save_open = true;
+                            self.save();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.saving.is_none(),
+                                egui::Button::new("Discard and open"),
+                            )
+                            .clicked()
+                            && let Some(path) = self.pending_open.take()
+                        {
+                            self.discard_on_open = true;
+                            self.open_file(path);
+                        }
                     }
                     if ui.button("Cancel").clicked() {
                         self.pending_open = None;
@@ -1965,6 +2000,7 @@ impl eframe::App for App {
                 let diagnostics = self.cargo_diagnostics.clone();
                 egui::ScrollArea::vertical()
                     .max_height(170.)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
                         for diag in diagnostics {
                             let label = format!(
@@ -2060,6 +2096,10 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
+
+    fn on_exit(&mut self, _gl: Option<&glow::Context>) {
+        self.flush_shutdown_state();
+    }
 }
 
 fn diagnostic_location(source: &str, line: usize, column: usize) -> parser::ByteSpan {
@@ -2139,6 +2179,83 @@ fn main() -> eframe::Result {
 mod file_tests {
     use super::*;
     use crate::editor_core::{append_rust_syntax, editor_page_bounds};
+
+    #[test]
+    fn restarting_restores_project_file_mode_lesson_cursor_and_progress() {
+        let root =
+            std::env::temp_dir().join(format!("rustbridge-session-root-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}").unwrap();
+        let state_dir =
+            std::env::temp_dir().join(format!("rustbridge-session-state-{}", std::process::id()));
+        let store = persistence::Store::new(state_dir.clone()).unwrap();
+        let session = persistence::Session {
+            root: Some(root.clone()),
+            file: Some(file.clone()),
+            mode: "compare".into(),
+            lesson: 6,
+            cursor_byte: 3,
+            completed_lessons: vec![true, false, true],
+        };
+        store.save_session(&session).unwrap();
+        let mut app = App::default();
+        app.initialize_state_from_store(store, true);
+        app.wait_for_document_io();
+        assert_eq!(app.root, Some(root.clone()));
+        assert_eq!(app.file, Some(file));
+        assert!(matches!(app.mode, Mode::Compare));
+        assert_eq!(app.lesson, 6);
+        assert_eq!(app.cursor_byte, 3);
+        assert!(app.completed_lessons[0]);
+        assert!(!app.completed_lessons[1]);
+        assert!(app.completed_lessons[2]);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn graceful_shutdown_flushes_session_and_dirty_recovery_journal() {
+        let state_dir =
+            std::env::temp_dir().join(format!("rustbridge-app-drop-state-{}", std::process::id()));
+        let source_dir =
+            std::env::temp_dir().join(format!("rustbridge-app-drop-source-{}", std::process::id()));
+        fs::create_dir_all(&source_dir).unwrap();
+        let path = source_dir.join("main.rs");
+        fs::write(&path, "disk source").unwrap();
+        let store = persistence::Store::new(state_dir.clone()).unwrap();
+        {
+            let mut app = App {
+                root: Some(source_dir.clone()),
+                file: Some(path.clone()),
+                saved_source: "disk source".into(),
+                rust: "unsaved editor buffer".into(),
+                dirty: true,
+                mode: Mode::Rust,
+                lesson: 5,
+                cursor_byte: 4,
+                state_store: Some(store.clone()),
+                state_worker: Some(persistence::PersistenceWorker::spawn(store.clone())),
+                ..App::default()
+            };
+            app.completed_lessons[2] = true;
+            app.flush_shutdown_state();
+        }
+        let restored = store.load_session().unwrap();
+        assert_eq!(restored.root, Some(source_dir.clone()));
+        assert_eq!(restored.file, Some(path.clone()));
+        assert_eq!(restored.mode, "rust");
+        assert_eq!(restored.lesson, 5);
+        assert_eq!(restored.cursor_byte, 4);
+        assert!(restored.completed_lessons[2]);
+        assert_eq!(
+            store.load_journal(&path).unwrap().edited,
+            "unsaved editor buffer"
+        );
+        fs::remove_dir_all(state_dir).unwrap();
+        fs::remove_dir_all(source_dir).unwrap();
+    }
 
     #[test]
     fn closing_a_background_save_always_requires_confirmation() {

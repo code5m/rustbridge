@@ -26,7 +26,8 @@ for i in $(seq 1 120); do
   sleep 0.25
 done
 if [[ -z "$WIN" ]]; then cat "$DIR/stderr"; echo RESOURCE_WINDOW_NOT_FOUND; exit 1; fi
-sleep 6
+# Cold Tree-sitter and llvmpipe initialization are not idle work.
+sleep 15
 kill -0 "$APP"
 if [[ ! -r "/proc/$APP/stat" ]]; then echo RESOURCE_PROCESS_MISSING; exit 1; fi
 cpu_a="$(awk '{print $14+$15}' "/proc/$APP/stat")"
@@ -40,8 +41,9 @@ fd_b="$(find "/proc/$APP/fd" -mindepth 1 -maxdepth 1 | wc -l)"
 hz="$(getconf CLK_TCK)"
 awk -v a="$cpu_a" -v b="$cpu_b" -v hz="$hz" -v x="$rss_a" -v y="$rss_b" -v p="$fd_a" -v q="$fd_b" 'BEGIN {
   printf "RESOURCE_SAMPLE idle_cpu_single_core=%.2f%% rss_kib=%d_to_%d fds=%d_to_%d\n", 100*(b-a)/(5*hz),x,y,p,q;
-  if (y > 524288 || q > 128 || y-x > 65536) {
-    print "RESOURCE_BUDGET_EXCEEDED";
+  cpu=100*(b-a)/(5*hz);
+  if (y > 524288 || q > 128 || y-x > 65536 || cpu > 20) {
+    printf "RESOURCE_BUDGET_EXCEEDED idle_cpu=%.2f%% rss_kib=%d fd=%d\n",cpu,y,q;
     exit 3;
   }
 }'

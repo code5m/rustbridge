@@ -291,6 +291,33 @@ mod tests {
         assert_eq!(fs::read_to_string(&b).unwrap(), "fn changed() {}");
         fs::remove_dir_all(folder).unwrap();
     }
+    #[test]
+    fn cancelled_open_does_not_poison_future_open_requests() {
+        let folder =
+            std::env::temp_dir().join(format!("rustbridge-cancel-open-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let first = folder.join("first.rs");
+        let second = folder.join("second.rs");
+        fs::write(&first, "fn first() {}").unwrap();
+        fs::write(&second, "fn second() {}").unwrap();
+        let worker = DocumentIo::new();
+        worker.open(1, first);
+        worker.cancel_open();
+        worker.open(2, second);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(Reply::Open { id, result, .. }) = worker.take() {
+                assert_eq!(id, 2);
+                assert_eq!(result.unwrap().source, "fn second() {}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "future open stayed cancelled");
+            thread::sleep(Duration::from_millis(4));
+        }
+        drop(worker);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn fifo_disguised_as_rust_file_is_rejected_without_blocking() {

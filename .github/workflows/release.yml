@@ -22,11 +22,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-analyzer
       - name: Native Linux dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libx11-xcb-dev libgl1-mesa-dev libgl1-mesa-dri xvfb xdotool
       - name: Check all supported native targets
         run: cargo test --all-targets
+      - name: Real rust-analyzer JSON-RPC integration
+        run: cargo test integration_real_rust_analyzer_hover_completion_definition -- --ignored --nocapture
+      - name: Real Cargo process and diagnostic integration
+        run: cargo test integration_real_cargo_check_streams_clickable_diagnostics -- --ignored --nocapture
+      - name: Real Cargo test and run subprocess integration
+        run: cargo test integration_real_cargo_test_and_run_execute_only_when_requested -- --ignored --nocapture
       - name: Build optimized release
         run: cargo build --release
       - name: Package Linux

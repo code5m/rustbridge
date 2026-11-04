@@ -58,3 +58,27 @@ Roadmap: optional rust-analyzer for resolved identities and go-to-definition; ri
 - Java learning symbol navigation is an AST-only *same-name declaration candidate* service; do not claim actual cross-crate type inference or semantic go-to-definition.
 - Release quality requires not only fmt/check/tests/clippy but real X11/Xvfb keyboard saves and CRLF assertions, a bounded resource measurement, and a verified .deb artifact. Do not bundle CJK font files.
 - Preserve original files on failures and keep all integrated fixes in one branch/PR until a single gated merge into main.
+
+
+## v0.5 integrated engineering contract
+
+1. Make changes for the 13 approved workstreams in one branch and merge to main once after cross-platform CI. Do not create per-issue main merges or release tags prematurely.
+2. No source rewrites from Java projection; only Rust source editing owns actual files. LSP is optional, version-scoped and never executes unsolicited workspace edits.
+3. Never execute Cargo/build.rs/tests/project binaries when opening a directory. Every check/test/run requires explicit user trust consent. Stop subprocess groups on cancellation/timeouts.
+4. Dirty-source recovery stays local, private and conflict-checked, never overwriting changed on-disk Rust without explicit merge.
+5. Accepted saves remain supervised across close requests. Uncooperative writers and OS-level uninterruptible I/O remain documented limits.
+6. Large-file layout stays bounded; update source line indexes incrementally; test Unicode/CRLF offsets with randomized workloads.
+7. Windows/macOS source writes preserve original identity with private backup, but are not equivalent to Linux power-loss atomic rename. Verify via native CI, and sign/notarize before public binary release.
+8. Idle CPU is measured after warm-up and gated against egui repaint loops. Include genuine GUI crash recovery and native interaction in Linux CI, with a scheduled extended soak.
+
+
+## v0.5 cross-platform lifecycle and release contracts
+
+- Crash journals and session snapshots live in a private per-user state directory, never beside or in place of source files. Recovery restores to a dirty editor buffer only; exports use create-new semantics and never overwrite a user's existing recovery file.
+- Windows atomic state snapshots use native replace-existing/write-through semantics. Do not use rename-over-existing where the OS does not guarantee replacement.
+- Every save path must distinguish pre-commit failure from committed-but-durability-uncertain state. A successful rename/write is not rolled back by a later directory sync failure.
+- On Unix, cooperative RustBridge writers use a per-real-path OS lock; on Windows, an exclusive file handle blocks competing opens. Never claim that advisory locks protect against every non-cooperating external editor or eliminate the final Linux rename race.
+- Opening and saving remain on independent background workers. Cancel stale opens, but never silently discard an accepted save. An OS/network filesystem call may remain uninterruptible; communicate slow I/O instead of pretending to cancel it.
+- rust-analyzer and Cargo subprocesses are optional. LSP does not apply workspace edits. Cargo check/test/run always require explicit project trust confirmation because build scripts/tests/programs execute user code.
+- Run native macOS/Windows CI and packaging, not only Linux cross-compilation. macOS/Windows in-place writes have private rollback copies but are not power-loss atomic; installers are unsigned/unnotarized until signing and notarization are configured.
+- Large source editing is a sliding bounded window over the original document, not a full rope editor. Keep absolute UTF-8 byte offsets and CRLF mappings exact across window rebases.

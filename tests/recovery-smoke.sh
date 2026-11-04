@@ -55,11 +55,38 @@ done
 [[ -n "$WIN" ]] || { cat "$ROOT/second.log"; echo "RECOVERY_RESTART_WINDOW_MISSING"; exit 2; }
 sleep 3
 kill -0 "$APP"
+xdotool windowfocus --sync "$WIN"
+echo "RECOVERY_WINDOW=$WIN FOCUS=$(xdotool getwindowfocus 2>/dev/null || true)"
 grep -q UNSAVED_RECOVERY_MARKER "$JOURNAL"
 if grep -q UNSAVED_RECOVERY_MARKER "$ROOT/code.rs"; then
   echo "RESTART_SILENTLY_OVERWROTE_SOURCE"; exit 2
 fi
+# Prove the user can restore into the editor, continue editing, and explicitly
+# save. The original source remains untouched until this click/keyboard action.
+xdotool mousemove --sync 500 442 click 1
+sleep 2
+if command -v scrot >/dev/null; then scrot /tmp/rustbridge-recovery-after-click.png; fi
+xdotool mousemove --sync 400 130 click 1
+xdotool key End
+xdotool type --clearmodifiers --delay 18 ' // RECOVERY_RESTORED_AND_EDITABLE'
+sleep 1
+xdotool key --clearmodifiers ctrl+s
+for i in $(seq 1 50); do
+  if grep -q RECOVERY_RESTORED_AND_EDITABLE "$ROOT/code.rs"; then break; fi
+  sleep 0.2
+done
+grep -q UNSAVED_RECOVERY_MARKER "$ROOT/code.rs" || {
+  echo "RECOVERY_BUFFER_NOT_RESTORED"; cat "$ROOT/second.log"; if command -v scrot >/dev/null; then scrot /tmp/rustbridge-recovery-after-failed-restore.png; fi; exit 3;
+}
+grep -q RECOVERY_RESTORED_AND_EDITABLE "$ROOT/code.rs" || {
+  echo "RECOVERED_BUFFER_NOT_EDITABLE_OR_SAVE_FAILED"; exit 3;
+}
+for i in $(seq 1 25); do
+  [[ ! -e "$JOURNAL" ]] && break
+  sleep 0.2
+done
+[[ ! -e "$JOURNAL" ]] || { echo "SAVED_RECOVERY_JOURNAL_NOT_CLEARED"; exit 3; }
 if [[ "$#" -gt 1 ]] && command -v scrot >/dev/null; then
   scrot "$2" || true
 fi
-echo "CRASH_RECOVERY_JOURNAL_RESTART_PASS"
+echo "CRASH_RECOVERY_RESTART_RESTORE_EDIT_SAVE_PASS"

@@ -307,6 +307,143 @@ mod tests {
         );
     }
     #[test]
+    #[ignore = "manual real Cargo subprocess integration; run in native OS CI"]
+    fn integration_real_cargo_check_streams_clickable_diagnostics() {
+        use std::fs;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rustbridge-cargo-real-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "rustbridge_cargo_smoke"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"pub fn broken() -> u32 { "not a number" }
+"#,
+        )
+        .unwrap();
+        let task = CargoTask::start(root.clone(), Action::Check);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut diagnostic = None;
+        let mut finished = false;
+        while Instant::now() < deadline && !finished {
+            for event in task.poll() {
+                match event {
+                    Event::Diagnostic(value) => diagnostic = Some(value),
+                    Event::Finished(status) => {
+                        eprintln!("cargo integration: {status}");
+                        finished = true;
+                    }
+                    Event::Log(line) => {
+                        eprintln!("cargo: {}", line.chars().take(180).collect::<String>())
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(finished, "Cargo check did not finish within deadline");
+        let diagnostic = diagnostic.expect("rustc JSON diagnostic must be streamed");
+        assert_eq!(diagnostic.path, root.join("src/lib.rs"));
+        assert_eq!(diagnostic.line, 1);
+        assert_eq!(diagnostic.level, "error");
+        drop(task);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual real Cargo test/run subprocess integration; run in native OS CI"]
+    fn integration_real_cargo_test_and_run_execute_only_when_requested() {
+        use std::fs;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rustbridge-cargo-run-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            r#"[package]
+name = "rustbridge_cargo_run_smoke"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub fn add(a:u32,b:u32)->u32{a+b}
+#[cfg(test)] mod tests{#[test] fn smoke(){assert_eq!(crate::add(2,2),4);}}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main(){println!(\"RUSTBRIDGE_RUN_OK\");}\n",
+        )
+        .unwrap();
+
+        let test_task = CargoTask::start(root.clone(), Action::Test);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut test_finished = None;
+        while Instant::now() < deadline && test_finished.is_none() {
+            for event in test_task.poll() {
+                if let Event::Finished(status) = event {
+                    test_finished = Some(status);
+                }
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let test_status = test_finished.expect("cargo test must finish");
+        assert!(
+            test_status.contains("exit status: 0"),
+            "cargo test: {test_status}"
+        );
+        drop(test_task);
+
+        let run_task = CargoTask::start(root.clone(), Action::Run);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut run_finished = None;
+        let mut run_output = String::new();
+        while Instant::now() < deadline && run_finished.is_none() {
+            for event in run_task.poll() {
+                match event {
+                    Event::Log(line) => run_output.push_str(&line),
+                    Event::Finished(status) => run_finished = Some(status),
+                    Event::Diagnostic(diag) => run_output.push_str(&diag.message),
+                }
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let run_status = run_finished.expect("cargo run must finish");
+        assert!(
+            run_status.contains("exit status: 0"),
+            "cargo run: {run_status}"
+        );
+        assert!(
+            run_output.contains("RUSTBRIDGE_RUN_OK"),
+            "program stdout must be streamed to the IDE: {run_output}"
+        );
+        drop(run_task);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn correct_command_and_timeout_configuration() {
         assert_eq!(Action::Check.args(), ["check", "--message-format=json"]);
         assert_eq!(Action::Test.args(), ["test", "--message-format=json"]);

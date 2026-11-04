@@ -52,7 +52,10 @@ pub fn show(
             Side::Java => a.java_at.line,
             Side::Rust => a.rust_at.line,
         });
+    // Stable scrollbar presence prevents alternating layout/repaint loops on
+    // large source views: egui would otherwise flip show_scroll every frame.
     let mut scroll = egui::ScrollArea::both()
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .id_salt(id)
         .auto_shrink([false, false]);
     if let Some(line) = jump_line {

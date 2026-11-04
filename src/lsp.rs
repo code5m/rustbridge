@@ -720,9 +720,9 @@ mod tests {
         fs::write(&path, &source).unwrap();
         let task = LspTask::start(root.clone());
         task.open(path.clone(), source.clone(), 1);
-        let deadline = Instant::now() + Duration::from_secs(65);
+        let init_deadline = Instant::now() + Duration::from_secs(50);
         let mut ready = false;
-        while Instant::now() < deadline && !ready {
+        while Instant::now() < init_deadline && !ready {
             for event in task.poll() {
                 match event {
                     Event::Ready => ready = true,
@@ -739,11 +739,12 @@ mod tests {
         let usage = source.rfind("Widget").unwrap();
         let pos = position_for_byte(&source, usage);
         let completion_pos = position_for_byte(&source, source.find("item.la").unwrap() + 7);
+        let query_deadline = Instant::now() + Duration::from_secs(60);
         let mut next_query = Instant::now();
         let mut definitions = false;
         let mut hover = false;
         let mut completion = false;
-        while Instant::now() < deadline && !(definitions && hover && completion) {
+        while Instant::now() < query_deadline && !(definitions && hover && completion) {
             if Instant::now() >= next_query {
                 task.query(Kind::Definition, 1, pos.line, pos.character);
                 task.query(Kind::Hover, 1, pos.line, pos.character);

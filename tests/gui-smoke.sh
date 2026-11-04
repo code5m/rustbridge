@@ -96,6 +96,11 @@ sleep 1
 xdotool key ctrl+Next
 xdotool keyup Control_L Control_R 2>/dev/null || true
 sleep 1
+# Continue beyond the first virtual window with real wheel events; the editor
+# must rebase its bounded page while preserving absolute source coordinates.
+xdotool mousemove --sync 600 145
+xdotool click --repeat 35 --delay 45 5
+sleep 1
 xdotool mousemove --sync 342 163 click 1
 xdotool key End
 xdotool type --clearmodifiers --delay 12 ' // SMOKE_PAGED'
@@ -131,6 +136,8 @@ b=Path(sys.argv[1]).read_bytes()
 assert b'SMOKE_PAGED' in b, "PAGED_GUI_SAVE_MISSING"
 assert b.count(b'\r\n') == b.count(b'\n') == 35000, "CRLF line endings corrupted"
 assert b' // SMOKE_PAGED\r\n' in b, "Paged insertion at wrong byte boundary"
-print("PAGED_GUI_CRLF_SAVE_PASS")
+line=next(i for i,value in enumerate(b.splitlines(),1) if b'SMOKE_PAGED' in value)
+assert line > 240, f"wheel/page navigation did not reach beyond the first 240 lines: {line}"
+print(f"PAGED_GUI_CRLF_SAVE_PASS line={line} (wheel + keyboard window navigation)")
 PY
 echo "GUI_SMOKE_PASS"

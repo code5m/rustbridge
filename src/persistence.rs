@@ -12,6 +12,39 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    let from = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let to = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both paths are valid nul-terminated UTF-16 and remain alive for the call.
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 const MAX_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -151,6 +184,9 @@ impl Store {
             let mut file = options.open(&stage)?;
             file.write_all(data)?;
             file.sync_all()?;
+            #[cfg(windows)]
+            atomic_replace(&stage, path)?;
+            #[cfg(not(windows))]
             fs::rename(&stage, path)?;
             #[cfg(unix)]
             fs::File::open(&self.dir)?.sync_all()?;
@@ -274,6 +310,37 @@ mod tests {
         store.export_recovery(&journal, &file).unwrap();
         assert!(store.export_recovery(&journal, &file).is_err());
         assert_eq!(fs::read_to_string(&file).unwrap(), "recovered");
+        fs::remove_dir_all(store.directory()).unwrap();
+    }
+    #[test]
+    fn atomic_session_and_recovery_journals_can_be_updated_repeatedly() {
+        let store = fixture();
+        let first = Session {
+            mode: "java".into(),
+            lesson: 1,
+            ..Session::default()
+        };
+        let second = Session {
+            mode: "rust".into(),
+            lesson: 9,
+            cursor_byte: 123,
+            completed_lessons: vec![true; 12],
+            ..Session::default()
+        };
+        store.save_session(&first).unwrap();
+        store.save_session(&second).unwrap();
+        assert_eq!(store.load_session(), Some(second));
+        let source = store.directory().join("overwrite.rs");
+        store
+            .save_journal(&source, "disk", "first unsaved")
+            .unwrap();
+        store
+            .save_journal(&source, "disk", "second unsaved")
+            .unwrap();
+        assert_eq!(
+            store.load_journal(&source).unwrap().edited,
+            "second unsaved"
+        );
         fs::remove_dir_all(store.directory()).unwrap();
     }
     #[test]

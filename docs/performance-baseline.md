@@ -123,3 +123,29 @@ Keyboard focus and Ctrl+S were separately verified with an isolated temp source.
 Normal desktop integration and reproducible cold-start latency, activity under
 continuous typing and scrolling, long-running memory budgets, rapid workspace switching,
 and multi-platform tests require separate acceptance.
+
+## RustBridge v0.5 integrated idle and endurance revalidation — 2026-11-04
+
+These measurements use the final integrated v0.5 release binary on the same
+Ubuntu workstation, with an actual 40,000–42,000-line Rust source file and an
+isolated X11/Xvfb display. CPU is the Linux process user+system tick delta,
+expressed as one-core equivalent; it is not whole-machine utilization.
+
+| Workload | Observation | Interpretation |
+| --- | ---: | --- |
+| 40,000-line idle resource gate | 0.00% one-core CPU over 5 s after 15 s warm-up | No sampled idle repaint loop after scroll-area scrollbar visibility was made stable. |
+| 40,000-line idle RSS | 218,540 KiB at both endpoints | Single process, llvmpipe/Xvfb, Tree-sitter warmed. |
+| Open file descriptors | 10 → 10 | No growth during the sample. |
+| 42,000-line interactive soak | 180 s, 36 keyboard mode-switch samples | Process remained alive; no RSS/FD budget breach. |
+| Soak RSS | 207,984 KiB baseline / 214,192 KiB peak | +6,196 KiB peak during repeated view changes. |
+| Soak file descriptors | 10 baseline / 10 peak | No descriptor growth. |
+| Large-file GUI edit | 35,000-line CRLF file, wheel + keyboard rebasing; saved marker at line 309 | Confirms navigation beyond the first 240-line window and byte-preserving save. |
+| Crash recovery | SIGKILL → relaunch → restore → edit → explicit save | The original file stayed unchanged until the user explicitly saved the recovered buffer. |
+| GNOME Wayland | xdg_toplevel create/configure and wl_surface commits observed | Native Wayland window lifecycle verified; not a full human IME/accessibility assessment. |
+
+The stable-scrollbar fix addressed a real egui idle repaint regression observed
+during v0.5 integration. The values above are repeatable observations on one
+machine and renderer, not universal CPU/RSS guarantees. The soak is three minutes,
+not a 24-hour soak. The scheduled CI workflow runs a 15-minute weekly Linux soak;
+longer 24-hour endurance, real-user multi-platform interaction, and signing/
+notarization remain separate release requirements.

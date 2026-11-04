@@ -2255,6 +2255,7 @@ name = "rustbridge"
 version = "0.5.0"
 dependencies = [
  "eframe",
+ "glow",
  "libc",
  "rfd",
  "serde",
