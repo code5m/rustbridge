@@ -121,3 +121,13 @@ The binding product and architecture decisions are recorded in `docs/ui-2.0-deci
 - LSP and persistence queues must coalesce superseded document snapshots; stopping a crashed analyzer must not produce an unbounded restart loop.
 - Portable Cargo success is a structured process exit status, never an English exit-code string; preserve real compiler diagnostics.
 - Cross-platform CI must pass on main-relative PR changes before the one-time merge. Do not misrepresent Windows/macOS in-place writes as power-loss-atomic, an Xvfb driver as a user, or a five-second resource observation as a 24-hour stability proof.
+
+## 2026-11-05 full-code re-audit and recovery completion contract
+
+- The current repository default branch is `main`. The audit findings, single-branch remediation decisions and still-unverifiable platform constraints are recorded in `docs/completion-reliability-audit-20261105.md`.
+- Startup must never synchronously enumerate or fully deserialize recovery archives on the egui event thread. A background inventory must enumerate all entries, bound each file, report omitted/invalid entries and retain full source text only when a user opens or exports that specific recovery record.
+- Any asynchronous first document open must be handed a configured Store *before* its job is enqueued, including recovery-only restarts with no saved session.json. Otherwise an unsaved buffer may be silently omitted.
+- The GUI cannot synchronously parse a large recovery journal or query remote disk metadata on tab activation. Watcher results carry their observed FileStamp; save still performs independent conflict-checked I/O.
+- Never overwrite an invalid, overlarge or incompatible session without retaining its original bytes under a unique private backup. Do not change permissions through state-directory symlinks.
+- Windows/macOS non-atomic source writes require a durable independent rollback before mutation; retain rollback when post-commit directory durability is not confirmed. Do not claim power-loss atomicity or guaranteed recovery against all external writers.
+- Prevent regressions with native GUI crash/restore/edit/save tests, all-platform native CI, and explicit count tests for >256 recovery records. Do not merge a partial fix before the entire PR's gates pass.

@@ -35,11 +35,8 @@
 - No guarantee of signed installers or native macOS/Windows visual QA from Linux CI.
 
 
-## Actual verification status on Linux
+## Verification updates and historical evidence
 
-- Static gates and unit tests: passed on the current codebase.
-- Real rust-analyzer Hover/Completion/Definition integration: passed on the previous Document Manager/LSP commit.
-- GUI acceptance: **not yet completed**. The traditional 35,000-line GUI smoke had flaky focus/mode transitions on Xvfb; one direct large-file real-save check passed. A revised five-step page-navigation GUI script is committed for rerun, but the combined Xvfb run was interrupted by a development-machine connection reset and must not be marked PASS.
-- User studies and signed macOS/Windows distribution: separate outstanding release gates.
-
-This project may contain integrated changes while GUI/release acceptance remains open. Never present those release gates as green without evidence.
+- The original pre-merge learning-path acceptance notes below this heading were superseded by later verification, not by an untested claim: PR #22 (`5447a2c`) passed Windows, macOS and Linux native CI, including real rust-analyzer integration, native Linux 35,000-line GUI editing and SIGKILL-restart-recover-edit-save coverage.
+- The complete recovery inventory and asynchronous cold-start audit is tracked separately in `docs/completion-reliability-audit-20261105.md`. It must pass its own CI before being called merged and accepted.
+- Actual manual Windows/macOS visual testing, long-duration soak, packaging signing/notarization and power-loss-atomic source replacement remain separate verification or platform boundaries; do not conflate CI tests with those credentials or hardware assurances.

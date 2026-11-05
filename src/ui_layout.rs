@@ -99,6 +99,20 @@ impl App {
                         self.live_dirty_count()
                     ));
                 }
+                if self.recovery_scan_warning.is_some() || !self.orphan_recovery.is_empty() {
+                    ui.colored_label(
+                        Color32::YELLOW,
+                        if self.recovery_scan_warning.is_some() {
+                            "恢复记录需要核查"
+                        } else {
+                            "发现孤立的恢复记录"
+                        },
+                    );
+                    if ui.button("查看恢复记录").clicked() {
+                        self.show_left_sidebar = true;
+                        self.sidebar_section = SidebarSection::Tools;
+                    }
+                }
                 if self.external_change {
                     ui.colored_label(Color32::RED, "磁盘文件已在外部修改");
                     if ui.button("重新加载磁盘版本").clicked() {
@@ -577,31 +591,79 @@ impl App {
             }
         });
         ui.small(&self.lsp_status);
+        if let Some(warning) = self.recovery_scan_warning.as_deref() {
+            ui.separator();
+            ui.colored_label(egui::Color32::YELLOW, warning);
+            if let Some(store) = self.state_store.as_ref() {
+                ui.small(format!("恢复记录目录：{}", store.directory().display()));
+            }
+        }
         if !self.orphan_recovery.is_empty() {
             ui.separator();
-            ui.strong("孤立恢复快照（原始文件已删除或移动）");
+            ui.strong(format!(
+                "孤立恢复快照（{} 条，原始文件已删除或移动）",
+                self.orphan_recovery.len(),
+            ));
             ui.small("不会自动创建、覆盖或修改原始文件。请选择新的文件名导出后人工比对。");
-            for journal in self.orphan_recovery.iter().take(20) {
+            let total = self.orphan_recovery.len();
+            let page_size = 20;
+            self.orphan_recovery_offset = self
+                .orphan_recovery_offset
+                .min((total - 1) / page_size * page_size);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(self.orphan_recovery_offset > 0, egui::Button::new("上一页"))
+                    .clicked()
+                {
+                    self.orphan_recovery_offset =
+                        self.orphan_recovery_offset.saturating_sub(page_size);
+                }
+                ui.label(format!(
+                    "第 {} / {} 页",
+                    self.orphan_recovery_offset / page_size + 1,
+                    total.div_ceil(page_size)
+                ));
+                if ui
+                    .add_enabled(
+                        self.orphan_recovery_offset + page_size < total,
+                        egui::Button::new("下一页"),
+                    )
+                    .clicked()
+                {
+                    self.orphan_recovery_offset += page_size;
+                }
+            });
+            if self.recovery_export_receiver.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("恢复文件正在后台导出");
+                });
+            }
+            let entries: Vec<_> = self
+                .orphan_recovery
+                .iter()
+                .skip(self.orphan_recovery_offset)
+                .take(page_size)
+                .map(|entry| entry.path.clone())
+                .collect();
+            for source in entries {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(journal.path.display().to_string());
-                    if ui.button("导出恢复副本").clicked() {
-                        let name = journal
-                            .path
+                    ui.label(source.display().to_string());
+                    if ui
+                        .add_enabled(
+                            self.recovery_export_receiver.is_none(),
+                            egui::Button::new("导出恢复副本"),
+                        )
+                        .clicked()
+                    {
+                        let name = source
                             .file_name()
                             .map(|name| format!("{}.recovery.rs", name.to_string_lossy()))
                             .unwrap_or_else(|| "recovered.rs".into());
                         if let Some(destination) =
                             rfd::FileDialog::new().set_file_name(&name).save_file()
                         {
-                            self.status = match self
-                                .state_store
-                                .as_ref()
-                                .expect("state store for recovery")
-                                .export_recovery(journal, &destination)
-                            {
-                                Ok(()) => format!("孤立快照已导出：{}", destination.display()),
-                                Err(error) => format!("恢复导出未完成（原有文件未覆盖）：{error}"),
-                            };
+                            self.start_recovery_export(source.clone(), destination);
                         }
                     }
                 });

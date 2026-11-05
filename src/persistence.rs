@@ -3,9 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     hash::{Hash, Hasher},
-    io::{self, Write},
+    io::{self, BufReader, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Condvar, Mutex},
@@ -47,6 +47,7 @@ fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
     }
 }
 const MAX_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SESSION_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct DocumentSession {
@@ -90,6 +91,50 @@ pub struct Journal {
     pub captured_unix_seconds: u64,
 }
 
+/// Cheap, complete startup index. Never retains a journal's large source text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryEntry {
+    pub path: PathBuf,
+    pub source_exists: bool,
+    pub captured_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RecoveryInventory {
+    pub entries: Vec<RecoveryEntry>,
+    pub invalid: usize,
+    pub oversized: usize,
+    pub unreadable: usize,
+    pub unreadable_session: bool,
+}
+
+impl RecoveryInventory {
+    pub fn warning(&self) -> Option<String> {
+        let failures = self.invalid + self.oversized + self.unreadable;
+        (failures != 0 || self.unreadable_session).then(|| format!(
+            "恢复扫描：{} 个记录可用，{} 个损坏或不匹配，{} 个超过单文件限制，{} 个不可读取。{}             原记录未被删除，可人工检查状态目录。",
+            self.entries.len(), self.invalid, self.oversized, self.unreadable,
+            if self.unreadable_session {
+                "历史会话文件无法解析或超过限制；下一次写入前先备份旧文件。"
+            } else {
+                ""
+            },
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+struct RecoveryHeader {
+    path: PathBuf,
+    #[serde(default)]
+    captured_unix_seconds: u64,
+    /// Validate required fields without allocating massive editor strings.
+    #[serde(rename = "baseline")]
+    _baseline: serde::de::IgnoredAny,
+    #[serde(rename = "edited")]
+    _edited: serde::de::IgnoredAny,
+}
+
 #[derive(Clone, Debug)]
 pub struct Store {
     dir: PathBuf,
@@ -117,6 +162,12 @@ impl Store {
     }
     pub fn new(dir: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&dir)?;
+        let metadata = fs::symlink_metadata(&dir)?;
+        if !metadata.file_type().is_dir() {
+            return Err(io::Error::other(
+                "Private state directory must be a real directory, not a symlink",
+            ));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -134,58 +185,152 @@ impl Store {
             .join(format!("recover-{:016x}.json", hasher.finish()))
     }
     pub fn load_session(&self) -> Option<Session> {
-        serde_json::from_slice(&fs::read(self.dir.join("session.json")).ok()?).ok()
+        let path = self.dir.join("session.json");
+        let meta = fs::symlink_metadata(&path).ok()?;
+        if !meta.file_type().is_file() || meta.len() > MAX_SESSION_BYTES {
+            return None;
+        }
+        serde_json::from_reader(BufReader::new(File::open(path).ok()?)).ok()
     }
     pub fn save_session(&self, session: &Session) -> io::Result<()> {
         let data = serde_json::to_vec(session).map_err(io::Error::other)?;
-        self.atomic_write(&self.dir.join("session.json"), &data)
+        if data.len() as u64 > MAX_SESSION_BYTES {
+            return Err(io::Error::other(
+                "Workspace session exceeds the 8 MiB safety limit",
+            ));
+        }
+        let path = self.dir.join("session.json");
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if !metadata.file_type().is_file() {
+                return Err(io::Error::other("Workspace session is not a regular file"));
+            }
+            if self.load_session().is_none() {
+                // Preserve corrupted or future-version learning progress
+                // under a private unique name before writing new state.
+                let mut moved = false;
+                for _ in 0..64 {
+                    let serial = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                    let backup = self.dir.join(format!(
+                        "session-unreadable-{}-{serial:016x}.json",
+                        std::process::id()
+                    ));
+                    if backup.exists() {
+                        continue;
+                    }
+                    fs::rename(&path, &backup)?;
+                    #[cfg(unix)]
+                    File::open(&self.dir)?.sync_all()?;
+                    moved = true;
+                    break;
+                }
+                if !moved {
+                    return Err(io::Error::other("No unique session backup path available"));
+                }
+            }
+        }
+        self.atomic_write(&path, &data)
     }
     pub fn load_journal(&self, source: &Path) -> Option<Journal> {
         let path = self.journal_path(source);
-        let bytes = fs::read(path).ok()?;
-        if bytes.len() > MAX_JOURNAL_BYTES {
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_JOURNAL_BYTES as u64 {
             return None;
         }
-        let journal: Journal = serde_json::from_slice(&bytes).ok()?;
-        if journal.path == source {
-            Some(journal)
-        } else {
-            None
-        }
+        let file = File::open(path).ok()?;
+        let journal: Journal = serde_json::from_reader(BufReader::new(file)).ok()?;
+        (journal.path == source).then_some(journal)
     }
 
-    /// Load every valid journal whose source still exists. This also recovers
-    /// tabs if a crash happened before the latest session tab list was flushed.
-    pub fn load_all_journals(&self) -> Vec<Journal> {
-        let Ok(entries) = fs::read_dir(&self.dir) else {
-            return Vec::new();
+    /// Inventories *every* recovery record without loading up to 64 MiB of
+    /// editor text per entry. Used only on a background startup worker.
+    /// Oversized, invalid and unreadable entries are counted rather than
+    /// silently dropped after a directory-entry or global-byte cutoff.
+    pub fn scan_journals(&self) -> RecoveryInventory {
+        let mut inventory = RecoveryInventory {
+            unreadable_session: self.dir.join("session.json").exists()
+                && self.load_session().is_none(),
+            ..RecoveryInventory::default()
         };
-        let mut bytes_scanned = 0_u64;
-        entries
-            .filter_map(Result::ok)
-            .take(256)
-            .filter_map(|entry| {
-                let path = entry.path();
-                let name = path.file_name()?.to_string_lossy();
-                if !name.starts_with("recover-") || !name.ends_with(".json") {
-                    return None;
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                if error.kind() != io::ErrorKind::NotFound {
+                    inventory.unreadable += 1;
                 }
-                let metadata = entry.metadata().ok()?;
-                if metadata.len() as usize > MAX_JOURNAL_BYTES
-                    || bytes_scanned.saturating_add(metadata.len()) > 128 * 1024 * 1024
-                {
-                    return None;
+                return inventory;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    inventory.unreadable += 1;
+                    continue;
                 }
-                bytes_scanned += metadata.len();
-                let bytes = fs::read(&path).ok()?;
-                let journal: Journal = serde_json::from_slice(&bytes).ok()?;
-                if self.journal_path(&journal.path) != path {
-                    return None;
+            };
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("recover-") || !name.ends_with(".json") {
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    inventory.unreadable += 1;
+                    continue;
                 }
-                Some(journal)
-            })
+            };
+            if !metadata.file_type().is_file() {
+                inventory.invalid += 1;
+                continue;
+            }
+            if metadata.len() > MAX_JOURNAL_BYTES as u64 {
+                inventory.oversized += 1;
+                continue;
+            }
+            let file = match File::open(&path) {
+                Ok(file) => file,
+                Err(_) => {
+                    inventory.unreadable += 1;
+                    continue;
+                }
+            };
+            let header: RecoveryHeader = match serde_json::from_reader(BufReader::new(file)) {
+                Ok(header) => header,
+                Err(_) => {
+                    inventory.invalid += 1;
+                    continue;
+                }
+            };
+            if self.journal_path(&header.path) != path {
+                inventory.invalid += 1;
+                continue;
+            }
+            inventory.entries.push(RecoveryEntry {
+                source_exists: header.path.is_file(),
+                path: header.path,
+                captured_unix_seconds: header.captured_unix_seconds,
+            });
+        }
+        inventory
+            .entries
+            .sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        inventory
+    }
+
+    /// Backwards-compatible full-journal API for unit tests and recovery
+    /// exports. Production startup uses scan_journals() so it stays bounded.
+    #[cfg(test)]
+    pub fn load_all_journals(&self) -> Vec<Journal> {
+        self.scan_journals()
+            .entries
+            .into_iter()
+            .filter_map(|entry| self.load_journal(&entry.path))
             .collect()
     }
+
     pub fn save_journal(&self, source: &Path, baseline: &str, edited: &str) -> io::Result<()> {
         if baseline == edited {
             return self.delete_journal(source);
@@ -369,6 +514,106 @@ mod tests {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         Store::new(folder).unwrap()
+    }
+    #[cfg(unix)]
+    #[test]
+    fn state_directory_symlink_is_rejected_before_permissions_change() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = fixture();
+        let sensitive = root.directory().join("existing");
+        let redirected = root.directory().join("linked");
+        fs::create_dir_all(&sensitive).unwrap();
+        fs::set_permissions(&sensitive, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&sensitive, &redirected).unwrap();
+        assert!(Store::new(redirected).is_err());
+        assert_eq!(
+            fs::metadata(&sensitive).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_dir_all(root.directory()).unwrap();
+    }
+
+    #[test]
+    fn unreadable_session_is_backed_up_before_new_state_is_committed() {
+        let store = fixture();
+        let path = store.directory().join("session.json");
+        fs::write(&path, b"{broken legacy state").unwrap();
+        assert!(store.load_session().is_none());
+        let inventory = store.scan_journals();
+        assert!(inventory.unreadable_session);
+        assert!(inventory.warning().unwrap().contains("会话"));
+        let new_session = Session {
+            mode: "rust".into(),
+            lesson: 2,
+            ..Session::default()
+        };
+        store.save_session(&new_session).unwrap();
+        assert_eq!(store.load_session(), Some(new_session));
+        let copies: Vec<_> = fs::read_dir(store.directory())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("session-unreadable-")
+            })
+            .collect();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(fs::read(copies[0].path()).unwrap(), b"{broken legacy state");
+        fs::remove_dir_all(store.directory()).unwrap();
+    }
+
+    #[test]
+    fn inventory_indexes_all_300_entries_without_loading_full_editor_text() {
+        let store = fixture();
+        for index in 0..300 {
+            let source = store.directory().join(format!("source-{index:04}.rs"));
+            let journal = Journal {
+                path: source.clone(),
+                baseline: "fn before() {}".into(),
+                edited: "fn after() {}".into(),
+                captured_unix_seconds: index,
+            };
+            fs::write(
+                store.journal_path(&source),
+                serde_json::to_vec(&journal).unwrap(),
+            )
+            .unwrap();
+        }
+        // Do not use global byte/trailing directory entry cutoffs. Report
+        // individual damaged or too-large files without deleting any of them.
+        fs::write(store.directory().join("recover-broken.json"), b"{ invalid").unwrap();
+        let oversized = store.directory().join("recover-too-large.json");
+        File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_JOURNAL_BYTES as u64 + 1)
+            .unwrap();
+
+        let inventory = store.scan_journals();
+        assert_eq!(inventory.entries.len(), 300);
+        assert_eq!(inventory.invalid, 1);
+        assert_eq!(inventory.oversized, 1);
+        assert_eq!(inventory.unreadable, 0);
+        assert!(inventory.entries.iter().all(|entry| !entry.source_exists));
+        assert!(inventory.warning().unwrap().contains("300"));
+        assert!(store.load_journal(&oversized).is_none());
+        fs::remove_dir_all(store.directory()).unwrap();
+    }
+
+    #[test]
+    fn inventory_does_not_accept_forged_journal_paths() {
+        let store = fixture();
+        let wrong = store.directory().join("recover-wrong.json");
+        fs::write(
+            &wrong,
+            br#"{"path":"/tmp/wrong.rs","baseline":"a","edited":"b"}"#,
+        )
+        .unwrap();
+        let inventory = store.scan_journals();
+        assert!(inventory.entries.is_empty());
+        assert_eq!(inventory.invalid, 1);
+        fs::remove_dir_all(store.directory()).unwrap();
     }
     #[test]
     fn deleted_source_is_still_discoverable_as_exportable_recovery() {

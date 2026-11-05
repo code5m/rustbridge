@@ -56,7 +56,7 @@ struct Shared {
 pub struct FileWatch {
     path: PathBuf,
     shared: Arc<Shared>,
-    events: Receiver<()>,
+    events: Receiver<Option<FileStamp>>,
 }
 impl FileWatch {
     pub fn new(path: PathBuf, initial: Option<FileStamp>, ctx: egui::Context) -> Self {
@@ -98,9 +98,9 @@ impl FileWatch {
                     continue;
                 }
                 if current != state.observed {
-                    state.observed = current;
+                    state.observed = current.clone();
                     drop(state);
-                    if sender.send(()).is_err() {
+                    if sender.send(current).is_err() {
                         return;
                     }
                     ctx.request_repaint();
@@ -133,12 +133,19 @@ impl FileWatch {
         }
         while self.events.try_recv().is_ok() {}
     }
-    pub fn changed(&self) -> bool {
-        let mut changed = false;
-        while self.events.try_recv().is_ok() {
-            changed = true;
+    /// Return the latest worker-observed stamp; no UI-thread filesystem call.
+    /// The nested Option distinguishes "no event" from "file was deleted".
+    pub fn take_changed_stamp(&self) -> Option<Option<FileStamp>> {
+        let mut latest = None;
+        while let Ok(stamp) = self.events.try_recv() {
+            latest = Some(stamp);
         }
-        changed
+        latest
+    }
+
+    #[cfg(test)]
+    pub fn changed(&self) -> bool {
+        self.take_changed_stamp().is_some()
     }
 }
 impl Drop for FileWatch {
@@ -189,6 +196,31 @@ mod tests {
         drop(watch);
         fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn file_deletion_is_sent_as_none_from_background_worker() {
+        let dir = fixture();
+        let path = dir.join("deleted.rs");
+        fs::write(&path, "fn before() {}").unwrap();
+        let watch = FileWatch::with_interval(
+            path.clone(),
+            file_stamp(&path).ok(),
+            egui::Context::default(),
+            Duration::from_millis(12),
+        );
+        fs::remove_file(&path).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(stamp) = watch.take_changed_stamp() {
+                assert!(stamp.is_none(), "deleted file must have no stamp");
+                break;
+            }
+            assert!(Instant::now() < until, "worker missed file deletion");
+            thread::sleep(Duration::from_millis(4));
+        }
+        drop(watch);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn restored_mtime_same_length_still_detected_by_ctime() {
