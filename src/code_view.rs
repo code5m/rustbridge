@@ -31,6 +31,13 @@ pub struct ViewOptions {
     pub document_id: u64,
 }
 
+/// Converts a scroll offset into an egui show_rows index. Its row height
+/// includes item spacing; using text height alone causes growing drift.
+fn source_row_for_offset(offset_y: f32, row_height: f32, spacing_y: f32) -> usize {
+    let pitch = (row_height + spacing_y).max(1.0);
+    (offset_y / pitch).floor().max(0.0) as usize
+}
+
 #[derive(Clone, Default)]
 struct FoldState {
     source_hash: u64,
@@ -341,7 +348,14 @@ pub fn show(
         offset_y: output.state.offset.y,
         fold_changed: state_changed,
         top_source_line: {
-            let row = (output.state.offset.y / row_height).floor().max(0.0) as usize;
+            // egui::ScrollArea::show_rows adds vertical item spacing to the
+            // supplied row height. Without this spacing, linked scrolling
+            // drifts increasingly far from the matching original source line.
+            let row = source_row_for_offset(
+                output.state.offset.y,
+                row_height,
+                ui.spacing().item_spacing.y,
+            );
             state.visible_rows.as_ref().map_or(row, |rows| {
                 rows.get(row)
                     .copied()
@@ -612,6 +626,18 @@ mod fold_tests {
         assert!(rows.contains(&6), "other functions must remain visible");
         assert!(state.reveal(&projection, 3, projection.rust_line_starts.len()));
         assert!(state.visible_rows.as_ref().is_none());
+    }
+
+    #[test]
+    fn linked_scroll_uses_virtual_row_pitch_including_egui_spacing() {
+        // ScrollArea::show_rows uses row_height + item_spacing.y, not the
+        // text row height alone. At row 1000 even 4px spacing accumulates.
+        let physical_row_height: f32 = 21.0;
+        let spacing: f32 = 4.0;
+        let offset: f32 = 1000.0 * (physical_row_height + spacing);
+        let linked_row = source_row_for_offset(offset, physical_row_height, spacing);
+        assert_eq!(linked_row, 1000);
+        assert_ne!((offset / physical_row_height).floor() as usize, 1000);
     }
 
     #[test]
