@@ -2,12 +2,13 @@
 //! No Rust source is transmitted; journal data is stored only on the user's disk.
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     fs::{self, OpenOptions},
     hash::{Hash, Hasher},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    sync::mpsc::{self, Sender},
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -159,8 +160,10 @@ impl Store {
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return Vec::new();
         };
+        let mut bytes_scanned = 0_u64;
         entries
             .filter_map(Result::ok)
+            .take(256)
             .filter_map(|entry| {
                 let path = entry.path();
                 let name = path.file_name()?.to_string_lossy();
@@ -168,12 +171,15 @@ impl Store {
                     return None;
                 }
                 let metadata = entry.metadata().ok()?;
-                if metadata.len() as usize > MAX_JOURNAL_BYTES {
+                if metadata.len() as usize > MAX_JOURNAL_BYTES
+                    || bytes_scanned.saturating_add(metadata.len()) > 128 * 1024 * 1024
+                {
                     return None;
                 }
+                bytes_scanned += metadata.len();
                 let bytes = fs::read(&path).ok()?;
                 let journal: Journal = serde_json::from_slice(&bytes).ok()?;
-                if !journal.path.is_file() || self.journal_path(&journal.path) != path {
+                if self.journal_path(&journal.path) != path {
                     return None;
                 }
                 Some(journal)
@@ -257,50 +263,95 @@ pub enum Job {
     DeleteJournal(PathBuf),
     Session(Session),
 }
+// Only the most recent update for each document and the latest session are queued.
+// This bounds memory to the number of open documents, not the number of edits.
+// Operations for a document remain ordered (including deletion after save).
+#[derive(Default)]
+struct PersistenceQueue {
+    jobs: VecDeque<Job>,
+    closing: bool,
+}
 pub struct PersistenceWorker {
-    sender: Option<Sender<Job>>,
+    queue: Arc<(Mutex<PersistenceQueue>, Condvar)>,
     handle: Option<thread::JoinHandle<()>>,
 }
 impl PersistenceWorker {
     pub fn spawn(store: Store) -> Self {
-        let (sender, receiver) = mpsc::channel::<Job>();
+        let queue = Arc::new((Mutex::new(PersistenceQueue::default()), Condvar::new()));
+        let shared = Arc::clone(&queue);
         let handle = thread::spawn(move || {
-            while let Ok(job) = receiver.recv() {
+            loop {
+                let job = {
+                    let (lock, wake) = &*shared;
+                    let mut pending = lock.lock().unwrap();
+                    while pending.jobs.is_empty() && !pending.closing {
+                        pending = wake.wait(pending).unwrap();
+                    }
+                    if pending.closing && pending.jobs.is_empty() {
+                        return;
+                    }
+                    pending.jobs.pop_front().expect("pending nonempty")
+                };
                 match job {
                     Job::SaveJournal {
                         path,
                         baseline,
                         edited,
                     } => {
-                        if let Err(e) = store.save_journal(&path, &baseline, &edited) {
-                            eprintln!("RustBridge recovery journal: {e}");
+                        if let Err(error) = store.save_journal(&path, &baseline, &edited) {
+                            eprintln!(
+                                "RustBridge recovery journal for {}: {error}",
+                                path.display()
+                            );
                         }
                     }
                     Job::DeleteJournal(path) => {
-                        let _ = store.delete_journal(&path);
+                        if let Err(error) = store.delete_journal(&path) {
+                            eprintln!(
+                                "RustBridge recovery removal for {}: {error}",
+                                path.display()
+                            );
+                        }
                     }
                     Job::Session(session) => {
-                        let _ = store.save_session(&session);
+                        if let Err(error) = store.save_session(&session) {
+                            eprintln!("RustBridge session persistence: {error}");
+                        }
                     }
                 }
             }
         });
         Self {
-            sender: Some(sender),
+            queue,
             handle: Some(handle),
         }
     }
     pub fn send(&self, job: Job) {
-        if let Some(tx) = self.sender.as_ref() {
-            let _ = tx.send(job);
+        let (lock, wake) = &*self.queue;
+        let mut pending = lock.lock().unwrap();
+        if pending.closing {
+            return;
         }
+        let obsolete = pending.jobs.iter().position(|old| match (old, &job) {
+            (Job::Session(_), Job::Session(_)) => true,
+            (Job::SaveJournal { path: a, .. }, Job::SaveJournal { path: b, .. })
+            | (Job::SaveJournal { path: a, .. }, Job::DeleteJournal(b))
+            | (Job::DeleteJournal(a), Job::SaveJournal { path: b, .. })
+            | (Job::DeleteJournal(a), Job::DeleteJournal(b)) => a == b,
+            _ => false,
+        });
+        if let Some(index) = obsolete {
+            pending.jobs.remove(index);
+        }
+        pending.jobs.push_back(job);
+        wake.notify_one();
     }
 }
 impl Drop for PersistenceWorker {
     fn drop(&mut self) {
-        // Normal exit completes accepted journal operations, while abnormal
-        // process termination retains the last durably committed journal.
-        self.sender.take();
+        let (lock, wake) = &*self.queue;
+        lock.lock().unwrap().closing = true;
+        wake.notify_all();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -318,6 +369,41 @@ mod tests {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         Store::new(folder).unwrap()
+    }
+    #[test]
+    fn deleted_source_is_still_discoverable_as_exportable_recovery() {
+        let store = fixture();
+        let source = store.directory().join("deleted.rs");
+        let export = store.directory().join("recovered.rs");
+        fs::write(&source, "fn original() {}").unwrap();
+        store
+            .save_journal(&source, "fn original() {}", "fn edited() {}")
+            .unwrap();
+        fs::remove_file(&source).unwrap();
+        let orphan = store
+            .load_all_journals()
+            .into_iter()
+            .find(|journal| journal.path == source)
+            .expect("deleted document recovery");
+        store.export_recovery(&orphan, &export).unwrap();
+        assert_eq!(fs::read_to_string(export).unwrap(), "fn edited() {}");
+    }
+    #[test]
+    fn persistence_queue_coalesces_many_pending_edit_snapshots() {
+        let worker = PersistenceWorker::spawn(fixture());
+        let path = PathBuf::from("/tmp/rustbridge-coalescing-test.rs");
+        for i in 0..1000 {
+            worker.send(Job::SaveJournal {
+                path: path.clone(),
+                baseline: String::from("original"),
+                edited: format!("new version {i}"),
+            });
+        }
+        let pending = worker.queue.0.lock().unwrap();
+        assert!(
+            pending.jobs.len() <= 1,
+            "only latest revision should remain pending"
+        );
     }
     #[test]
     fn journal_survives_a_simulated_crash_and_rejects_unrelated_sources() {

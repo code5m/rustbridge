@@ -65,8 +65,12 @@ fi
 # save. The original source remains untouched until this click/keyboard action.
 xdotool mousemove --sync 500 442 click 1
 sleep 2
+# The restore action enters the editable Rust mode. Pressing Ctrl+2 again is
+# idempotent and makes the GUI integration assert the correct editing context.
+xdotool key --clearmodifiers ctrl+2
+sleep 0.7
 if command -v scrot >/dev/null; then scrot /tmp/rustbridge-recovery-after-click.png; fi
-xdotool mousemove --sync 400 130 click 1
+xdotool mousemove --sync 344 161 click 1
 xdotool key End
 xdotool type --clearmodifiers --delay 18 ' // RECOVERY_RESTORED_AND_EDITABLE'
 sleep 1

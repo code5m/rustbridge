@@ -45,8 +45,8 @@ impl App {
                 {
                     self.navigate_back();
                 }
-                if self.documents.dirty_count() > 0
-                    && (!self.dirty || self.documents.dirty_count() > 1)
+                if self.live_dirty_count() > 0
+                    && (!self.dirty || self.live_dirty_count() > 1)
                     && ui.button("全部保存").clicked()
                 {
                     self.save_all_documents();
@@ -96,7 +96,7 @@ impl App {
                     ui.weak(format!(
                         "{} 个标签 · {} 个未保存",
                         self.documents.len(),
-                        self.documents.dirty_count()
+                        self.live_dirty_count()
                     ));
                 }
                 if self.external_change {
@@ -120,7 +120,11 @@ impl App {
                 .map(|document| {
                     (
                         document.path.clone(),
-                        document.is_dirty(),
+                        if self.file.as_ref() == Some(&document.path) {
+                            self.dirty
+                        } else {
+                            document.is_dirty()
+                        },
                         document.external_change,
                         document.pending_recovery.is_some(),
                     )
@@ -133,12 +137,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             for (path, dirty, external, recovery) in tabs {
-                                let active = self.file.as_ref().is_some_and(|active_path| {
-                                    active_path
-                                        .canonicalize()
-                                        .unwrap_or_else(|_| active_path.clone())
-                                        == path.canonicalize().unwrap_or_else(|_| path.clone())
-                                });
+                                let active = self.file.as_ref() == Some(&path);
                                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                                 let label = format!(
                                     "{}{}{}{}",
@@ -578,6 +577,36 @@ impl App {
             }
         });
         ui.small(&self.lsp_status);
+        if !self.orphan_recovery.is_empty() {
+            ui.separator();
+            ui.strong("孤立恢复快照（原始文件已删除或移动）");
+            ui.small("不会自动创建、覆盖或修改原始文件。请选择新的文件名导出后人工比对。");
+            for journal in self.orphan_recovery.iter().take(20) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(journal.path.display().to_string());
+                    if ui.button("导出恢复副本").clicked() {
+                        let name = journal
+                            .path
+                            .file_name()
+                            .map(|name| format!("{}.recovery.rs", name.to_string_lossy()))
+                            .unwrap_or_else(|| "recovered.rs".into());
+                        if let Some(destination) =
+                            rfd::FileDialog::new().set_file_name(&name).save_file()
+                        {
+                            self.status = match self
+                                .state_store
+                                .as_ref()
+                                .expect("state store for recovery")
+                                .export_recovery(journal, &destination)
+                            {
+                                Ok(()) => format!("孤立快照已导出：{}", destination.display()),
+                                Err(error) => format!("恢复导出未完成（原有文件未覆盖）：{error}"),
+                            };
+                        }
+                    }
+                });
+            }
+        }
         if self.lsp_ready {
             ui.small("编辑器原生交互：鼠标悬停查看类型 · 输入时自动补全 · F12 跳转定义 · Ctrl+Space 手动补全。");
         }
@@ -657,7 +686,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     let enabled = self.cargo_project
                         && self.cargo_task.is_none()
-                        && !self.dirty
+                        && self.live_dirty_count() == 0
                         && self.saving.is_none();
                     if ui
                         .add_enabled(enabled, egui::Button::new("Cargo Check"))
@@ -678,7 +707,7 @@ impl App {
             BottomTab::Run => {
                 let enabled = self.cargo_project
                     && self.cargo_task.is_none()
-                    && !self.dirty
+                    && self.live_dirty_count() == 0
                     && self.saving.is_none();
                 if ui
                     .add_enabled(enabled, egui::Button::new("运行 Cargo 项目"))

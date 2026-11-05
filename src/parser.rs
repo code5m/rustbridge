@@ -49,6 +49,11 @@ pub struct Projection {
     pub anchors: Vec<Anchor>,
     /// All linked occurrences grouped by their original line; rewrites preserve line breaks.
     pub anchors_by_line: Vec<Vec<usize>>,
+    /// Indexed selection in each view. Keep separate from rendering buckets.
+    pub rust_lookup_lines: Vec<Vec<usize>>,
+    pub java_lookup_lines: Vec<Vec<usize>>,
+    pub rust_wide_anchors: Vec<usize>,
+    pub java_wide_anchors: Vec<usize>,
     /// Cached offsets used by the virtualized code panes.
     pub rust_line_starts: Vec<usize>,
     pub java_line_starts: Vec<usize>,
@@ -64,24 +69,34 @@ impl Projection {
         self.find(byte, true)
     }
     fn find(&self, byte: usize, in_java: bool) -> Option<usize> {
-        self.anchors
-            .iter()
-            .enumerate()
-            .filter(|(_, anchor)| {
-                if in_java {
-                    anchor.java.contains(byte)
-                } else {
-                    anchor.rust.contains(byte)
-                }
+        let (starts, indexed, wide) = if in_java {
+            (
+                &self.java_line_starts,
+                &self.java_lookup_lines,
+                &self.java_wide_anchors,
+            )
+        } else {
+            (
+                &self.rust_line_starts,
+                &self.rust_lookup_lines,
+                &self.rust_wide_anchors,
+            )
+        };
+        let line = starts
+            .partition_point(|start| *start <= byte)
+            .saturating_sub(1);
+        indexed
+            .get(line)
+            .into_iter()
+            .flat_map(|items| items.iter())
+            .chain(wide.iter())
+            .filter_map(|&index| {
+                let anchor = self.anchors.get(index)?;
+                let span = if in_java { anchor.java } else { anchor.rust };
+                span.contains(byte).then_some((index, span.len()))
             })
-            .min_by_key(|(_, anchor)| {
-                if in_java {
-                    anchor.java.len()
-                } else {
-                    anchor.rust.len()
-                }
-            })
-            .map(|(idx, _)| idx)
+            .min_by_key(|(_, length)| *length)
+            .map(|(index, _)| index)
     }
 }
 
@@ -535,6 +550,34 @@ pub fn project(source: &str) -> Projection {
         })
 }
 
+// Build compact per-line indexes while keeping extreme cross-line spans separate.
+fn add_span_to_lookup(
+    lookup: &mut [Vec<usize>],
+    starts: &[usize],
+    span: ByteSpan,
+    index: usize,
+    wide: &mut Vec<usize>,
+) {
+    if span.start >= span.end || starts.is_empty() {
+        return;
+    }
+    let first = starts
+        .partition_point(|&start| start <= span.start)
+        .saturating_sub(1);
+    let last = starts
+        .partition_point(|&start| start < span.end)
+        .saturating_sub(1);
+    if last.saturating_sub(first) > 256 {
+        wide.push(index);
+    } else {
+        for line in first..=last {
+            if let Some(bucket) = lookup.get_mut(line) {
+                bucket.push(index);
+            }
+        }
+    }
+}
+
 fn project_tree(source: &str, tree: &Tree, cancelled: &dyn Fn() -> bool) -> Option<Projection> {
     let mut collector = Collector {
         source,
@@ -590,13 +633,35 @@ fn project_tree(source: &str, tree: &Tree, cancelled: &dyn Fn() -> bool) -> Opti
     }
     anchors.sort_by_key(|anchor| (anchor.rust.start, anchor.rust.end));
     let mut anchors_by_line = vec![Vec::new(); rust_lines.len()];
+    let mut rust_lookup_lines = vec![Vec::new(); rust_lines.len()];
+    let mut java_lookup_lines = vec![Vec::new(); java_lines.len()];
+    let mut rust_wide_anchors = Vec::new();
+    let mut java_wide_anchors = Vec::new();
     for (index, anchor) in anchors.iter().enumerate() {
         anchors_by_line[anchor.rust_at.line].push(index);
+        add_span_to_lookup(
+            &mut rust_lookup_lines,
+            &rust_lines,
+            anchor.rust,
+            index,
+            &mut rust_wide_anchors,
+        );
+        add_span_to_lookup(
+            &mut java_lookup_lines,
+            &java_lines,
+            anchor.java,
+            index,
+            &mut java_wide_anchors,
+        );
     }
     Some(Projection {
         java,
         anchors,
         anchors_by_line,
+        rust_lookup_lines,
+        java_lookup_lines,
+        rust_wide_anchors,
+        java_wide_anchors,
         rust_line_starts: rust_lines,
         java_line_starts: java_lines,
         java_insights: collector.insights,
@@ -829,5 +894,40 @@ mod tests {
         assert_eq!(p.java, "");
         assert!(p.anchors.is_empty());
         assert_eq!(project("fn main() {}\n").java.matches('\n').count(), 1);
+    }
+    #[test]
+    fn indexed_span_lookup_matches_exact_reference_for_all_bytes() {
+        let source =
+            "struct User { name: String }\nimpl User { fn greet(&self) -> &str { &self.name } }\n";
+        let projection = project(source);
+        for (bytes, view) in [(source.len(), false), (projection.java.len(), true)] {
+            for position in 0..bytes {
+                let baseline = projection
+                    .anchors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, anchor)| {
+                        if view {
+                            anchor.java.contains(position)
+                        } else {
+                            anchor.rust.contains(position)
+                        }
+                    })
+                    .min_by_key(|(_, anchor)| {
+                        if view {
+                            anchor.java.len()
+                        } else {
+                            anchor.rust.len()
+                        }
+                    })
+                    .map(|(index, _)| index);
+                let actual = if view {
+                    projection.java_anchor(position)
+                } else {
+                    projection.rust_anchor(position)
+                };
+                assert_eq!(actual, baseline, "view={view} byte={position}");
+            }
+        }
     }
 }
