@@ -12,6 +12,8 @@ pub struct Document {
     pub path: PathBuf,
     pub source: String,
     pub saved_source: String,
+    /// Cached dirty bit, changed only when source or saved baseline changes.
+    pub dirty: bool,
     pub cursor_byte: usize,
     pub mode: String,
     pub disk_stamp: Option<FileStamp>,
@@ -21,7 +23,7 @@ pub struct Document {
 
 impl Document {
     pub fn is_dirty(&self) -> bool {
-        self.source != self.saved_source
+        self.dirty
     }
 }
 
@@ -44,6 +46,9 @@ pub struct DocumentManager {
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
     let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
     let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
     left == right
@@ -137,6 +142,7 @@ impl DocumentManager {
             path,
             saved_source: source.clone(),
             source,
+            dirty: false,
             cursor_byte,
             mode,
             disk_stamp,
@@ -160,6 +166,7 @@ impl DocumentManager {
         if let Some(doc) = self.get_mut(path) {
             doc.source = update.source;
             doc.saved_source = update.saved_source;
+            doc.dirty = doc.source != doc.saved_source;
             doc.cursor_byte = update.cursor_byte;
             doc.mode = update.mode;
             doc.disk_stamp = update.disk_stamp;
@@ -182,6 +189,7 @@ impl DocumentManager {
         if let Some(doc) = self.documents.iter_mut().find(|doc| doc.id == active_id) {
             doc.source = source;
             doc.saved_source = saved_source;
+            doc.dirty = doc.source != doc.saved_source;
             doc.cursor_byte = cursor_byte;
             doc.mode = mode;
             doc.disk_stamp = disk_stamp;
@@ -217,6 +225,7 @@ impl DocumentManager {
             return false;
         };
         doc.saved_source = saved_source;
+        doc.dirty = doc.source != doc.saved_source;
         doc.disk_stamp = disk_stamp;
         doc.external_change = false;
         true

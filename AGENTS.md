@@ -111,3 +111,13 @@ The binding product and architecture decisions are recorded in `docs/ui-2.0-deci
 - Never auto-run exercise code, users' project tests, or Cargo build scripts. Do not describe rustc or Cargo as a security sandbox.
 - Ownership visualizations using the fixed example cannot claim arbitrary program semantic analysis. F12 navigation history must preserve actual paths and source coordinates.
 - Learning data must deserialize older sessions with missing fields, and roundtrip across restart. Regression gates in docs/learning-path-v1.md.
+
+## 2026-11-05 unified performance/reliability integration contract
+
+- All performance, recovery, native LSP, document-manager and cross-platform regression fixes belong to one branch and one gated PR. Decisions, measured acceptance and remaining limits are documented in `docs/performance-reliability-unified-20261105.md`.
+- Never measure dirty status by comparing the full saved baseline every UI frame; show unsynced active changes immediately while checkpointing full text only at explicit lifecycle events and debounced recovery.
+- Never lose a queued explicit Save All job because an unrelated document conflicted; show each unresolved source as dirty and do not auto-close or switch projects on incomplete saves.
+- Crash recovery is not complete until the user can continue editing the restored Rust buffer and explicitly save it; orphan recovery snapshots must be discoverable without overwriting original source.
+- LSP and persistence queues must coalesce superseded document snapshots; stopping a crashed analyzer must not produce an unbounded restart loop.
+- Portable Cargo success is a structured process exit status, never an English exit-code string; preserve real compiler diagnostics.
+- Cross-platform CI must pass on main-relative PR changes before the one-time merge. Do not misrepresent Windows/macOS in-place writes as power-loss-atomic, an Xvfb driver as a user, or a five-second resource observation as a 24-hour stability proof.

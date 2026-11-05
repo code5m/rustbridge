@@ -319,6 +319,24 @@ pub struct PracticeTask {
     pub had_errors: bool,
     pub started: Instant,
 }
+impl Drop for PracticeTask {
+    fn drop(&mut self) {
+        // Cancellation may take a moment to release Windows file handles.
+        // Cleanup runs outside the GUI thread, including when the user closes
+        // the app while an explicitly requested compilation is in progress.
+        self.task.cancel();
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            for _ in 0..30 {
+                match fs::remove_dir_all(&root) {
+                    Ok(()) => return,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(200)),
+                }
+            }
+        });
+    }
+}
 
 impl App {
     pub(super) fn poll_practice(&mut self) {
@@ -332,7 +350,9 @@ impl App {
             match event {
                 cargo_runner::Event::Diagnostic(diagnostic) => diagnostics.push(diagnostic),
                 cargo_runner::Event::Log(line) => logs.push(line),
-                cargo_runner::Event::Finished(message) => ended = Some(message),
+                cargo_runner::Event::Finished { message, success } => {
+                    ended = Some((message, success))
+                }
             }
         }
         if let Some(task) = self.practice_task.as_mut() {
@@ -345,9 +365,9 @@ impl App {
             }
             self.practice_log.push(line);
         }
-        if let Some(message) = ended {
+        if let Some((message, success)) = ended {
             let task = self.practice_task.take().expect("present");
-            let passed = message.contains("exit status: 0") && !task.had_errors;
+            let passed = success && !task.had_errors;
             if passed && let Some(done) = self.practice_passed.get_mut(task.exercise) {
                 *done = true;
             }
@@ -359,7 +379,7 @@ impl App {
             } else {
                 format!("练习未通过：{message}。请结合诊断和提示修改后重试。")
             };
-            let _ = fs::remove_dir_all(task.root);
+            let _ = fs::remove_dir_all(&task.root);
         }
     }
 
@@ -652,8 +672,8 @@ mod tests {
                             code_found = true;
                         }
                     }
-                    cargo_runner::Event::Finished(status) => {
-                        assert!(status.contains("exit status: 101"), "unexpected {status}");
+                    cargo_runner::Event::Finished { message, success } => {
+                        assert!(!success, "unexpected success: {message}");
                         finished = true;
                     }
                     cargo_runner::Event::Log(_) => {}

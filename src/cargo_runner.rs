@@ -62,7 +62,7 @@ pub struct Diagnostic {
 pub enum Event {
     Log(String),
     Diagnostic(Diagnostic),
-    Finished(String),
+    Finished { message: String, success: bool },
 }
 fn parse_compiler_message(line: &str, root: &Path) -> Option<Diagnostic> {
     let value: Value = serde_json::from_str(line).ok()?;
@@ -164,7 +164,10 @@ impl CargoTask {
         let root_worker = root.clone();
         thread::spawn(move || {
             if !root_worker.join("Cargo.toml").is_file() {
-                let _ = tx.send(Event::Finished("已取消：目录中没有 Cargo.toml".into()));
+                let _ = tx.send(Event::Finished {
+                    message: "已取消：目录中没有 Cargo.toml".into(),
+                    success: false,
+                });
                 return;
             }
             let mut command = Command::new(program);
@@ -178,10 +181,10 @@ impl CargoTask {
             let mut process = match command.spawn() {
                 Ok(child) => child,
                 Err(error) => {
-                    let _ = tx.send(Event::Finished(format!(
-                        "{} 启动失败：{error}",
-                        action.label()
-                    )));
+                    let _ = tx.send(Event::Finished {
+                        message: format!("{} 启动失败：{error}", action.label()),
+                        success: false,
+                    });
                     return;
                 }
             };
@@ -197,32 +200,38 @@ impl CargoTask {
                 *guard = Some(process);
             }
             let limit = Instant::now() + action.timeout();
-            let outcome = loop {
+            let (outcome, success) = loop {
                 let expired = Instant::now() >= limit;
                 let cancelling = cancelled_worker.load(Ordering::Acquire);
                 let mut guard = actor.lock().unwrap();
                 let Some(child) = guard.as_mut() else {
-                    break "进程已经退出".to_string();
+                    break ("进程已经退出".to_string(), false);
                 };
                 if cancelling || expired {
                     cancel_process(child);
                     guard.take();
-                    break if cancelling {
-                        "已取消，子进程组已停止".into()
-                    } else {
-                        format!("已超过 {} 秒超时并终止", action.timeout().as_secs())
-                    };
+                    break (
+                        if cancelling {
+                            "已取消，子进程组已停止".into()
+                        } else {
+                            format!("已超过 {} 秒超时并终止", action.timeout().as_secs())
+                        },
+                        false,
+                    );
                 }
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         guard.take();
-                        break format!("{} 已退出：{status}", action.label());
+                        break (
+                            format!("{} 已退出：{status}", action.label()),
+                            status.success(),
+                        );
                     }
                     Ok(None) => {}
                     Err(error) => {
                         cancel_process(child);
                         guard.take();
-                        break format!("进程等待失败：{error}");
+                        break (format!("进程等待失败：{error}"), false);
                     }
                 }
                 drop(guard);
@@ -230,7 +239,10 @@ impl CargoTask {
             };
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            let _ = tx.send(Event::Finished(outcome));
+            let _ = tx.send(Event::Finished {
+                message: outcome,
+                success,
+            });
         });
         Self {
             receiver,
@@ -358,7 +370,9 @@ edition = "2024"
             for event in task.poll() {
                 match event {
                     Event::Diagnostic(value) => diagnostic = Some(value),
-                    Event::Finished(status) => {
+                    Event::Finished {
+                        message: status, ..
+                    } => {
                         eprintln!("cargo integration: {status}");
                         finished = true;
                     }
@@ -419,7 +433,10 @@ pub fn add(a:u32,b:u32)->u32{a+b}
         let mut test_finished = None;
         while Instant::now() < deadline && test_finished.is_none() {
             for event in test_task.poll() {
-                if let Event::Finished(status) = event {
+                if let Event::Finished {
+                    message: status, ..
+                } = event
+                {
                     test_finished = Some(status);
                 }
             }
@@ -440,7 +457,9 @@ pub fn add(a:u32,b:u32)->u32{a+b}
             for event in run_task.poll() {
                 match event {
                     Event::Log(line) => run_output.push_str(&line),
-                    Event::Finished(status) => run_finished = Some(status),
+                    Event::Finished {
+                        message: status, ..
+                    } => run_finished = Some(status),
                     Event::Diagnostic(diag) => run_output.push_str(&diag.message),
                 }
             }

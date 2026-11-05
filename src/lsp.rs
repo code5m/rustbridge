@@ -64,6 +64,8 @@ pub struct Completion {
 pub enum Event {
     Ready,
     Status(String),
+    /// Emitted once the server worker and its subprocess have stopped.
+    Stopped,
     Hover {
         path: PathBuf,
         revision: u64,
@@ -107,12 +109,14 @@ enum Request {
     Close {
         path: PathBuf,
     },
+    WakeChanges,
     Stop,
 }
 pub struct LspTask {
     tx: Sender<Request>,
     rx: Receiver<Event>,
     process: Arc<Mutex<Option<Child>>>,
+    changes: Arc<Mutex<HashMap<PathBuf, (String, u64)>>>,
     cancelled: Arc<AtomicBool>,
     pub root: PathBuf,
 }
@@ -121,17 +125,29 @@ impl LspTask {
         let (tx, commands) = mpsc::channel();
         let (events_sender, rx) = mpsc::channel();
         let process = Arc::new(Mutex::new(None));
+        let changes = Arc::new(Mutex::new(HashMap::new()));
+        let pending_changes = Arc::clone(&changes);
         let cancelled = Arc::new(AtomicBool::new(false));
         let process_worker = Arc::clone(&process);
         let stop = Arc::clone(&cancelled);
         let root_worker = root.clone();
         thread::spawn(move || {
-            run_server(root_worker, commands, events_sender, process_worker, stop);
+            let done = events_sender.clone();
+            run_server(
+                root_worker,
+                commands,
+                events_sender,
+                process_worker,
+                pending_changes,
+                stop,
+            );
+            let _ = done.send(Event::Stopped);
         });
         Self {
             tx,
             rx,
             process,
+            changes,
             cancelled,
             root,
         }
@@ -144,11 +160,24 @@ impl LspTask {
         });
     }
     pub fn change(&self, path: PathBuf, source: String, version: u64) {
-        let _ = self.tx.send(Request::Change {
-            path,
-            source,
-            version,
-        });
+        // Replacing a pending document snapshot keeps typing responsive when the
+        // analyzer is indexing or its stdin is temporarily blocked.
+        let mut changes = self.changes.lock().unwrap();
+        let wake = changes.is_empty();
+        match changes.entry(path) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if version >= entry.get().1 {
+                    entry.insert((source, version));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((source, version));
+            }
+        }
+        drop(changes);
+        if wake {
+            let _ = self.tx.send(Request::WakeChanges);
+        }
     }
     pub fn query(&self, path: PathBuf, kind: Kind, revision: u64, line: u32, character: u32) {
         let _ = self.tx.send(Request::Query {
@@ -160,6 +189,7 @@ impl LspTask {
         });
     }
     pub fn close(&self, path: PathBuf) {
+        self.changes.lock().unwrap().remove(&path);
         let _ = self.tx.send(Request::Close { path });
     }
     pub fn poll(&self) -> Vec<Event> {
@@ -407,7 +437,7 @@ fn issue_request(
                 );
             }
         }
-        Request::Stop => {}
+        Request::WakeChanges | Request::Stop => {}
     }
     Ok(())
 }
@@ -577,6 +607,7 @@ fn run_server(
     commands: Receiver<Request>,
     events: Sender<Event>,
     child_slot: Arc<Mutex<Option<Child>>>,
+    changes: Arc<Mutex<HashMap<PathBuf, (String, u64)>>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut child = match spawn_rust_analyzer(&root) {
@@ -647,25 +678,43 @@ fn run_server(
                 stop.store(true, Ordering::Release);
                 break;
             }
-            if ready {
-                if let Err(error) = issue_request(
-                    &mut writer,
-                    command,
-                    &mut opened,
-                    &mut next_id,
-                    &mut pending,
-                ) {
-                    let _ = events.send(Event::Status(format!("LSP request failed: {error}")));
-                    stop.store(true, Ordering::Release);
-                    break;
-                }
+            let commands: Vec<Request> = if matches!(command, Request::WakeChanges) {
+                let snapshots = std::mem::take(&mut *changes.lock().unwrap());
+                snapshots
+                    .into_iter()
+                    .map(|(path, (source, version))| Request::Change {
+                        path,
+                        source,
+                        version,
+                    })
+                    .collect()
             } else {
-                // Preserve every opened document and its latest queued edit while the
-                // server initializes. The bounded queue prevents unbounded UI input.
-                if queued.len() >= 512 {
-                    queued.pop_front();
+                vec![command]
+            };
+            for command in commands {
+                if ready {
+                    if let Err(error) = issue_request(
+                        &mut writer,
+                        command,
+                        &mut opened,
+                        &mut next_id,
+                        &mut pending,
+                    ) {
+                        let _ = events.send(Event::Status(format!("LSP request failed: {error}")));
+                        stop.store(true, Ordering::Release);
+                        break;
+                    }
+                } else {
+                    // Changes are latest-revision-only; never drop didOpen/didClose
+                    // just because the analyzer is initializing.
+                    if let Request::Change { ref path, .. } = command {
+                        queued.retain(|item| !matches!(item, Request::Change { path: other, .. } if other == path));
+                    }
+                    if matches!(command, Request::Query { .. }) && queued.len() >= 256 {
+                        continue;
+                    }
+                    queued.push_back(command);
                 }
-                queued.push_back(command);
             }
         }
         for (id, (_, _, _, _, _, deadline)) in &pending {
@@ -819,6 +868,37 @@ pub fn byte_for_position(source: &str, pos: &SpanPosition) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rapid_unsent_changes_keep_only_latest_document_snapshot() {
+        let (tx, pending) = mpsc::channel();
+        let (_event_sender, rx) = mpsc::channel();
+        let task = LspTask {
+            tx,
+            rx,
+            process: Arc::new(Mutex::new(None)),
+            changes: Arc::new(Mutex::new(HashMap::new())),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            root: PathBuf::new(),
+        };
+        let path = PathBuf::from("unsaved.rs");
+        for revision in 1..=1000 {
+            task.change(path.clone(), format!("source {revision}"), revision);
+        }
+        let changes = task.changes.lock().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes.get(&path),
+            Some(&(String::from("source 1000"), 1000))
+        );
+        drop(changes);
+        assert!(matches!(pending.try_recv(), Ok(Request::WakeChanges)));
+        assert!(
+            pending.try_recv().is_err(),
+            "only one wake-up must be queued"
+        );
+        task.close(path);
+        assert!(task.changes.lock().unwrap().is_empty());
+    }
     #[test]
     fn frame_decoder_handles_utf8_and_content_length() {
         let value = json!({"jsonrpc":"2.0","id":5,"result":"中文🦀"});

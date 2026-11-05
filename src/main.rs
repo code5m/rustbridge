@@ -110,8 +110,10 @@ struct App {
     restore_queue: VecDeque<PathBuf>,
     restore_states: HashMap<PathBuf, persistence::DocumentSession>,
     restore_active: Option<PathBuf>,
+    orphan_recovery: Vec<persistence::Journal>,
     pending_close_document: Option<PathBuf>,
     save_queue: VecDeque<PathBuf>,
+    save_errors: Vec<String>,
     io_revision: u64,
     opening: Option<(u64, PathBuf, u64)>,
     saving: Option<(u64, PathBuf, String)>,
@@ -247,8 +249,10 @@ impl Default for App {
             restore_queue: VecDeque::new(),
             restore_states: HashMap::new(),
             restore_active: None,
+            orphan_recovery: Vec::new(),
             pending_close_document: None,
             save_queue: VecDeque::new(),
+            save_errors: Vec::new(),
             io_revision: 0,
             opening: None,
             saving: None,
@@ -339,6 +343,48 @@ impl App {
         self.last_synced_mode = self.mode;
         self.last_synced_disk_stamp = self.disk_stamp.clone();
         self.last_synced_external_change = self.external_change;
+    }
+
+    /// Reflect metadata eagerly without copying an entire text buffer on every
+    /// keystroke. The source is checkpointed by the 350 ms recovery debounce,
+    /// or synchronously before save, switch, close and shutdown.
+    fn sync_active_metadata_for_persistence(&mut self) {
+        if self.file.as_ref() != self.documents.active().map(|doc| &doc.path) {
+            self.sync_active_document();
+            return;
+        }
+        if self.last_synced_cursor_byte != self.cursor_byte
+            || self.last_synced_mode != self.mode
+            || self.last_synced_disk_stamp != self.disk_stamp
+            || self.last_synced_external_change != self.external_change
+        {
+            self.documents.update_active_metadata(
+                self.cursor_byte,
+                mode_name(self.mode).into(),
+                self.disk_stamp.clone(),
+                self.external_change,
+            );
+            self.last_synced_cursor_byte = self.cursor_byte;
+            self.last_synced_mode = self.mode;
+            self.last_synced_disk_stamp = self.disk_stamp.clone();
+            self.last_synced_external_change = self.external_change;
+        }
+    }
+
+    fn live_dirty_count(&self) -> usize {
+        let count = self.documents.dirty_count();
+        match self.documents.active() {
+            Some(active) if self.file.as_ref() == Some(&active.path) => {
+                if active.is_dirty() && !self.dirty {
+                    count.saturating_sub(1)
+                } else if !active.is_dirty() && self.dirty {
+                    count + 1
+                } else {
+                    count
+                }
+            }
+            _ => count + usize::from(self.file.is_some() && self.dirty),
+        }
     }
 
     fn sync_active_document(&mut self) {
@@ -455,7 +501,20 @@ impl App {
         store: persistence::Store,
         restore_last_document: bool,
     ) {
-        if let Some(session) = store.load_session() {
+        // A crash may happen before the first session.json was committed.
+        // Journals remain discoverable even without a saved session.
+        let saved_journals = store.load_all_journals();
+        self.orphan_recovery = saved_journals
+            .iter()
+            .filter(|journal| !journal.path.is_file())
+            .cloned()
+            .collect();
+        if let Some(session) = store.load_session().or_else(|| {
+            saved_journals
+                .iter()
+                .any(|journal| journal.path.is_file())
+                .then(persistence::Session::default)
+        }) {
             self.lesson = session.lesson.min(lessons::LESSONS.len().saturating_sub(1));
             self.completed_lessons = normalized_completion(&session.completed_lessons);
             self.quiz_attempts = (0..lessons::LESSONS.len())
@@ -498,13 +557,16 @@ impl App {
                         mode: session.mode.clone(),
                     });
                 }
-                for journal in store.load_all_journals() {
+                for journal in saved_journals
+                    .iter()
+                    .filter(|journal| journal.path.is_file())
+                {
                     if !documents
                         .iter()
                         .any(|document| same_document_path(&document.path, &journal.path))
                     {
                         documents.push(persistence::DocumentSession {
-                            path: journal.path,
+                            path: journal.path.clone(),
                             cursor_byte: 0,
                             mode: "rust".into(),
                         });
@@ -640,7 +702,7 @@ impl App {
         self.recovery_due = None;
     }
     fn poll_persistence(&mut self) {
-        self.sync_active_document();
+        self.sync_active_metadata_for_persistence();
         if self
             .recovery_due
             .is_some_and(|due| std::time::Instant::now() >= due)
@@ -676,6 +738,9 @@ impl App {
         }
         self.lsp_task = None;
         self.lsp_user_stopped = false;
+        // Normalize the project identity once rather than synchronously
+        // canonicalizing the directory on every UI frame in poll_lsp().
+        self.root = Some(root.clone());
         let worker = lsp::LspTask::start(root.clone());
         for doc in self.documents.iter() {
             if let Ok(path) = doc.path.canonicalize()
@@ -699,18 +764,19 @@ impl App {
         let Some(task) = self.lsp_task.as_ref() else {
             return;
         };
-        if !self
-            .root
-            .as_ref()
-            .is_some_and(|root| root.canonicalize().is_ok_and(|p| p == task.root))
-        {
+        if self.root.as_ref() != Some(&task.root) {
             task.cancel();
             self.lsp_task = None;
             self.lsp_ready = false;
             return;
         }
-        for event in task.poll() {
+        let events = task.poll();
+        let mut stopped = false;
+        for event in events {
             match event {
+                lsp::Event::Stopped => {
+                    stopped = true;
+                }
                 lsp::Event::Ready => {
                     self.lsp_ready = true;
                     self.lsp_status =
@@ -783,6 +849,17 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if stopped {
+            self.lsp_ready = false;
+            self.lsp_task = None;
+            // Stop an unlimited rapid-restart loop when analyzer is missing or
+            // crashing. The Tools panel provides an explicit Retry action.
+            self.lsp_user_stopped = true;
+            self.lsp_status
+                .push_str("；LSP 已退出，点击「启动 LSP」可以重试。");
+            self.lsp_hover.clear();
+            self.lsp_completions.clear();
         }
     }
 
@@ -997,8 +1074,8 @@ impl App {
                         self.cargo_diagnostics.push(diagnostic);
                     }
                 }
-                cargo_runner::Event::Finished(status) => {
-                    self.cargo_status = status;
+                cargo_runner::Event::Finished { message, .. } => {
+                    self.cargo_status = message;
                     finished = true;
                 }
             }
@@ -1117,6 +1194,7 @@ impl App {
         self.restore_active = None;
         self.pending_close_document = None;
         self.save_queue.clear();
+        self.save_errors.clear();
         if let Some(io) = self.document_io.as_ref() {
             io.cancel_open();
         }
@@ -1484,15 +1562,16 @@ impl App {
                                 self.after_save_close = false;
                                 self.after_save_open = false;
                                 self.after_save_project = false;
-                                self.save_queue.clear();
+                                self.save_errors.push(self.status.clone());
+                                self.start_next_queued_save();
                             } else {
                                 if self.documents.get(&path).is_some_and(|doc| doc.is_dirty())
                                     && !self.save_queue.iter().any(|queued| queued == &path)
                                 {
                                     self.save_queue.push_back(path.clone());
                                 }
-                                if let Some(next) = self.save_queue.pop_front() {
-                                    self.start_save_path(next);
+                                if self.start_next_queued_save() {
+                                    // Continue the accepted save queue before closing/switching.
                                 } else if self.pending_close_document.as_ref().is_some_and(
                                     |pending| {
                                         pending.canonicalize().unwrap_or_else(|_| pending.clone())
@@ -1505,6 +1584,7 @@ impl App {
                                 {
                                     self.close_document_now(path.clone(), false);
                                 } else if self.pending_project.is_some()
+                                    && self.save_errors.is_empty()
                                     && self.documents.dirty_count() == 0
                                     && let Some(next) = self.pending_project.take()
                                 {
@@ -1537,9 +1617,11 @@ impl App {
                             self.after_save_close = false;
                             self.after_save_open = false;
                             self.after_save_project = false;
-                            self.save_queue.clear();
                             self.status =
                                 format!("Save failed (original source preserved): {error}");
+                            self.save_errors
+                                .push(format!("{}: {error}", path.display()));
+                            self.start_next_queued_save();
                         }
                     }
                 }
@@ -1701,22 +1783,24 @@ impl App {
         self.start_save_path(path);
     }
 
-    fn start_save_path(&mut self, path: PathBuf) {
+    /// Returns true if a background save was accepted. False means the
+    /// caller can continue with the next queued document.
+    fn start_save_path(&mut self, path: PathBuf) -> bool {
         if self.saving.is_some() {
             self.status = "已有一个安全保存任务正在运行。".into();
-            return;
+            return false;
         }
-        let Some(document) = self.documents.get(&path).cloned() else {
+        let Some(document) = self.documents.get(&path) else {
             self.status = format!("文档已关闭，无法保存：{}", path.display());
-            return;
+            return false;
         };
         if !document.is_dirty() {
             self.status = format!("{} 已经是最新版本。", path.display());
-            return;
+            return false;
         }
         if document.external_change {
             self.status = format!("{} 已在外部修改；为避免覆盖，拒绝保存。", path.display());
-            return;
+            return false;
         }
         self.io_revision += 1;
         let id = self.io_revision;
@@ -1732,6 +1816,28 @@ impl App {
         self.saving = Some((id, path.clone(), content));
         self.saving_started = Some(std::time::Instant::now());
         self.status = format!("正在后台安全保存 {}…", path.display());
+        true
+    }
+
+    fn start_next_queued_save(&mut self) -> bool {
+        while let Some(next) = self.save_queue.pop_front() {
+            if self.start_save_path(next.clone()) {
+                return true;
+            }
+            if self.documents.get(&next).is_some_and(|doc| doc.is_dirty()) {
+                self.save_errors.push(self.status.clone());
+            }
+        }
+        if !self.save_errors.is_empty() {
+            self.status = format!(
+                "保存全部已结束，但 {} 个文档存在冲突或错误：{}",
+                self.save_errors.len(),
+                self.save_errors.join("；")
+            );
+            self.after_save_close = false;
+            self.after_save_project = false;
+        }
+        false
     }
 
     fn save_all_documents(&mut self) {
@@ -1740,11 +1846,12 @@ impl App {
             self.status = "当前保存完成后再继续保存其他文档。".into();
             return;
         }
+        self.save_errors.clear();
         self.save_queue = self.documents.dirty_paths().into();
-        if let Some(next) = self.save_queue.pop_front() {
-            self.start_save_path(next);
-        } else {
+        if self.save_queue.is_empty() {
             self.status = "所有打开的文档均已保存。".into();
+        } else {
+            self.start_next_queued_save();
         }
     }
 
@@ -2779,6 +2886,14 @@ impl eframe::App for App {
                         self.documents.set_pending_recovery(&journal.path, None);
                         self.rust = journal.edited.clone();
                         self.update_projection();
+                        // Restoring an editable buffer must actually enter the
+                        // Rust editor rather than leave users in read-only Java mode.
+                        self.mode = Mode::Rust;
+                        self.cursor_byte = self.rust.len();
+                        self.editor_jump = Some(parser::ByteSpan {
+                            start: self.cursor_byte,
+                            end: self.cursor_byte,
+                        });
                         self.dirty = true;
                         self.mark_dirty_for_recovery();
                         self.status = "已恢复未保存缓冲区；尚未覆盖磁盘文件。".into();
@@ -3652,5 +3767,68 @@ mod file_tests {
             line_number_gutter("let 中文 = 1;\r\nlet next = 2;\n"),
             "1\n2\n3"
         );
+    }
+    #[test]
+    fn live_dirty_count_updates_before_large_buffer_is_checkpointed() {
+        let root =
+            std::env::temp_dir().join(format!("rustbridge-live-dirty-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let mut app = App::default();
+        app.open_file(path.clone());
+        app.wait_for_document_io();
+        assert_eq!(app.live_dirty_count(), 0);
+        let offset = app.rust.len();
+        let patch = "\n// pending checkpoint";
+        app.rust.push_str(patch);
+        app.source_edited(offset..offset, patch);
+        app.dirty = true;
+        app.mark_dirty_for_recovery();
+        assert_eq!(app.live_dirty_count(), 1);
+        // Repaint/persistence polling must not copy the entire source just to
+        // update cursor and tab metadata.
+        app.poll_persistence();
+        assert!(!app.documents.get(&path).unwrap().is_dirty());
+        app.sync_active_document();
+        assert_eq!(app.documents.dirty_count(), 1);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_all_skips_conflict_and_keeps_saving_remaining_documents() {
+        let root = std::env::temp_dir().join(format!(
+            "rustbridge-save-all-continue-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.rs");
+        let b = root.join("b.rs");
+        fs::write(&a, "pub fn a() {}").unwrap();
+        fs::write(&b, "pub fn b() {}").unwrap();
+        let mut app = App::default();
+        for (file, text) in [(&a, " // unsaved A"), (&b, " // unsaved B")] {
+            app.open_file(file.clone());
+            app.wait_for_document_io();
+            let offset = app.rust.len();
+            app.rust.push_str(text);
+            app.source_edited(offset..offset, text);
+            app.dirty = true;
+            app.sync_active_document();
+        }
+        app.documents.set_external_change(&a, true);
+        app.save_all_documents();
+        app.wait_for_document_io();
+        assert_eq!(fs::read_to_string(&a).unwrap(), "pub fn a() {}");
+        assert_eq!(
+            fs::read_to_string(&b).unwrap(),
+            "pub fn b() {} // unsaved B"
+        );
+        assert!(app.documents.get(&a).unwrap().is_dirty());
+        assert!(!app.documents.get(&b).unwrap().is_dirty());
+        assert_eq!(app.save_errors.len(), 1, "one conflict should be reported");
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
     }
 }

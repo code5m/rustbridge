@@ -101,8 +101,7 @@ impl App {
     fn track_lsp_hover(
         &mut self,
         displayed: &str,
-        original: &str,
-        base_offset: usize,
+        original_range: std::ops::Range<usize>,
         galley: &egui::Galley,
         galley_pos: egui::Pos2,
         response: &egui::Response,
@@ -119,8 +118,9 @@ impl App {
         };
         let cursor = galley.cursor_from_pos(pointer - galley_pos);
         let displayed_byte = parser::char_to_byte(displayed, cursor.index);
+        let original = &self.rust[original_range.clone()];
         let local_byte = editor_eol::display_to_original(original, displayed_byte);
-        let byte = (base_offset + local_byte).min(self.rust.len());
+        let byte = (original_range.start + local_byte).min(self.rust.len());
         let next_identifier = self.rust[byte..]
             .chars()
             .next()
@@ -418,11 +418,9 @@ impl App {
             });
         }
         if !output.response.changed() {
-            let hover_source = self.rust.clone();
             self.track_lsp_hover(
                 &editor_text,
-                &hover_source,
-                0,
+                0..self.rust.len(),
                 &output.galley,
                 output.galley_pos,
                 &output.response,
@@ -666,8 +664,7 @@ impl App {
             if !output.response.changed() {
                 self.track_lsp_hover(
                     &page,
-                    &physical_page,
-                    range.start,
+                    range.clone(),
                     &output.galley,
                     output.galley_pos,
                     &output.response,
