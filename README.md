@@ -29,7 +29,7 @@ RustBridge v0.5 keeps real Rust files as the only editable source. Java code on 
 
 - **Crash recovery:** private local journal of dirty Rust source with a full saved baseline; on restart, restore into the editor only if the disk still matches that baseline. Otherwise export a non-overwriting recovery copy.
 - **Multi-document workspace:** real document tabs with stable Document IDs, independent source buffers, save baselines, dirty/external-change state, cursor/mode and per-document recovery. Ctrl+Tab cycles tabs; Ctrl+W closes the current tab. Save and Save All operate on the intended document(s). Session restore reopens all tabs and continues after an individual unreadable tab.
-- **Interactive learning:** twelve short Java8→Rust quizzes; incorrect answers have conceptual explanations, and progress is stored privately.
+- **Interactive learning:** 24 Java8→Rust concept quizzes across six stages; incorrect answers have conceptual explanations, and progress is stored privately.
 - **Editor-native rust-analyzer LSP:** real JSON-RPC Hover, Completion and same/cross-file Definition with UTF-16 coordinates, path/version-scoped replies, snippet expansion and cancellable server lifecycle. It starts lazily when entering a real Rust editor in a Cargo project (not on app/project startup); manual Stop suppresses automatic restart until manually started again. Semantic indexing may take time.
 - **User-authorized Cargo:** explicit trust approval before cargo check/test/run (including potentially unsafe build.rs/project code), bounded subprocess output, timeouts, cancellation and clickable rustc diagnostics.
 - **Sliding virtual source window:** a global line slider, wheel-edge rebase and keyboard navigation across a bounded 240-line moving editor. This is not a full rope-based text editor.
@@ -125,7 +125,8 @@ larger than or equal to 512 KiB, with a sliding window and global line slider; t
 | src/document_manager.rs | Stable document identity, independent buffers, dirty state, saved baselines, recovery and active-tab ownership |
 | src/document_io.rs | Async source open/save, generation-based cancellation and file limits |
 | `src/symbol_search.rs` | Bounded AST-only declaration candidate search (not a resolver) |
-| src/lessons.rs / src/lesson_quiz.rs | 12 Java↔Rust lessons, quizzes and mastery progress |
+| src/lessons.rs / src/lesson_quiz.rs | 24 Java↔Rust lessons across six stages, quizzes and conceptual progress |
+| src/learning_path.rs | Six-stage curriculum, 12 editable exercises, guided rustc diagnostics, illustrated ownership and local practice state |
 | src/persistence.rs | Crash journals, atomic session snapshots and private recovery export |
 | src/lsp.rs | Lazy-start rust-analyzer JSON-RPC client, multi-document synchronization, snippet expansion and UTF-16 position mapping |
 | src/cargo_runner.rs | User-approved Cargo check/test/run, cancellation and compiler diagnostics |
@@ -161,3 +162,13 @@ RustBridge's UI 2.0 product intent, information architecture, layout rules, inte
 - [UI 2.0 Interaction Specification](docs/ui-2.0-interaction-spec.md)
 
 The redesigned shell separates Project / Structure / Search / Learn / Tools navigation from the central workbench, contextual explanation, and bottom Problems / Build / Run / Output tool window. The bundled example is read-only; only a real opened `.rs` file is editable. Project switches use explicit unsaved-change protection. Compare mode has a draggable divider. The UI remains native egui and keeps the real filesystem and Rust source authoritative.
+
+## Six-stage learning and real compiler exercises
+
+The learning path now contains 24 concepts across six stages: syntax/structural migration, ownership/borrowing, types/error handling, collections/memory/concurrency, Cargo engineering, and async/advanced boundaries. Existing lessons retain their original indices, so upgraded users keep historical progress. Each stage includes two editable exercises.
+
+Each exercise runs a separate, temporary, dependency-free Cargo crate with `cargo check --all-targets --offline` **only after explicit consent**. The compiler's real diagnostic code and location are shown alongside conservative Java/Rust explanations for recognized errors. Checks do not execute the exercise's tests or application, but rustc/Cargo should not be treated as a system security sandbox. Quiz attempts, mistakes, compile-check status and unsaved practice drafts are stored locally.
+
+A four-step ownership/borrowing diagram illustrates move, shared borrow and mutable borrow; it does not attempt to infer borrow states for arbitrary projects. F12 source navigation offers Alt+Left to return to the previous source location. A green compiler check is not a claim that the solution meets its behavioral goal.
+
+See [Learning Path decision record](docs/learning-path-v1.md) for acceptance scope and limits.

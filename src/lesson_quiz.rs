@@ -123,6 +123,122 @@ pub const QUIZZES: &[Quiz] = &[
         correct: 1,
         explanation: "cargo check 类似 Maven 的快速验证部分流程，cargo test/run 执行代码需要明确授权。",
     },
+    Quiz {
+        prompt: "Rust 的 match 为何要求穷尽所有 enum 变体？",
+        choices: [
+            "为了编译器检查所有状态都被处理",
+            "因为所有 enum 都是数字",
+            "因为 match 自动执行 GC",
+        ],
+        correct: 0,
+        explanation: "穷尽检查降低遗漏状态的风险；变体还可以携带数据。",
+    },
+    Quiz {
+        prompt: "fn f<T: Clone>(x: T) 能依赖哪种能力？",
+        choices: [
+            "任何 T 自动实现 Copy",
+            "T 至少实现 Clone",
+            "T 必须是 Java 对象",
+        ],
+        correct: 1,
+        explanation: "trait bound 要求调用方提供满足特征约束的类型。",
+    },
+    Quiz {
+        prompt: "Rust 的 crate 与 Cargo package 关系最准确的是？",
+        choices: [
+            "一定完全同义",
+            "一个 package 可以提供 lib 和 bin 等多个 crate",
+            "mod 必然自动读取任意子目录",
+        ],
+        correct: 1,
+        explanation: "Cargo package 是发布/构建单位；crate 是编译单位。",
+    },
+    Quiz {
+        prompt: "哪种赋值使源变量仍可用？",
+        choices: [
+            "let b = String::from(\"a\"); let c=b; 使用 b",
+            "let a=1_i32; let b=a; 继续使用 a",
+            "对任意 Vec 使用按值赋值",
+        ],
+        correct: 1,
+        explanation: "i32 实现 Copy，String、Vec 不实现 Copy。",
+    },
+    Quiz {
+        prompt: "为什么同一位置上的活跃 &T 与 &mut T 常会冲突？",
+        choices: [
+            "Rust 不支持读取可变变量",
+            "可变借用要求排他访问",
+            "Java JVM 没有 GC",
+        ],
+        correct: 1,
+        explanation: "共享读与排他写的借用规则在编译时保障内存安全。",
+    },
+    Quiz {
+        prompt: "生命周期注解 'a 能做什么？",
+        choices: [
+            "使局部变量永不被释放",
+            "说明多个引用之间的有效性关系",
+            "自动创建垃圾回收器",
+        ],
+        correct: 1,
+        explanation: "标注描述关系，不会凭空延长所有权的生命周期。",
+    },
+    Quiz {
+        prompt: "Result<T,E> 后的 ? 遇到 Err 时通常怎样处理？",
+        choices: [
+            "直接吞掉错误",
+            "将错误传播到兼容的函数返回类型",
+            "自动重试三次",
+        ],
+        correct: 1,
+        explanation: "? 在失败分支提前返回，并根据 From 等规则转换错误类型。",
+    },
+    Quiz {
+        prompt: "Arc<RefCell<T>> 可以直接保证跨线程共享安全吗？",
+        choices: [
+            "不一定；RefCell 通常不是 Sync",
+            "一定保证",
+            "Arc 会禁止全部修改",
+        ],
+        correct: 0,
+        explanation: "Arc 只解决共享所有权；内部类型必须满足并发安全约束。",
+    },
+    Quiz {
+        prompt: "cargo check 与 cargo test 的主要不同是什么？",
+        choices: [
+            "check 会运行所有单测",
+            "test 实际执行测试代码而 check 通常不执行",
+            "check 自动发布到 crates.io",
+        ],
+        correct: 1,
+        explanation: "执行测试可能产生副作用，需要显式授权。",
+    },
+    Quiz {
+        prompt: "Rust 的宏展开主要发生在什么时候？",
+        choices: ["编译期间", "运行后 JVM 热更新", "操作系统启动时"],
+        correct: 0,
+        explanation: "macro_rules! 与过程宏处理的是编译期语法。",
+    },
+    Quiz {
+        prompt: "Pin<&mut T> 主要表达什么？",
+        choices: [
+            "该指针所指值受到移动约束",
+            "自动运行 Future",
+            "保证一个 T 永不释放",
+        ],
+        correct: 0,
+        explanation: "Pin 约束后续移动，不意味着对象永久存活或 Future 立即执行。",
+    },
+    Quiz {
+        prompt: "unsafe { *ptr } 何时安全？",
+        choices: [
+            "只要能编译就安全",
+            "需要证明指针有效、对齐且访问满足别名等不变量",
+            "unsafe 会自动阻止所有空指针",
+        ],
+        correct: 1,
+        explanation: "unsafe 标记人工证明义务，并不提供运行时自动验证。",
+    },
 ];
 #[cfg(test)]
 mod quiz_tests {

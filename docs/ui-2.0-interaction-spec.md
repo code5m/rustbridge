@@ -75,8 +75,8 @@ The bar may wrap on narrow windows. It must not hide the only way to restore a p
 - Clicking a result activates its existing document tab or asynchronously opens a new one; other tabs and their dirty buffers remain untouched.
 
 ### Learn
-- Show all twelve lessons and completion progress.
-- Selecting a lesson opens Learn mode and resets quiz feedback only for that lesson.
+- Show 24 concepts grouped into six stages, conceptual quiz progress, separate compiler-checked practice progress and per-concept mistakes.
+- Selecting a lesson opens Learn mode and resets only its visible answer selection. Never erase attempts, mistakes, exercise drafts or verified compiler checks.
 - Returning from a concept-linked lesson returns to the prior code mode and selected AST anchor.
 
 ### Tools
@@ -167,3 +167,7 @@ Add shortcuts only when they do not conflict with egui text editing or OS conven
 - Open Learn from a selected symbol; finish a quiz; return to the same code selection.
 - Run Check/Test/Run; verify explicit trust confirmation, diagnostics navigation, output, and cancellation.
 - Switch projects while LSP/Cargo/diagnostics are active; verify stale results are not shown as current.
+
+## 10. Learning system
+
+A stage-specific scratch editor provides two exercises for each of six stages. Compiling explicitly requires a user confirmation and uses Cargo check --all-targets --offline in an isolated temporary no-dependency crate. Error-code explanations are educational only. Practice drafts and progress persist with the session. See docs/learning-path-v1.md.

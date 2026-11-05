@@ -100,3 +100,14 @@ The binding product and architecture decisions are recorded in `docs/ui-2.0-deci
 - Responsive behavior must collapse secondary panels before making code panes unreadable. Keep the minimum window usable and provide visible controls to restore hidden panels.
 - Do not weaken existing safe-save, recovery, CRLF/Unicode, large-file, process-cancellation, or resource guarantees for visual convenience.
 - UI changes require unit/regression tests plus a real desktop visual/interaction check when possible. Headless window survival is not proof of visual usability.
+
+
+## Learning path product and safety contract
+
+- Keep the original twelve lesson indices stable; later lessons are added without invalidating persisted completion data.
+- A quiz answer, a successful compiler check, and demonstrated understanding are separate achievements. Never label compile success as semantic correctness or mastery.
+- Exercise scratch buffers stay separate from real source files and are persisted locally; a user must approve an isolated no-dependency offline Cargo compile check.
+- Parse compiler diagnostic error codes from rustc JSON and attach explanations only for known grounded codes. Unknown errors show the actual compiler text.
+- Never auto-run exercise code, users' project tests, or Cargo build scripts. Do not describe rustc or Cargo as a security sandbox.
+- Ownership visualizations using the fixed example cannot claim arbitrary program semantic analysis. F12 navigation history must preserve actual paths and source coordinates.
+- Learning data must deserialize older sessions with missing fields, and roundtrip across restart. Regression gates in docs/learning-path-v1.md.

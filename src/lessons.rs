@@ -103,6 +103,102 @@ pub const LESSONS: &[Lesson] = &[
         rust_code: "cargo check\ncargo test\ncargo run",
         common_mistake: "Expecting Cargo commands to behave like Maven phases without checking the package and workspace context.",
     },
+    Lesson {
+        java: "Java enum + switch",
+        rust: "enum + match",
+        why: "Rust enum variants can contain typed data; match verifies exhaustiveness.",
+        java_code: "switch (state) { case READY: break; default: break; }",
+        rust_code: "enum State { Ready, Failed(String) }\nfn label(s: State) -> String { match s { State::Ready => \"ok\".into(), State::Failed(reason) => reason } }",
+        common_mistake: "Treating Rust variants as integer constants instead of algebraic data types.",
+    },
+    Lesson {
+        java: "Java generics",
+        rust: "generic + trait bound",
+        why: "Rust generic constraints describe behaviors and can be monomorphized.",
+        java_code: "<T extends Comparable<T>> T max(T a, T b)",
+        rust_code: "fn choose<T: Ord>(a: T, b: T) -> T { if a > b { a } else { b } }",
+        common_mistake: "Assuming Rust generics are always Java type erasure or virtual dispatch.",
+    },
+    Lesson {
+        java: "Java packages",
+        rust: "mod + crate",
+        why: "Modules control names and visibility; Cargo packages may contain multiple crates.",
+        java_code: "package app.user; public class User {}",
+        rust_code: "mod user { pub struct User; }\nfn sample() { let _u = user::User; }",
+        common_mistake: "Assuming a folder always creates a module or pub implies globally public APIs.",
+    },
+    Lesson {
+        java: "Reference assignment",
+        rust: "Move + Copy",
+        why: "Copy types duplicate values; non-Copy ownership can move on assignment.",
+        java_code: "String b = a; // shares object reference",
+        rust_code: "let a = String::from(\"hi\");\nlet b = a; // move; a cannot be used",
+        common_mistake: "Assuming String assignments behave like Java reference copies.",
+    },
+    Lesson {
+        java: "Mutable objects",
+        rust: "&mut + borrow rules",
+        why: "An exclusive mutable reference is verified statically; it is not a Java synchronized lock.",
+        java_code: "list.add(1); // object may be aliased",
+        rust_code: "fn push_one(v: &mut Vec<i32>) { v.push(1); }",
+        common_mistake: "Mixing an active &T with a conflicting &mut T.",
+    },
+    Lesson {
+        java: "Object reachability",
+        rust: "Lifetime + Drop",
+        why: "Reference lifetime describes validity of borrowing, not how long a value lives by itself.",
+        java_code: "String f() { String s=\"x\"; return s; }",
+        rust_code: "fn identity<'a>(s: &'a str) -> &'a str { s }",
+        common_mistake: "Returning a reference to a local value that will be dropped.",
+    },
+    Lesson {
+        java: "Exception propagation",
+        rust: "? operator",
+        why: "The ? operator returns early on Err/None in a compatible return context.",
+        java_code: "try { return load(); } catch(IOException e) { throw e; }",
+        rust_code: "fn read() -> std::io::Result<String> { let text = std::fs::read_to_string(\"x\")?; Ok(text) }",
+        common_mistake: "Adding ? inside a function that cannot return a compatible residual.",
+    },
+    Lesson {
+        java: "Shared references",
+        rust: "Rc / Arc",
+        why: "Reference counting permits shared ownership; Arc is atomic but not automatic interior mutability.",
+        java_code: "List<String> a = object; List<String> b = object;",
+        rust_code: "use std::sync::Arc;\nlet a = Arc::new(vec![1,2]); let b = Arc::clone(&a);",
+        common_mistake: "Assuming Arc<T> automatically makes non-Send/Sync T thread safe.",
+    },
+    Lesson {
+        java: "JUnit / Maven test",
+        rust: "#[test] + cargo test",
+        why: "Rust tests are compiled and run by Cargo on explicit request.",
+        java_code: "@Test public void sum() { assertEquals(3, add(1,2)); }",
+        rust_code: "#[cfg(test)] mod tests { #[test] fn sum() { assert_eq!(1+2,3); } }",
+        common_mistake: "Expecting cargo check to execute tests or macro assertions.",
+    },
+    Lesson {
+        java: "Annotation/reflection",
+        rust: "macro_rules! / proc macro",
+        why: "Rust macros expand at compile time and can operate at syntax level.",
+        java_code: "@Override void handle() {}",
+        rust_code: "macro_rules! greet { ($name:expr) => { println!(\"Hi {}\", $name); } }",
+        common_mistake: "Treating macros as Java runtime reflection or assuming they are safe to auto-execute.",
+    },
+    Lesson {
+        java: "CompletableFuture internals",
+        rust: "Pin + Future",
+        why: "Pin constrains movement through a pointer; many async state machines rely on pinning.",
+        java_code: "CompletableFuture<String> task = fetch();",
+        rust_code: "use std::future::Future;\nfn use_future<F: Future>(_: F) {}",
+        common_mistake: "Assuming Pin guarantees memory allocation, thread safety or that a Future runs automatically.",
+    },
+    Lesson {
+        java: "JNI / native",
+        rust: "unsafe + FFI",
+        why: "unsafe marks obligations the compiler cannot verify; extern APIs need explicit ABI contracts.",
+        java_code: "native int read(int handle);",
+        rust_code: "unsafe extern \"C\" { fn external(value: i32) -> i32; }",
+        common_mistake: "Assuming unsafe disables all borrow checking or makes raw pointers valid.",
+    },
 ];
 
 pub struct ChineseLesson {
@@ -157,5 +253,53 @@ pub const CHINESE_LESSONS: &[ChineseLesson] = &[
     ChineseLesson {
         difference: "Cargo 负责依赖、编译、测试与 workspace 管理，类似 Maven/Gradle，但目标、feature 和执行规则不同。",
         mistake: "不要把 Cargo 命令机械类比为 Maven 生命周期阶段，注意 crate、package、workspace 的区别。",
+    },
+    ChineseLesson {
+        difference: "Rust enum 可携带不同类型的数据，match 必须覆盖所有可能分支；与 Java 8 enum/switch 不能简单等同。",
+        mistake: "不要无条件使用 _ 掩盖遗漏的分支；先理解每个变体中的数据。",
+    },
+    ChineseLesson {
+        difference: "Rust 泛型的 trait bound 是行为约束；编译器常进行单态化，不能直接套用 Java 类型擦除模型。",
+        mistake: "区分静态派发与 dyn Trait；不要假定所有 T 都能直接比较或打印。",
+    },
+    ChineseLesson {
+        difference: "Rust 使用 crate、mod、use 和 pub 管理模块与可见性，crate 与 Cargo package 不是同一个概念。",
+        mistake: "不要直接把 Java package 的目录习惯视为 Rust 模块定义规则。",
+    },
+    ChineseLesson {
+        difference: "Rust 非 Copy 类型的赋值通常转移所有权；i32 等 Copy 类型复制值而不使旧绑定失效。",
+        mistake: "先确认类型是否实现 Copy；不要对所有赋值都机械使用 clone。",
+    },
+    ChineseLesson {
+        difference: "&mut 表示排他可变借用，不是 Java 运行时监视器；编译期限制同一位置上的不兼容访问。",
+        mistake: "用作用域或先复制 Copy 值解决冲突，而不是到处添加 clone。",
+    },
+    ChineseLesson {
+        difference: "Rust 生命周期描述引用必须有效的关系；生命周期注解不会延长堆分配或对象的存活时间。",
+        mistake: "不能从函数返回局部 String 的 &str；必要时返回拥有所有权的 String。",
+    },
+    ChineseLesson {
+        difference: "? 对 Result 的 Err 进行提前返回，对 Option 的 None 也有类似模式；不是抛出 Java Exception。",
+        mistake: "查看函数返回类型，弄清失败是否被传播、转换或局部处理。",
+    },
+    ChineseLesson {
+        difference: "Rc 适合单线程共享，Arc 用原子引用计数支持跨线程共享拥有权；并不自动赋予 T 内部可变性或线程安全。",
+        mistake: "共享可变数据需再考虑 Mutex/RwLock 或其他安全同步机制。",
+    },
+    ChineseLesson {
+        difference: "#[test] 标记测试函数；cargo check 进行静态检查，而 cargo test 会实际执行测试和相关构建脚本。",
+        mistake: "不要把 cargo check 通过视为行为通过，也不要自动执行不可信项目的测试。",
+    },
+    ChineseLesson {
+        difference: "Rust 宏是编译期语法机制；声明宏和过程宏区别明显，不能简单对应 Java 注解或反射。",
+        mistake: "未展开的宏不能推断其真实控制流；构建第三方过程宏前需确认信任。",
+    },
+    ChineseLesson {
+        difference: "Pin 是对指针所指值移动行为的约束，不是永远不移动或自动异步调度；Future 需要被 poll。",
+        mistake: "不要轻易手写 unsafe Pin 投影；先使用标准 async/await 和安全抽象。",
+    },
+    ChineseLesson {
+        difference: "Rust unsafe 允许执行需要人工证明不变量的操作；FFI 要额外确认 ABI、内存布局、线程和生命周期契约。",
+        mistake: "不要为解决普通编译错误滥用 unsafe；优先安全 API 并封装最小的可信边界。",
     },
 ];

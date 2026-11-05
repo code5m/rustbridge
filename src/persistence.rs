@@ -63,6 +63,17 @@ pub struct Session {
     pub lesson: usize,
     pub cursor_byte: usize,
     pub completed_lessons: Vec<bool>,
+    /// Answer attempts (including errors) are locally persisted for targeted review.
+    #[serde(default)]
+    pub quiz_attempts: Vec<u32>,
+    #[serde(default)]
+    pub quiz_mistakes: Vec<u32>,
+    /// Actual Cargo check results for the twelve editable exercises.
+    #[serde(default)]
+    pub practice_passed: Vec<bool>,
+    /// User-authored scratchpad for each exercise; never treated as main project source.
+    #[serde(default)]
+    pub practice_drafts: Vec<String>,
     /// Open tabs in visual order. Old session files deserialize with an empty list.
     #[serde(default)]
     pub documents: Vec<DocumentSession>,
@@ -351,6 +362,21 @@ mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), "recovered");
         fs::remove_dir_all(store.directory()).unwrap();
     }
+    #[test]
+    fn learning_drafts_roundtrip_and_old_sessions_upgrade() {
+        let store = fixture();
+        let old = r#"{"root":null,"file":null,"mode":"java","lesson":2,"cursor_byte":0,"completed_lessons":[true,false]}"#;
+        let mut session: Session = serde_json::from_str(old).unwrap();
+        assert!(session.practice_passed.is_empty() && session.practice_drafts.is_empty());
+        session.quiz_attempts = vec![3];
+        session.quiz_mistakes = vec![2];
+        session.practice_passed = vec![true, false];
+        session.practice_drafts = vec!["let x = 42;".into(), "".into()];
+        store.save_session(&session).unwrap();
+        assert_eq!(store.load_session(), Some(session));
+        fs::remove_dir_all(store.directory()).unwrap();
+    }
+
     #[test]
     fn session_roundtrips_open_documents_and_orphan_journals_are_discoverable() {
         let store = fixture();

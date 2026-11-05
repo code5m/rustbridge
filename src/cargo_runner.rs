@@ -16,6 +16,7 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Check,
+    PracticeCheck,
     Test,
     Run,
 }
@@ -23,6 +24,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Self::Check => "cargo check",
+            Self::PracticeCheck => "cargo check --all-targets --offline",
             Self::Test => "cargo test",
             Self::Run => "cargo run",
         }
@@ -30,6 +32,12 @@ impl Action {
     fn args(self) -> &'static [&'static str] {
         match self {
             Self::Check => &["check", "--message-format=json"],
+            Self::PracticeCheck => &[
+                "check",
+                "--all-targets",
+                "--offline",
+                "--message-format=json",
+            ],
             Self::Test => &["test", "--message-format=json"],
             Self::Run => &["run", "--message-format=json"],
         }
@@ -37,12 +45,14 @@ impl Action {
     fn timeout(self) -> Duration {
         match self {
             Self::Check => Duration::from_secs(180),
+            Self::PracticeCheck => Duration::from_secs(90),
             Self::Test | Self::Run => Duration::from_secs(240),
         }
     }
 }
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
+    pub code: Option<String>,
     pub level: String,
     pub message: String,
     pub path: PathBuf,
@@ -76,6 +86,11 @@ fn parse_compiler_message(line: &str, root: &Path) -> Option<Diagnostic> {
         root.join(path)
     };
     Some(Diagnostic {
+        code: diagnostic
+            .get("code")
+            .and_then(|code| code.get("code"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         level: diagnostic
             .get("level")
             .and_then(Value::as_str)
@@ -302,6 +317,7 @@ mod tests {
         assert_eq!(result.line, 12);
         assert_eq!(result.column, 8);
         assert_eq!(result.level, "error");
+        assert_eq!(result.code, None);
         assert!(
             parse_compiler_message(r#"{"reason":"build-finished"}"#, Path::new("/opt")).is_none()
         );
@@ -447,6 +463,15 @@ pub fn add(a:u32,b:u32)->u32{a+b}
     fn correct_command_and_timeout_configuration() {
         assert_eq!(Action::Check.args(), ["check", "--message-format=json"]);
         assert_eq!(Action::Test.args(), ["test", "--message-format=json"]);
+        assert_eq!(
+            Action::PracticeCheck.args(),
+            [
+                "check",
+                "--all-targets",
+                "--offline",
+                "--message-format=json"
+            ]
+        );
         assert_eq!(Action::Run.args(), ["run", "--message-format=json"]);
         assert!(Action::Run.timeout() > Action::Check.timeout());
     }

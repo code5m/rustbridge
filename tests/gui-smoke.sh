@@ -88,21 +88,22 @@ if [[ -z "$WIN" ]]; then
   echo "PAGED_GUI_WINDOW_TIMEOUT"; cat "$ROOT/large.log"; exit 1
 fi
 kill -0 "$APP"
-# Window creation can precede the first completed egui frame or async source load.
-sleep 2
+# Large files require the async open/projection to settle before toggling modes.
+sleep 5
 focus_viewable_window "$WIN"
-xdotool key ctrl+2
-sleep 1
-xdotool key ctrl+Next
-xdotool keyup Control_L Control_R 2>/dev/null || true
-sleep 1
-# Continue beyond the first virtual window with real wheel events; the editor
-# must rebase its bounded page while preserving absolute source coordinates.
-xdotool mousemove --sync 600 145
-xdotool click --repeat 35 --delay 45 5
-sleep 1
-xdotool mousemove --sync 342 163 click 1
-xdotool key End
+xdotool key --clearmodifiers ctrl+2
+sleep 2
+# Focus the real Rust editing widget before invoking its paged navigation.
+# Ctrl+Next moves by half a 240-line page; repeated presses prove movement
+# beyond the first page rather than relying on fragile scroll positions.
+xdotool mousemove --sync 390 350 click 1
+for attempt in 1 2 3 4 5; do
+  xdotool key --clearmodifiers ctrl+Next
+  sleep 0.4
+done
+# Recheck the current mode without toggling it; use the editor's position.
+xdotool mousemove --sync 400 350 click 1
+xdotool key --clearmodifiers End
 xdotool type --clearmodifiers --delay 12 ' // SMOKE_PAGED'
 sleep 1
 xdotool key --clearmodifiers ctrl+s
@@ -123,7 +124,7 @@ if ! grep -q SMOKE_PAGED "$ROOT/large.rs"; then
 fi
 if ! grep -q SMOKE_PAGED "$ROOT/large.rs"; then
   echo "LARGE_SHORTCUT_UNDELIVERED_VERIFY_SAVE_BUTTON"
-  xdotool mousemove --sync 405 70 click 1
+  xdotool mousemove --sync 271 13 click 1
   for i in $(seq 1 25); do
     if grep -q SMOKE_PAGED "$ROOT/large.rs"; then break; fi
     sleep 0.2

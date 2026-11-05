@@ -1,5 +1,8 @@
 //! RustBridge UI 2.0 workbench shell and navigation.
-use super::{App, BottomTab, Mode, SidebarSection, cargo_runner, lessons, parser, symbol_search};
+use super::{
+    App, BottomTab, Mode, SidebarSection, cargo_runner, learning_path, lessons, parser,
+    symbol_search,
+};
 use eframe::egui::{self, Color32};
 
 impl App {
@@ -32,6 +35,15 @@ impl App {
                 );
                 if save.clicked() {
                     self.save();
+                }
+                if ui
+                    .add_enabled(
+                        !self.navigation_back.is_empty(),
+                        egui::Button::new("返回定义前 · Alt+←"),
+                    )
+                    .clicked()
+                {
+                    self.navigate_back();
                 }
                 if self.documents.dirty_count() > 0
                     && (!self.dirty || self.documents.dirty_count() > 1)
@@ -461,28 +473,54 @@ impl App {
     }
 
     fn learn_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Java 8 → Rust 学习");
+        ui.heading("Java → Rust 六阶段学习");
         let completed = self.completed_lessons.iter().filter(|&&done| done).count();
+        let practice_done = self.practice_passed.iter().filter(|&&done| done).count();
         ui.label(format!(
-            "已掌握 {completed}/{} 个核心概念",
-            lessons::LESSONS.len()
+            "知识测验 {completed}/{} · 真实编译练习 {practice_done}/{}",
+            lessons::LESSONS.len(),
+            learning_path::EXERCISES.len()
         ));
+        ui.small("测验答对不代表已经独立掌握；真实练习和重复错误单独统计。");
         ui.separator();
-        for (index, lesson) in lessons::LESSONS.iter().enumerate() {
-            let done = self.completed_lessons.get(index) == Some(&true);
-            let label = format!(
-                "{} {:02} · {} → {}",
-                if done { "✓" } else { "○" },
-                index + 1,
-                lesson.java,
-                lesson.rust
-            );
-            if ui.selectable_label(self.lesson == index, label).clicked() {
-                self.lesson = index;
-                self.quiz_choice = None;
-                self.lesson_return = None;
-                self.mode = Mode::Learn;
-            }
+        for (stage_idx, stage) in learning_path::STAGES.iter().enumerate() {
+            let done = stage
+                .lesson_indices
+                .iter()
+                .filter(|&&index| self.completed_lessons.get(index) == Some(&true))
+                .count();
+            egui::CollapsingHeader::new(format!(
+                "{} · {done}/{}",
+                stage.name,
+                stage.lesson_indices.len()
+            ))
+            .id_salt(("learning_stage", stage_idx))
+            .default_open(stage_idx == learning_path::stage_for_lesson(self.lesson))
+            .show(ui, |ui| {
+                ui.small(stage.objective);
+                for &index in stage.lesson_indices {
+                    let lesson = &lessons::LESSONS[index];
+                    let done = self.completed_lessons.get(index) == Some(&true);
+                    let errors = self.quiz_mistakes.get(index).copied().unwrap_or(0);
+                    let label = format!(
+                        "{} {} → {}{}",
+                        if done { "✓" } else { "○" },
+                        lesson.java,
+                        lesson.rust,
+                        if errors > 0 {
+                            format!(" · 答错 {errors}")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    if ui.selectable_label(self.lesson == index, label).clicked() {
+                        self.lesson = index;
+                        self.quiz_choice = None;
+                        self.lesson_return = None;
+                        self.mode = Mode::Learn;
+                    }
+                }
+            });
         }
     }
 
@@ -592,7 +630,24 @@ impl App {
                                 .on_hover_text(diagnostic.path.display().to_string())
                                 .clicked()
                             {
-                                self.jump_to_cargo_diagnostic(diagnostic);
+                                self.jump_to_cargo_diagnostic(diagnostic.clone());
+                            }
+                            if let Some((code, advice)) =
+                                diagnostic.code.as_deref().and_then(|code| {
+                                    learning_path::explain_error(code).map(|advice| (code, advice))
+                                })
+                            {
+                                ui.collapsing(format!("{} · {}", code, advice.plain), |ui| {
+                                    ui.strong("Java 心智模型");
+                                    ui.label(advice.java);
+                                    ui.strong("Rust 原因");
+                                    ui.label(advice.rust);
+                                    ui.strong("正确修复方向");
+                                    ui.label(advice.remedy);
+                                    ui.small(
+                                        "这是教学建议，仍需根据真实上下文编译验证，不能机械套用。",
+                                    );
+                                });
                             }
                         }
                     });

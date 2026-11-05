@@ -33,7 +33,7 @@ The application shell has five regions:
 - **Project:** real directory tree, project root, recent files, and excluded-directory visibility. Never invent or flatten filesystem paths.
 - **Structure:** AST-backed declarations and concepts from the current real Rust file. Do not claim unresolved symbols are semantically resolved.
 - **Search:** real Rust file search and explicitly labeled same-name AST declaration candidates.
-- **Learn:** the twelve Java 8 → Rust lessons, completion state, and direct entry to the teaching workspace.
+- **Learn:** the 24 Java 8 → Rust lessons grouped into six stages, completion state, and direct entry to the teaching workspace.
 - **Tools:** rust-analyzer status and manual start/stop override, plus explicitly opt-in diagnostics. LSP starts lazily on entry to the real Rust editor in a Cargo project; advanced tools remain discoverable without being mixed into Project.
 
 Cargo Check/Test/Run actions belong to the bottom Build/Run tool windows, not the Project tree.

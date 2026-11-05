@@ -9,6 +9,7 @@ mod editor_ui;
 mod file_search_worker;
 mod file_tree;
 mod file_watch;
+mod learning_path;
 mod lesson_quiz;
 mod lessons;
 mod line_index;
@@ -136,6 +137,19 @@ struct App {
     editor_page_target: usize,
     editor_scroll_override: Option<f32>,
     lesson_return: Option<(Mode, Option<usize>)>,
+    quiz_attempts: Vec<u32>,
+    quiz_mistakes: Vec<u32>,
+    practice_passed: Vec<bool>,
+    practice_drafts: Vec<String>,
+    practice_selected_stage: Option<usize>,
+    practice_index: usize,
+    practice_code: String,
+    practice_confirm: bool,
+    practice_task: Option<learning_path::PracticeTask>,
+    practice_status: String,
+    practice_diagnostics: Vec<cargo_runner::Diagnostic>,
+    practice_log: Vec<String>,
+    ownership_step: usize,
     analyzer_status: String,
     analyzer_check: Option<std::sync::mpsc::Receiver<String>>,
     analyzer_diagnostics: Option<analyzer::DiagnosticTask>,
@@ -164,6 +178,7 @@ struct App {
     lsp_hover: String,
     lsp_completions: Vec<lsp::Completion>,
     lsp_definitions: Vec<lsp::Location>,
+    navigation_back: Vec<(PathBuf, lsp::SpanPosition)>,
     lsp_target: Option<(PathBuf, lsp::SpanPosition)>,
     editor_focused: bool,
     completion_due: Option<std::time::Instant>,
@@ -259,6 +274,19 @@ impl Default for App {
             editor_page_target: 1,
             editor_scroll_override: None,
             lesson_return: None,
+            quiz_attempts: vec![0; lessons::LESSONS.len()],
+            quiz_mistakes: vec![0; lessons::LESSONS.len()],
+            practice_passed: vec![false; learning_path::EXERCISES.len()],
+            practice_drafts: vec![String::new(); learning_path::EXERCISES.len()],
+            practice_selected_stage: None,
+            practice_index: 0,
+            practice_code: String::new(),
+            practice_confirm: false,
+            practice_task: None,
+            practice_status: String::new(),
+            practice_diagnostics: Vec::new(),
+            practice_log: Vec::new(),
+            ownership_step: 0,
             analyzer_status: "Not checked; core reading does not require rust-analyzer.".into(),
             analyzer_check: None,
             analyzer_diagnostics: None,
@@ -288,6 +316,7 @@ impl Default for App {
             lsp_hover: String::new(),
             lsp_completions: Vec::new(),
             lsp_definitions: Vec::new(),
+            navigation_back: Vec::new(),
             lsp_target: None,
             editor_focused: false,
             completion_due: None,
@@ -429,6 +458,18 @@ impl App {
         if let Some(session) = store.load_session() {
             self.lesson = session.lesson.min(lessons::LESSONS.len().saturating_sub(1));
             self.completed_lessons = normalized_completion(&session.completed_lessons);
+            self.quiz_attempts = (0..lessons::LESSONS.len())
+                .map(|i| session.quiz_attempts.get(i).copied().unwrap_or(0))
+                .collect();
+            self.quiz_mistakes = (0..lessons::LESSONS.len())
+                .map(|i| session.quiz_mistakes.get(i).copied().unwrap_or(0))
+                .collect();
+            self.practice_passed = (0..learning_path::EXERCISES.len())
+                .map(|i| session.practice_passed.get(i).copied().unwrap_or(false))
+                .collect();
+            self.practice_drafts = (0..learning_path::EXERCISES.len())
+                .map(|i| session.practice_drafts.get(i).cloned().unwrap_or_default())
+                .collect();
             self.cursor_byte = session.cursor_byte;
             self.recovered_mode = Some(mode_from_name(&session.mode));
             if restore_last_document {
@@ -559,6 +600,21 @@ impl App {
             lesson: self.lesson,
             cursor_byte: active_state.map_or(self.cursor_byte, |document| document.cursor_byte),
             completed_lessons: self.completed_lessons.clone(),
+            quiz_attempts: self.quiz_attempts.clone(),
+            quiz_mistakes: self.quiz_mistakes.clone(),
+            practice_passed: self.practice_passed.clone(),
+            practice_drafts: self
+                .practice_drafts
+                .iter()
+                .enumerate()
+                .map(|(i, draft)| {
+                    if self.practice_selected_stage.is_some() && i == self.practice_index {
+                        self.practice_code.chars().take(64 * 1024).collect()
+                    } else {
+                        draft.clone()
+                    }
+                })
+                .collect(),
             documents,
         }
     }
@@ -835,6 +891,37 @@ impl App {
     }
 
     fn jump_lsp_definition(&mut self, location: lsp::Location) {
+        if let Some(from) = self.file.clone() {
+            let from_pos = lsp::position_for_byte(&self.rust, self.cursor_byte);
+            let target = lsp::SpanPosition {
+                line: location.line,
+                character: location.character,
+            };
+            if !same_document_path(&from, &location.path)
+                || from_pos.line != target.line
+                || from_pos.character != target.character
+            {
+                self.navigation_back.push((from, from_pos));
+                if self.navigation_back.len() > 100 {
+                    self.navigation_back.remove(0);
+                }
+            }
+        }
+        self.go_to_lsp_location(location);
+    }
+
+    fn navigate_back(&mut self) {
+        let Some((path, position)) = self.navigation_back.pop() else {
+            return;
+        };
+        self.go_to_lsp_location(lsp::Location {
+            path,
+            line: position.line,
+            character: position.character,
+        });
+    }
+
+    fn go_to_lsp_location(&mut self, location: lsp::Location) {
         let position = lsp::SpanPosition {
             line: location.line,
             character: location.character,
@@ -864,7 +951,9 @@ impl App {
         self.show_bottom_panel = true;
         self.bottom_tab = match action {
             cargo_runner::Action::Run => BottomTab::Run,
-            cargo_runner::Action::Check | cargo_runner::Action::Test => BottomTab::Build,
+            cargo_runner::Action::Check
+            | cargo_runner::Action::PracticeCheck
+            | cargo_runner::Action::Test => BottomTab::Build,
         };
         let Some(root) = self.root.clone() else {
             return;
@@ -1040,6 +1129,7 @@ impl App {
         self.lsp_hover.clear();
         self.lsp_completions.clear();
         self.lsp_definitions.clear();
+        self.navigation_back.clear();
         self.lsp_target = None;
         self.hover_target = None;
         self.hover_due = None;
@@ -2042,6 +2132,12 @@ impl App {
     }
 
     fn lessons(&mut self, ui: &mut egui::Ui) {
+        let stage = learning_path::stage_for_lesson(self.lesson);
+        ui.small(format!(
+            "{} · {}",
+            learning_path::STAGES[stage].name,
+            learning_path::STAGES[stage].objective
+        ));
         let lesson = &lessons::LESSONS[self.lesson];
         let chinese = &lessons::CHINESE_LESSONS[self.lesson];
         ui.heading(format!(
@@ -2078,6 +2174,14 @@ impl App {
                 )
                 .clicked()
             {
+                if self.quiz_choice != Some(index) {
+                    self.quiz_attempts[self.lesson] =
+                        self.quiz_attempts[self.lesson].saturating_add(1);
+                    if index != quiz.correct {
+                        self.quiz_mistakes[self.lesson] =
+                            self.quiz_mistakes[self.lesson].saturating_add(1);
+                    }
+                }
                 self.quiz_choice = Some(index);
                 if index == quiz.correct {
                     self.completed_lessons[self.lesson] = true;
@@ -2102,9 +2206,17 @@ impl App {
         }
         let completed = self.completed_lessons.iter().filter(|&&done| done).count();
         ui.small(format!(
-            "已掌握 {completed}/{} 个核心概念",
+            "已完成 {completed}/{} 个知识测验（不是实战掌握证明）",
             lessons::LESSONS.len()
         ));
+        let mistakes = self.quiz_mistakes[self.lesson];
+        let attempts = self.quiz_attempts[self.lesson];
+        if attempts > 0 {
+            ui.small(format!(
+                "本知识点答题 {attempts} 次，其中答错 {mistakes} 次；答错题建议继续练习。"
+            ));
+        }
+        self.render_practice(ui);
         ui.separator();
         ui.horizontal(|ui| {
             if let Some((mode, anchor)) = self.lesson_return
@@ -2330,6 +2442,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_document_io(ctx);
         self.poll_cargo();
+        self.poll_practice();
         self.poll_lsp();
         // Watch real disk metadata off the event thread. Idle windows do not
         // repeatedly repaint just to poll file stamps.
@@ -2416,6 +2529,7 @@ impl eframe::App for App {
         }
         if self.lsp_task.as_ref().is_some_and(|_| !self.lsp_ready)
             || self.cargo_task.is_some()
+            || self.practice_task.is_some()
             || self.opening.is_some()
             || self.saving.is_some()
             || self.symbol_pending
@@ -2690,45 +2804,55 @@ impl eframe::App for App {
         }
         // Capture Ctrl+S before TextEdit can consume the event, but only save
         // AFTER the editor has applied all changes from this frame.
-        let (save_shortcut, mode_shortcut, page_delta, close_tab_shortcut, document_cycle) = ctx
-            .input(|i| {
-                let mod_pressed = i.modifiers.ctrl || i.modifiers.command;
-                let requested_mode = if !mod_pressed {
-                    None
-                } else if i.key_pressed(egui::Key::Num1) {
-                    Some(Mode::Java)
-                } else if i.key_pressed(egui::Key::Num2) {
-                    Some(Mode::Rust)
-                } else if i.key_pressed(egui::Key::Num3) {
-                    Some(Mode::Compare)
-                } else if i.key_pressed(egui::Key::Num4) {
-                    Some(Mode::Learn)
-                } else {
-                    None
-                };
-                let page_delta = if !mod_pressed {
-                    0_i32
-                } else if i.key_pressed(egui::Key::PageDown) {
-                    1
-                } else if i.key_pressed(egui::Key::PageUp) {
-                    -1
-                } else {
-                    0
-                };
-                let close_tab = mod_pressed && i.key_pressed(egui::Key::W);
-                let cycle = if mod_pressed && i.key_pressed(egui::Key::Tab) {
-                    Some(if i.modifiers.shift { -1 } else { 1 })
-                } else {
-                    None
-                };
-                (
-                    mod_pressed && i.key_pressed(egui::Key::S),
-                    requested_mode,
-                    page_delta,
-                    close_tab,
-                    cycle,
-                )
-            });
+        let (
+            save_shortcut,
+            mode_shortcut,
+            page_delta,
+            close_tab_shortcut,
+            document_cycle,
+            back_shortcut,
+        ) = ctx.input(|i| {
+            let mod_pressed = i.modifiers.ctrl || i.modifiers.command;
+            let requested_mode = if !mod_pressed {
+                None
+            } else if i.key_pressed(egui::Key::Num1) {
+                Some(Mode::Java)
+            } else if i.key_pressed(egui::Key::Num2) {
+                Some(Mode::Rust)
+            } else if i.key_pressed(egui::Key::Num3) {
+                Some(Mode::Compare)
+            } else if i.key_pressed(egui::Key::Num4) {
+                Some(Mode::Learn)
+            } else {
+                None
+            };
+            let page_delta = if !mod_pressed {
+                0_i32
+            } else if i.key_pressed(egui::Key::PageDown) {
+                1
+            } else if i.key_pressed(egui::Key::PageUp) {
+                -1
+            } else {
+                0
+            };
+            let close_tab = mod_pressed && i.key_pressed(egui::Key::W);
+            let cycle = if mod_pressed && i.key_pressed(egui::Key::Tab) {
+                Some(if i.modifiers.shift { -1 } else { 1 })
+            } else {
+                None
+            };
+            (
+                mod_pressed && i.key_pressed(egui::Key::S),
+                requested_mode,
+                page_delta,
+                close_tab,
+                cycle,
+                i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft),
+            )
+        });
+        if back_shortcut {
+            self.navigate_back();
+        }
         if let Some(mode) = mode_shortcut {
             self.mode = mode;
             self.last_scroll = None;
@@ -2931,6 +3055,7 @@ mod file_tests {
                 cursor_byte: 3,
                 mode: "compare".into(),
             }],
+            ..persistence::Session::default()
         };
         store.save_session(&session).unwrap();
         let mut app = App::default();
