@@ -1,4 +1,5 @@
-//! Explicitly opt-in rust-analyzer Language Server Protocol client.
+//! Lazily started rust-analyzer Language Server Protocol client.
+//! The UI starts it only when a real Rust editor in a Cargo project is entered.
 //! Server lifecycle, JSON-RPC framing, utf16 coordinates, didOpen/didChange,
 //! hover, completion, definition, timeouts and cancellation remain separate from UI.
 //! It never applies workspace edits and disables build scripts/proc macros.
@@ -55,6 +56,7 @@ pub struct Location {
 pub struct Completion {
     pub label: String,
     pub text: String,
+    pub is_snippet: bool,
     pub start: Option<SpanPosition>,
     pub end: Option<SpanPosition>,
 }
@@ -63,15 +65,24 @@ pub enum Event {
     Ready,
     Status(String),
     Hover {
+        path: PathBuf,
         revision: u64,
+        line: u32,
+        character: u32,
         text: String,
     },
     Completion {
+        path: PathBuf,
         revision: u64,
+        line: u32,
+        character: u32,
         items: Vec<Completion>,
     },
     Definition {
+        path: PathBuf,
         revision: u64,
+        line: u32,
+        character: u32,
         locations: Vec<Location>,
     },
 }
@@ -87,10 +98,14 @@ enum Request {
         version: u64,
     },
     Query {
+        path: PathBuf,
         kind: Kind,
         revision: u64,
         line: u32,
         character: u32,
+    },
+    Close {
+        path: PathBuf,
     },
     Stop,
 }
@@ -135,13 +150,17 @@ impl LspTask {
             version,
         });
     }
-    pub fn query(&self, kind: Kind, revision: u64, line: u32, character: u32) {
+    pub fn query(&self, path: PathBuf, kind: Kind, revision: u64, line: u32, character: u32) {
         let _ = self.tx.send(Request::Query {
+            path,
             kind,
             revision,
             line,
             character,
         });
+    }
+    pub fn close(&self, path: PathBuf) {
+        let _ = self.tx.send(Request::Close { path });
     }
     pub fn poll(&self) -> Vec<Event> {
         let mut events = Vec::new();
@@ -298,9 +317,9 @@ fn request_body(kind: Kind, id: u64, uri: &str, line: u32, character: u32) -> Va
 fn issue_request(
     writer: &mut ChildStdin,
     command: Request,
-    active: &mut Option<(PathBuf, String, u64)>,
+    opened: &mut HashMap<PathBuf, (String, u64)>,
     next_id: &mut u64,
-    pending: &mut HashMap<u64, (Kind, u64, Instant)>,
+    pending: &mut HashMap<u64, (Kind, PathBuf, u64, u32, u32, Instant)>,
 ) -> io::Result<()> {
     match command {
         Request::Open {
@@ -308,59 +327,91 @@ fn issue_request(
             source,
             version,
         } => {
-            if let Some((old, _, _)) = active.as_ref()
-                && let Some(uri) = file_uri(old)
-            {
+            let uri = file_uri(&path).ok_or_else(|| io::Error::other("Invalid Rust file path"))?;
+            if let Some((_, last_version)) = opened.get(&path) {
+                if version > *last_version {
+                    send_message(
+                        writer,
+                        &json!({"jsonrpc":"2.0","method":"textDocument/didChange",
+                            "params":{"textDocument":{"uri":uri,"version":version},
+                                "contentChanges":[{"text":source}]}}),
+                    )?;
+                    opened.insert(path, (uri, version));
+                }
+            } else {
                 send_message(
                     writer,
-                    &json!({"jsonrpc":"2.0","method":"textDocument/didClose",
-                    "params":{"textDocument":{"uri":uri}}}),
+                    &json!({"jsonrpc":"2.0","method":"textDocument/didOpen",
+                    "params":{"textDocument":{"uri":uri,"languageId":"rust",
+                        "version":version,"text":source}}}),
                 )?;
+                opened.insert(path, (uri, version));
             }
-            let uri = file_uri(&path).ok_or_else(|| io::Error::other("Invalid Rust file path"))?;
-            send_message(
-                writer,
-                &json!({"jsonrpc":"2.0","method":"textDocument/didOpen",
-                "params":{"textDocument":{"uri":uri,"languageId":"rust",
-                    "version":version,"text":source}}}),
-            )?;
-            *active = Some((path, uri, version));
         }
         Request::Change {
             path,
             source,
             version,
         } => {
-            if let Some((active_path, uri, last_version)) = active.as_mut()
-                && *active_path == path
-                && version > *last_version
-            {
+            let uri = file_uri(&path).ok_or_else(|| io::Error::other("Invalid Rust file path"))?;
+            if let Some((_, last_version)) = opened.get(&path) {
+                if version > *last_version {
+                    send_message(
+                        writer,
+                        &json!({"jsonrpc":"2.0","method":"textDocument/didChange",
+                            "params":{"textDocument":{"uri":uri,"version":version},
+                                "contentChanges":[{"text":source}]}}),
+                    )?;
+                    opened.insert(path, (uri, version));
+                }
+            } else {
                 send_message(
                     writer,
-                    &json!({"jsonrpc":"2.0","method":"textDocument/didChange",
-                        "params":{"textDocument":{"uri":uri,"version":version},
-                            "contentChanges":[{"text":source}]}}),
+                    &json!({"jsonrpc":"2.0","method":"textDocument/didOpen",
+                    "params":{"textDocument":{"uri":uri,"languageId":"rust",
+                        "version":version,"text":source}}}),
                 )?;
-                *last_version = version;
+                opened.insert(path, (uri, version));
+            }
+        }
+        Request::Close { path } => {
+            if let Some((uri, _)) = opened.remove(&path) {
+                send_message(
+                    writer,
+                    &json!({"jsonrpc":"2.0","method":"textDocument/didClose",
+                    "params":{"textDocument":{"uri":uri}}}),
+                )?;
             }
         }
         Request::Query {
+            path,
             kind,
             revision,
             line,
             character,
         } => {
-            if let Some((_, uri, _)) = active.as_ref() {
+            if let Some((uri, _)) = opened.get(&path) {
                 let id = *next_id;
                 *next_id += 1;
                 send_message(writer, &request_body(kind, id, uri, line, character))?;
-                pending.insert(id, (kind, revision, Instant::now() + QUERY_TIMEOUT));
+                pending.insert(
+                    id,
+                    (
+                        kind,
+                        path,
+                        revision,
+                        line,
+                        character,
+                        Instant::now() + QUERY_TIMEOUT,
+                    ),
+                );
             }
         }
         Request::Stop => {}
     }
     Ok(())
 }
+
 fn parse_hover(result: &Value) -> String {
     let contents = result.get("contents").unwrap_or(result);
     if let Some(value) = contents.as_str() {
@@ -373,7 +424,7 @@ fn parse_hover(result: &Value) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     } else {
-        "未找到悬浮类型信息".into()
+        String::new()
     }
 }
 fn as_position(value: &Value) -> Option<SpanPosition> {
@@ -405,6 +456,7 @@ fn parse_completions(result: &Value) -> Vec<Completion> {
                     .or_else(|| item.get("insertText").and_then(Value::as_str))
                     .unwrap_or(&label)
                     .to_string(),
+                is_snippet: item.get("insertTextFormat").and_then(Value::as_u64) == Some(2),
                 label,
                 start: range
                     .and_then(|range| range.get("start"))
@@ -416,6 +468,82 @@ fn parse_completions(result: &Value) -> Vec<Completion> {
         })
         .collect()
 }
+/// Expand the common LSP snippet subset without interpreting arbitrary variables.
+/// Tab stops are removed, placeholder defaults are retained, and choice lists use
+/// their first option. This keeps completion insertion safe and deterministic.
+pub fn expand_snippet(input: &str) -> String {
+    fn expand(input: &str, depth: usize) -> String {
+        if depth > 8 {
+            return String::new();
+        }
+        let chars: Vec<char> = input.chars().collect();
+        let mut output = String::new();
+        let mut index = 0;
+        while index < chars.len() {
+            if chars[index] == '\\'
+                && index + 1 < chars.len()
+                && matches!(chars[index + 1], '$' | '\\' | '}')
+            {
+                output.push(chars[index + 1]);
+                index += 2;
+                continue;
+            }
+            if chars[index] != '$' || index + 1 >= chars.len() {
+                output.push(chars[index]);
+                index += 1;
+                continue;
+            }
+            if chars[index + 1].is_ascii_digit() {
+                index += 2;
+                while index < chars.len() && chars[index].is_ascii_digit() {
+                    index += 1;
+                }
+                continue;
+            }
+            if chars[index + 1] != '{' {
+                output.push('$');
+                index += 1;
+                continue;
+            }
+
+            let mut end = index + 2;
+            let mut nesting = 1_usize;
+            while end < chars.len() && nesting > 0 {
+                match chars[end] {
+                    '{' => nesting += 1,
+                    '}' => nesting -= 1,
+                    _ => {}
+                }
+                end += 1;
+            }
+            if nesting != 0 {
+                output.push('$');
+                index += 1;
+                continue;
+            }
+            let body: String = chars[index + 2..end - 1].iter().collect();
+            let replacement = if let Some((_, default)) = body.split_once(':') {
+                expand(default, depth + 1)
+            } else if let Some((_, choices)) = body.split_once('|') {
+                choices
+                    .split('|')
+                    .next()
+                    .unwrap_or_default()
+                    .split(',')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            } else {
+                String::new()
+            };
+            output.push_str(&replacement);
+            index = end;
+        }
+        output
+    }
+    expand(input, 0)
+}
+
 fn parse_locations(result: &Value) -> Vec<Location> {
     let elements = if let Some(items) = result.as_array() {
         items.clone()
@@ -506,9 +634,9 @@ fn run_server(
     let deadline = Instant::now() + SERVER_TIMEOUT;
     let mut ready = false;
     let mut queued = VecDeque::new();
-    let mut active: Option<(PathBuf, String, u64)> = None;
+    let mut opened = HashMap::<PathBuf, (String, u64)>::new();
     let mut next_id = 2;
-    let mut pending = HashMap::<u64, (Kind, u64, Instant)>::new();
+    let mut pending = HashMap::<u64, (Kind, PathBuf, u64, u32, u32, Instant)>::new();
     while !stop.load(Ordering::Acquire) {
         if !ready && Instant::now() > deadline {
             let _ = events.send(Event::Status("rust-analyzer 初始化超过 45 秒。".into()));
@@ -523,7 +651,7 @@ fn run_server(
                 if let Err(error) = issue_request(
                     &mut writer,
                     command,
-                    &mut active,
+                    &mut opened,
                     &mut next_id,
                     &mut pending,
                 ) {
@@ -532,14 +660,15 @@ fn run_server(
                     break;
                 }
             } else {
-                // Keep the newest document, retain query ordering after initialization.
-                if matches!(command, Request::Open { .. }) {
-                    queued.retain(|q| !matches!(q, Request::Open { .. } | Request::Change { .. }));
+                // Preserve every opened document and its latest queued edit while the
+                // server initializes. The bounded queue prevents unbounded UI input.
+                if queued.len() >= 512 {
+                    queued.pop_front();
                 }
                 queued.push_back(command);
             }
         }
-        for (id, (_, _, deadline)) in &pending {
+        for (id, (_, _, _, _, _, deadline)) in &pending {
             if Instant::now() > *deadline {
                 let _ = send_message(
                     &mut writer,
@@ -547,7 +676,7 @@ fn run_server(
                 );
             }
         }
-        pending.retain(|_, (_, _, deadline)| Instant::now() <= *deadline);
+        pending.retain(|_, (_, _, _, _, _, deadline)| Instant::now() <= *deadline);
         match server_rx.recv_timeout(Duration::from_millis(60)) {
             Ok(Ok(message)) => {
                 if let Some(id) = message.get("id").and_then(Value::as_u64) {
@@ -571,7 +700,7 @@ fn run_server(
                             if issue_request(
                                 &mut writer,
                                 command,
-                                &mut active,
+                                &mut opened,
                                 &mut next_id,
                                 &mut pending,
                             )
@@ -580,19 +709,30 @@ fn run_server(
                                 break;
                             }
                         }
-                    } else if let Some((kind, revision, _)) = pending.remove(&id) {
+                    } else if let Some((kind, path, revision, line, character, _)) =
+                        pending.remove(&id)
+                    {
                         let result = message.get("result").unwrap_or(&Value::Null);
                         let event = match kind {
                             Kind::Hover => Event::Hover {
+                                path,
                                 revision,
+                                line,
+                                character,
                                 text: parse_hover(result),
                             },
                             Kind::Completion => Event::Completion {
+                                path,
                                 revision,
+                                line,
+                                character,
                                 items: parse_completions(result),
                             },
                             Kind::Definition => Event::Definition {
+                                path,
                                 revision,
+                                line,
+                                character,
                                 locations: parse_locations(result),
                             },
                         };
@@ -746,9 +886,10 @@ mod tests {
         let mut completion = false;
         while Instant::now() < query_deadline && !(definitions && hover && completion) {
             if Instant::now() >= next_query {
-                task.query(Kind::Definition, 1, pos.line, pos.character);
-                task.query(Kind::Hover, 1, pos.line, pos.character);
+                task.query(path.clone(), Kind::Definition, 1, pos.line, pos.character);
+                task.query(path.clone(), Kind::Hover, 1, pos.line, pos.character);
                 task.query(
+                    path.clone(),
                     Kind::Completion,
                     1,
                     completion_pos.line,
@@ -801,6 +942,19 @@ mod tests {
         assert!(completion, "real LSP must provide completion items");
         drop(task);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snippet_expansion_keeps_defaults_and_first_choice_but_removes_tabstops() {
+        assert_eq!(
+            expand_snippet(concat!("println!(", "$", "{1:value})$0")),
+            "println!(value)"
+        );
+        assert_eq!(expand_snippet(concat!("$", "{1|String,u32|}")), "String");
+        assert_eq!(
+            expand_snippet(concat!("let \\$name = ", "$", "{1:42};$0")),
+            "let $name = 42;"
+        );
     }
 
     #[test]

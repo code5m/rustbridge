@@ -48,13 +48,24 @@ fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
 const MAX_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DocumentSession {
+    pub path: PathBuf,
+    pub cursor_byte: usize,
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Session {
     pub root: Option<PathBuf>,
+    /// Active document for backward compatibility with pre-UI-2.1 sessions.
     pub file: Option<PathBuf>,
     pub mode: String,
     pub lesson: usize,
     pub cursor_byte: usize,
     pub completed_lessons: Vec<bool>,
+    /// Open tabs in visual order. Old session files deserialize with an empty list.
+    #[serde(default)]
+    pub documents: Vec<DocumentSession>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -129,6 +140,34 @@ impl Store {
         } else {
             None
         }
+    }
+
+    /// Load every valid journal whose source still exists. This also recovers
+    /// tabs if a crash happened before the latest session tab list was flushed.
+    pub fn load_all_journals(&self) -> Vec<Journal> {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_name()?.to_string_lossy();
+                if !name.starts_with("recover-") || !name.ends_with(".json") {
+                    return None;
+                }
+                let metadata = entry.metadata().ok()?;
+                if metadata.len() as usize > MAX_JOURNAL_BYTES {
+                    return None;
+                }
+                let bytes = fs::read(&path).ok()?;
+                let journal: Journal = serde_json::from_slice(&bytes).ok()?;
+                if !journal.path.is_file() || self.journal_path(&journal.path) != path {
+                    return None;
+                }
+                Some(journal)
+            })
+            .collect()
     }
     pub fn save_journal(&self, source: &Path, baseline: &str, edited: &str) -> io::Result<()> {
         if baseline == edited {
@@ -312,6 +351,40 @@ mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), "recovered");
         fs::remove_dir_all(store.directory()).unwrap();
     }
+    #[test]
+    fn session_roundtrips_open_documents_and_orphan_journals_are_discoverable() {
+        let store = fixture();
+        let a = store.directory().join("a.rs");
+        let b = store.directory().join("b.rs");
+        fs::write(&a, "fn a() {}").unwrap();
+        fs::write(&b, "fn b() {}").unwrap();
+        let session = Session {
+            file: Some(b.clone()),
+            documents: vec![
+                DocumentSession {
+                    path: a.clone(),
+                    cursor_byte: 4,
+                    mode: "rust".into(),
+                },
+                DocumentSession {
+                    path: b.clone(),
+                    cursor_byte: 7,
+                    mode: "compare".into(),
+                },
+            ],
+            ..Session::default()
+        };
+        store.save_session(&session).unwrap();
+        assert_eq!(store.load_session(), Some(session));
+        store
+            .save_journal(&a, "fn a() {}", "fn a() { /* dirty */ }")
+            .unwrap();
+        let journals = store.load_all_journals();
+        assert_eq!(journals.len(), 1);
+        assert_eq!(journals[0].path, a);
+        fs::remove_dir_all(store.directory()).unwrap();
+    }
+
     #[test]
     fn atomic_session_and_recovery_journals_can_be_updated_repeatedly() {
         let store = fixture();

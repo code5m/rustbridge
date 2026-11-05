@@ -3,10 +3,215 @@ use super::editor_core::{
     EDITOR_PAGE_LINES, LARGE_EDITOR_BYTES, append_rust_syntax, editor_page_bounds,
     line_number_gutter,
 };
-use crate::{App, editor_eol, line_index, parser};
+use crate::{App, editor_eol, line_index, lsp, parser};
 use eframe::egui::{self, Color32};
 
 impl App {
+    fn handle_editor_lsp_shortcuts(&mut self, ui: &egui::Ui) {
+        if self.file.is_none() {
+            return;
+        }
+        let (modifiers, ctrl_space, f12, up, down, accept, escape) = ui.input(|input| {
+            let modifiers = input.modifiers;
+            (
+                modifiers,
+                self.editor_focused
+                    && (modifiers.ctrl || modifiers.command)
+                    && input.key_pressed(egui::Key::Space),
+                self.editor_focused && input.key_pressed(egui::Key::F12),
+                self.editor_focused && input.key_pressed(egui::Key::ArrowUp),
+                self.editor_focused && input.key_pressed(egui::Key::ArrowDown),
+                self.editor_focused
+                    && (input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Tab)),
+                self.editor_focused && input.key_pressed(egui::Key::Escape),
+            )
+        });
+
+        if ctrl_space {
+            ui.ctx().input_mut(|input| {
+                input.consume_key(modifiers, egui::Key::Space);
+            });
+            if self.lsp_ready {
+                self.lsp_query_at(lsp::Kind::Completion, self.cursor_byte);
+                self.completion_anchor.get_or_insert_with(|| {
+                    ui.ctx().pointer_hover_pos().unwrap_or(egui::Pos2::ZERO)
+                });
+            } else if self.lsp_task.is_some() {
+                self.status = "rust-analyzer 正在初始化；稍后再按 Ctrl+Space。".into();
+            } else {
+                self.status =
+                    "请先打开 Cargo 项目；进入 Rust 编辑器后会自动启动 rust-analyzer。".into();
+            }
+        }
+        if f12 {
+            ui.ctx().input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::F12);
+            });
+            if self.lsp_ready {
+                self.lsp_query_at(lsp::Kind::Definition, self.cursor_byte);
+            } else if self.lsp_task.is_some() {
+                self.status = "rust-analyzer 正在初始化；稍后再按 F12。".into();
+            } else {
+                self.status =
+                    "请先打开 Cargo 项目；进入 Rust 编辑器后会自动启动 rust-analyzer。".into();
+            }
+        }
+        if self.lsp_completions.is_empty() {
+            return;
+        }
+        if up || down {
+            let key = if up {
+                egui::Key::ArrowUp
+            } else {
+                egui::Key::ArrowDown
+            };
+            ui.ctx().input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, key);
+            });
+            let count = self.lsp_completions.len();
+            if count > 0 {
+                self.completion_selected = if up {
+                    self.completion_selected.saturating_sub(1)
+                } else {
+                    (self.completion_selected + 1).min(count - 1)
+                };
+            }
+        }
+        if accept {
+            let key = if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                egui::Key::Enter
+            } else {
+                egui::Key::Tab
+            };
+            ui.ctx().input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, key);
+            });
+            if let Some(item) = self.lsp_completions.get(self.completion_selected).cloned() {
+                self.insert_completion(item);
+            }
+        } else if escape {
+            ui.ctx().input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+            });
+            self.lsp_completions.clear();
+            self.completion_target = None;
+        }
+    }
+
+    fn track_lsp_hover(
+        &mut self,
+        displayed: &str,
+        original: &str,
+        base_offset: usize,
+        galley: &egui::Galley,
+        galley_pos: egui::Pos2,
+        response: &egui::Response,
+    ) {
+        if !self.lsp_ready || self.file.is_none() {
+            return;
+        }
+        let Some(pointer) = response.hover_pos() else {
+            self.hover_target = None;
+            self.hover_due = None;
+            self.hover_pointer = None;
+            self.lsp_hover.clear();
+            return;
+        };
+        let cursor = galley.cursor_from_pos(pointer - galley_pos);
+        let displayed_byte = parser::char_to_byte(displayed, cursor.index);
+        let local_byte = editor_eol::display_to_original(original, displayed_byte);
+        let byte = (base_offset + local_byte).min(self.rust.len());
+        let next_identifier = self.rust[byte..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_alphanumeric());
+        let query_byte = if next_identifier {
+            Some(byte)
+        } else {
+            self.rust[..byte]
+                .char_indices()
+                .last()
+                .filter(|(_, ch)| *ch == '_' || ch.is_alphanumeric())
+                .map(|(offset, _)| offset)
+        };
+        let Some(query_byte) = query_byte else {
+            self.hover_target = None;
+            self.hover_due = None;
+            self.hover_pointer = None;
+            self.lsp_hover.clear();
+            return;
+        };
+        let Some(path) = self.file.as_ref().and_then(|path| path.canonicalize().ok()) else {
+            return;
+        };
+        let position = lsp::position_for_byte(&self.rust, query_byte);
+        let target = (path, self.revision, position.line, position.character);
+        if self.hover_target.as_ref() != Some(&target) {
+            self.hover_target = Some(target);
+            self.hover_due =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(320));
+            self.lsp_hover.clear();
+        }
+        self.hover_pointer = Some(pointer);
+    }
+
+    fn show_lsp_overlays(&mut self, ctx: &egui::Context) {
+        if !self.lsp_hover.is_empty()
+            && let Some(pointer) = self.hover_pointer
+        {
+            let text = self.lsp_hover.clone();
+            egui::Area::new(egui::Id::new("rustbridge_lsp_hover"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pointer + egui::vec2(14.0, 18.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(480.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                ui.monospace(text);
+                            });
+                    });
+                });
+        }
+
+        if !self.lsp_completions.is_empty()
+            && let Some(position) = self.completion_anchor
+        {
+            let items = self.lsp_completions.clone();
+            let selected = self.completion_selected.min(items.len().saturating_sub(1));
+            let mut chosen = None;
+            egui::Area::new(egui::Id::new((
+                "rustbridge_lsp_completion",
+                self.file.clone(),
+            )))
+            .order(egui::Order::Foreground)
+            .fixed_pos(position + egui::vec2(0.0, 4.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(260.0);
+                    ui.label("rust-analyzer 补全 · ↑↓ 选择 · Enter/Tab 插入");
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            for (index, item) in items.iter().enumerate() {
+                                if ui
+                                    .selectable_label(index == selected, &item.label)
+                                    .clicked()
+                                {
+                                    chosen = Some(item.clone());
+                                }
+                            }
+                        });
+                });
+            });
+            if let Some(item) = chosen {
+                self.insert_completion(item);
+            }
+        }
+    }
+
     pub(super) fn find_next_in_editor(&mut self) {
         let query = self.editor_query.trim();
         if query.is_empty() {
@@ -36,6 +241,15 @@ impl App {
     }
 
     pub(super) fn editor(&mut self, ui: &mut egui::Ui) {
+        if self.file.is_some()
+            && self.cargo_project
+            && self.lsp_task.is_none()
+            && !self.lsp_user_stopped
+        {
+            // Start only when the user enters the real Rust editor, not when
+            // browsing the project tree or reading the Java teaching view.
+            self.start_lsp();
+        }
         if self.file.is_none() {
             ui.colored_label(
                 Color32::YELLOW,
@@ -53,6 +267,7 @@ impl App {
                 });
             return;
         }
+        self.handle_editor_lsp_shortcuts(ui);
         ui.horizontal(|ui| {
             ui.label("原始 Rust 源码 · 可编辑");
             if ui.button("保存 · Ctrl+S").clicked() {
@@ -155,11 +370,43 @@ impl App {
             self.selected = None;
             self.status = "Source edited; updating the reading projection.".into();
         }
+        self.editor_focused = output.response.has_focus();
         if let Some(cursor) = output.cursor_range {
+            let old_cursor = self.cursor_byte;
             let displayed = parser::char_to_byte(&editor_text, cursor.primary.index);
             self.cursor_byte = editor_eol::display_to_original(&self.rust, displayed);
+            let caret = output
+                .galley
+                .pos_from_cursor(egui::text::CCursor::new(cursor.primary.index))
+                .translate(output.galley_pos.to_vec2())
+                .left_bottom();
+            self.completion_anchor = Some(caret);
+            if old_cursor != self.cursor_byte && !output.response.changed() {
+                self.lsp_completions.clear();
+                self.completion_target = None;
+                self.completion_due = None;
+                self.definition_target = None;
+            }
+            if output.response.changed() && self.lsp_ready {
+                let trigger = editor_text[..displayed]
+                    .chars()
+                    .last()
+                    .is_some_and(|ch| ch == '.' || ch == '_' || ch.is_alphanumeric());
+                if trigger {
+                    self.completion_due =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(220));
+                    self.completion_target = None;
+                    self.lsp_completions.clear();
+                }
+            }
         }
-        if !self.projection_pending
+        if !output.response.changed()
+            && !self.projection_pending
+            && output.response.clicked()
+            && ui.input(|input| input.modifiers.ctrl || input.modifiers.command)
+        {
+            self.lsp_query_at(lsp::Kind::Definition, self.cursor_byte);
+        } else if !self.projection_pending
             && output.response.clicked()
             && let Some(cursor) = output.cursor_range
         {
@@ -169,6 +416,22 @@ impl App {
                 byte.checked_sub(1)
                     .and_then(|before| self.projection.rust_anchor(before))
             });
+        }
+        if !output.response.changed() {
+            let hover_source = self.rust.clone();
+            self.track_lsp_hover(
+                &editor_text,
+                &hover_source,
+                0,
+                &output.galley,
+                output.galley_pos,
+                &output.response,
+            );
+        } else {
+            self.hover_target = None;
+            self.hover_due = None;
+            self.hover_pointer = None;
+            self.lsp_hover.clear();
         }
         if let Some(span) = cursor_target
             && span.end <= editor_text.len()
@@ -184,6 +447,7 @@ impl App {
             ui.scroll_to_cursor(Some(egui::Align::Center));
             ui.ctx().request_repaint();
         }
+        self.show_lsp_overlays(ui.ctx());
     }
 
     fn paged_editor(&mut self, ui: &mut egui::Ui) {
@@ -348,12 +612,71 @@ impl App {
                         .and_then(|b| self.projection.rust_anchor(b))
                 });
             }
+            self.editor_focused = output.response.has_focus();
+            if let Some(cursor) = output.cursor_range {
+                let caret = output
+                    .galley
+                    .pos_from_cursor(egui::text::CCursor::new(cursor.primary.index))
+                    .translate(output.galley_pos.to_vec2())
+                    .left_bottom();
+                self.completion_anchor = Some(caret);
+            }
             if !output.response.changed()
                 && let Some(cursor) = output.cursor_range
             {
+                let old_cursor = self.cursor_byte;
                 let displayed = parser::char_to_byte(&page, cursor.primary.index);
                 self.cursor_byte =
                     range.start + editor_eol::display_to_original(&physical_page, displayed);
+                let caret = output
+                    .galley
+                    .pos_from_cursor(egui::text::CCursor::new(cursor.primary.index))
+                    .translate(output.galley_pos.to_vec2())
+                    .left_bottom();
+                self.completion_anchor = Some(caret);
+                if old_cursor != self.cursor_byte {
+                    self.lsp_completions.clear();
+                    self.completion_target = None;
+                    self.completion_due = None;
+                    self.definition_target = None;
+                }
+            }
+            if output.response.changed()
+                && self.lsp_ready
+                && let Some(cursor) = output.cursor_range
+            {
+                let displayed = parser::char_to_byte(&page, cursor.primary.index);
+                let trigger = page[..displayed]
+                    .chars()
+                    .last()
+                    .is_some_and(|ch| ch == '.' || ch == '_' || ch.is_alphanumeric());
+                if trigger {
+                    self.completion_due =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(220));
+                    self.completion_target = None;
+                    self.lsp_completions.clear();
+                }
+            }
+            if !output.response.changed()
+                && output.response.clicked()
+                && ui.input(|input| input.modifiers.ctrl || input.modifiers.command)
+            {
+                self.lsp_query_at(lsp::Kind::Definition, self.cursor_byte);
+            }
+            if !output.response.changed() {
+                self.track_lsp_hover(
+                    &page,
+                    &physical_page,
+                    range.start,
+                    &output.galley,
+                    output.galley_pos,
+                    &output.response,
+                );
+            } else {
+                self.hover_target = None;
+                self.hover_due = None;
+                self.hover_pointer = None;
+                self.lsp_hover.clear();
             }
             if let Some(span) = target.filter(|s| s.start >= range.start && s.end <= range.end) {
                 use egui::text::{CCursor, CCursorRange};
@@ -371,5 +694,6 @@ impl App {
                 ui.scroll_to_cursor(Some(egui::Align::Center));
             }
         }
+        self.show_lsp_overlays(ui.ctx());
     }
 }

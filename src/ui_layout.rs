@@ -1,7 +1,5 @@
 //! RustBridge UI 2.0 workbench shell and navigation.
-use super::{
-    App, BottomTab, Mode, SidebarSection, cargo_runner, lessons, lsp, parser, symbol_search,
-};
+use super::{App, BottomTab, Mode, SidebarSection, cargo_runner, lessons, parser, symbol_search};
 use eframe::egui::{self, Color32};
 
 impl App {
@@ -34,6 +32,12 @@ impl App {
                 );
                 if save.clicked() {
                     self.save();
+                }
+                if self.documents.dirty_count() > 0
+                    && (!self.dirty || self.documents.dirty_count() > 1)
+                    && ui.button("全部保存").clicked()
+                {
+                    self.save_all_documents();
                 }
                 if self.saving.is_some() {
                     ui.spinner();
@@ -72,9 +76,16 @@ impl App {
                 }
 
                 if self.dirty {
-                    ui.colored_label(Color32::YELLOW, "未保存");
+                    ui.colored_label(Color32::YELLOW, "当前文档未保存");
                 } else if self.file.is_none() {
                     ui.weak("内置示例 · 只读");
+                }
+                if !self.documents.is_empty() {
+                    ui.weak(format!(
+                        "{} 个标签 · {} 个未保存",
+                        self.documents.len(),
+                        self.documents.dirty_count()
+                    ));
                 }
                 if self.external_change {
                     ui.colored_label(Color32::RED, "磁盘文件已在外部修改");
@@ -87,6 +98,76 @@ impl App {
                 ui.small("当前窗口较窄，说明栏已自动隐藏；可放大窗口后恢复。");
             }
         });
+
+        if !self.documents.is_empty() {
+            // Render lightweight tab metadata; do not clone full source buffers
+            // or recovery journals on every egui frame.
+            let tabs: Vec<_> = self
+                .documents
+                .iter()
+                .map(|document| {
+                    (
+                        document.path.clone(),
+                        document.is_dirty(),
+                        document.external_change,
+                        document.pending_recovery.is_some(),
+                    )
+                })
+                .collect();
+            egui::TopBottomPanel::top("document_tabs").show(ctx, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("document_tab_strip")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (path, dirty, external, recovery) in tabs {
+                                let active = self.file.as_ref().is_some_and(|active_path| {
+                                    active_path
+                                        .canonicalize()
+                                        .unwrap_or_else(|_| active_path.clone())
+                                        == path.canonicalize().unwrap_or_else(|_| path.clone())
+                                });
+                                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                                let label = format!(
+                                    "{}{}{}{}",
+                                    if dirty { "● " } else { "" },
+                                    name,
+                                    if external { " !" } else { "" },
+                                    if recovery { " ↻" } else { "" }
+                                );
+                                let tooltip = format!(
+                                    "{}{}",
+                                    path.display(),
+                                    if recovery {
+                                        " · 存在未恢复的崩溃快照"
+                                    } else {
+                                        ""
+                                    }
+                                );
+                                if ui
+                                    .selectable_label(active, label)
+                                    .on_hover_text(tooltip)
+                                    .clicked()
+                                {
+                                    self.open(path.clone());
+                                }
+                                if ui
+                                    .small_button("×")
+                                    .on_hover_text("关闭此文档标签")
+                                    .clicked()
+                                {
+                                    self.request_close_document(path.clone());
+                                }
+                                ui.separator();
+                            }
+                            if self.opening.is_some() {
+                                ui.spinner();
+                                ui.small("正在打开…");
+                            }
+                        });
+                    });
+            });
+        }
 
         if show_left {
             egui::SidePanel::left("navigation")
@@ -439,7 +520,7 @@ impl App {
 
         ui.separator();
         ui.strong("rust-analyzer LSP");
-        ui.small("真实 JSON-RPC。启动后可请求悬浮、补全与定义跳转；不会自动应用工作区修改。");
+        ui.small("进入 Cargo 项目的 Rust 编辑器时自动启动；Hover、Completion、Definition 直接融入编辑器，不会自动应用工作区修改。");
         ui.horizontal_wrapped(|ui| {
             if self.lsp_task.is_none() {
                 if ui
@@ -453,57 +534,14 @@ impl App {
                     task.cancel();
                 }
                 self.lsp_ready = false;
-                self.lsp_status = "rust-analyzer LSP 已停止。".into();
+                self.lsp_user_stopped = true;
+                self.lsp_status =
+                    "rust-analyzer LSP 已停止；本项目不会自动重启，直到你手动启动。".into();
             }
         });
         ui.small(&self.lsp_status);
         if self.lsp_ready {
-            ui.horizontal_wrapped(|ui| {
-                for (kind, label) in [
-                    (lsp::Kind::Hover, "查询类型"),
-                    (lsp::Kind::Completion, "请求补全"),
-                    (lsp::Kind::Definition, "查找定义"),
-                ] {
-                    if ui.button(label).clicked() {
-                        self.lsp_query(kind);
-                    }
-                }
-            });
-        }
-        if !self.lsp_hover.is_empty() {
-            ui.separator();
-            ui.strong("悬浮信息");
-            ui.monospace(&self.lsp_hover);
-        }
-        if !self.lsp_completions.is_empty() {
-            ui.separator();
-            ui.strong("补全候选");
-            let items = self.lsp_completions.clone();
-            for item in items {
-                if ui.selectable_label(false, &item.label).clicked() {
-                    self.insert_completion(item);
-                }
-            }
-        }
-        if !self.lsp_definitions.is_empty() {
-            ui.separator();
-            ui.strong("定义位置");
-            let locations = self.lsp_definitions.clone();
-            for location in locations.into_iter().take(12) {
-                let label = format!(
-                    "{}:{}:{}",
-                    location
-                        .path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                    location.line + 1,
-                    location.character + 1
-                );
-                if ui.selectable_label(false, label).clicked() {
-                    self.jump_lsp_definition(location);
-                }
-            }
+            ui.small("编辑器原生交互：鼠标悬停查看类型 · 输入时自动补全 · F12 跳转定义 · Ctrl+Space 手动补全。");
         }
     }
 

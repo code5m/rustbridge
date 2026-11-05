@@ -2,6 +2,7 @@ mod analyzer;
 mod cargo_runner;
 mod code_view;
 mod document_io;
+mod document_manager;
 mod editor_core;
 mod editor_eol;
 mod editor_ui;
@@ -28,7 +29,7 @@ use safe_save::save_if_unchanged;
 #[cfg(test)]
 use std::fs;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
 };
 
@@ -98,6 +99,18 @@ struct App {
     external_change: bool,
     file_watch: Option<file_watch::FileWatch>,
     document_io: Option<document_io::DocumentIo>,
+    documents: document_manager::DocumentManager,
+    last_synced_path: Option<PathBuf>,
+    last_synced_revision: u64,
+    last_synced_cursor_byte: usize,
+    last_synced_mode: Mode,
+    last_synced_disk_stamp: Option<FileStamp>,
+    last_synced_external_change: bool,
+    restore_queue: VecDeque<PathBuf>,
+    restore_states: HashMap<PathBuf, persistence::DocumentSession>,
+    restore_active: Option<PathBuf>,
+    pending_close_document: Option<PathBuf>,
+    save_queue: VecDeque<PathBuf>,
     io_revision: u64,
     opening: Option<(u64, PathBuf, u64)>,
     saving: Option<(u64, PathBuf, String)>,
@@ -106,7 +119,7 @@ struct App {
     after_save_open: bool,
     after_save_project: bool,
     after_save_close: bool,
-    discard_on_open: bool,
+    discard_on_open: Option<PathBuf>,
     symbol_worker: Option<symbol_search::SymbolSearch>,
     symbol_revision: u64,
     symbol_query: String,
@@ -133,7 +146,7 @@ struct App {
     last_session: Option<persistence::Session>,
     session_due: Option<std::time::Instant>,
     recovery_due: Option<std::time::Instant>,
-    pending_recovery: Option<persistence::Journal>,
+    pending_recovery: Option<std::sync::Arc<persistence::Journal>>,
     recovered_mode: Option<Mode>,
     cursor_byte: usize,
     completed_lessons: Vec<bool>,
@@ -147,10 +160,20 @@ struct App {
     lsp_task: Option<lsp::LspTask>,
     lsp_status: String,
     lsp_ready: bool,
+    lsp_user_stopped: bool,
     lsp_hover: String,
     lsp_completions: Vec<lsp::Completion>,
     lsp_definitions: Vec<lsp::Location>,
     lsp_target: Option<(PathBuf, lsp::SpanPosition)>,
+    editor_focused: bool,
+    completion_due: Option<std::time::Instant>,
+    completion_anchor: Option<egui::Pos2>,
+    completion_selected: usize,
+    completion_target: Option<(PathBuf, u64, u32, u32)>,
+    definition_target: Option<(PathBuf, u64, u32, u32)>,
+    hover_due: Option<std::time::Instant>,
+    hover_target: Option<(PathBuf, u64, u32, u32)>,
+    hover_pointer: Option<egui::Pos2>,
 }
 
 impl Default for App {
@@ -199,6 +222,18 @@ impl Default for App {
             external_change: false,
             file_watch: None,
             document_io: None,
+            documents: document_manager::DocumentManager::default(),
+            last_synced_path: None,
+            last_synced_revision: 0,
+            last_synced_cursor_byte: 0,
+            last_synced_mode: Mode::Java,
+            last_synced_disk_stamp: None,
+            last_synced_external_change: false,
+            restore_queue: VecDeque::new(),
+            restore_states: HashMap::new(),
+            restore_active: None,
+            pending_close_document: None,
+            save_queue: VecDeque::new(),
             io_revision: 0,
             opening: None,
             saving: None,
@@ -207,7 +242,7 @@ impl Default for App {
             after_save_open: false,
             after_save_project: false,
             after_save_close: false,
-            discard_on_open: false,
+            discard_on_open: None,
             symbol_worker: None,
             symbol_revision: 0,
             symbol_query: String::new(),
@@ -247,29 +282,130 @@ impl Default for App {
             cargo_status: "Cargo 检查、测试、运行需要手动授权，不会自动执行。".into(),
             cargo_diag_target: None,
             lsp_task: None,
-            lsp_status: "rust-analyzer LSP 未启动。按需启用，不在启动时索引项目。".into(),
+            lsp_status: "进入 Cargo 项目的 Rust 编辑器时，将按需启动 rust-analyzer。".into(),
             lsp_ready: false,
+            lsp_user_stopped: false,
             lsp_hover: String::new(),
             lsp_completions: Vec::new(),
             lsp_definitions: Vec::new(),
             lsp_target: None,
+            editor_focused: false,
+            completion_due: None,
+            completion_anchor: None,
+            completion_selected: 0,
+            completion_target: None,
+            definition_target: None,
+            hover_due: None,
+            hover_target: None,
+            hover_pointer: None,
         }
     }
 }
 
 impl App {
-    fn flush_shutdown_state(&self) {
+    fn mark_active_document_synced(&mut self) {
+        self.last_synced_path = self.file.clone();
+        self.last_synced_revision = self.revision;
+        self.last_synced_cursor_byte = self.cursor_byte;
+        self.last_synced_mode = self.mode;
+        self.last_synced_disk_stamp = self.disk_stamp.clone();
+        self.last_synced_external_change = self.external_change;
+    }
+
+    fn sync_active_document(&mut self) {
+        let Some(path) = self.file.clone() else {
+            self.mark_active_document_synced();
+            return;
+        };
+
+        let mut inserted = false;
+        let active_matches = self
+            .documents
+            .active()
+            .is_some_and(|document| same_document_path(&document.path, &path));
+        if !active_matches {
+            if !self.documents.contains(&path) {
+                self.documents.insert_loaded(
+                    path.clone(),
+                    self.saved_source.clone(),
+                    self.cursor_byte,
+                    mode_name(self.mode).into(),
+                    self.disk_stamp.clone(),
+                );
+                inserted = true;
+            }
+            self.documents.set_active_path(&path);
+        }
+
+        let path_changed = self
+            .last_synced_path
+            .as_ref()
+            .is_none_or(|previous| !same_document_path(previous, &path));
+        let source_changed = inserted || path_changed || self.last_synced_revision != self.revision;
+        let metadata_changed = path_changed
+            || self.last_synced_cursor_byte != self.cursor_byte
+            || self.last_synced_mode != self.mode
+            || self.last_synced_disk_stamp != self.disk_stamp
+            || self.last_synced_external_change != self.external_change;
+
+        if source_changed {
+            self.documents.update_active_source(
+                self.rust.clone(),
+                self.saved_source.clone(),
+                self.cursor_byte,
+                mode_name(self.mode).into(),
+                self.disk_stamp.clone(),
+                self.external_change,
+            );
+        } else if metadata_changed {
+            // Cursor movement and mode changes must not clone large source buffers.
+            self.documents.update_active_metadata(
+                self.cursor_byte,
+                mode_name(self.mode).into(),
+                self.disk_stamp.clone(),
+                self.external_change,
+            );
+        }
+        if source_changed || metadata_changed {
+            self.mark_active_document_synced();
+        }
+    }
+
+    fn persist_document_recovery(&self, path: &Path) {
+        let (Some(worker), Some(doc)) = (self.state_worker.as_ref(), self.documents.get(path))
+        else {
+            return;
+        };
+        if doc.pending_recovery.is_some() {
+            return;
+        }
+        if doc.is_dirty() {
+            worker.send(persistence::Job::SaveJournal {
+                path: doc.path.clone(),
+                baseline: doc.saved_source.clone(),
+                edited: doc.source.clone(),
+            });
+        } else {
+            worker.send(persistence::Job::DeleteJournal(doc.path.clone()));
+        }
+    }
+
+    fn flush_shutdown_state(&mut self) {
+        self.sync_active_document();
         if let Some(worker) = self.state_worker.as_ref() {
             worker.send(persistence::Job::Session(self.session_snapshot()));
-            if let Some(path) = self.file.clone() {
-                if self.dirty {
+            for doc in self.documents.iter() {
+                if doc.pending_recovery.is_some() {
+                    continue;
+                }
+                if doc.is_dirty() {
                     worker.send(persistence::Job::SaveJournal {
-                        path,
-                        baseline: self.saved_source.clone(),
-                        edited: self.rust.clone(),
+                        path: doc.path.clone(),
+                        baseline: doc.saved_source.clone(),
+                        edited: doc.source.clone(),
                     });
                 } else {
-                    worker.send(persistence::Job::DeleteJournal(path));
+                    worker.send(persistence::Job::DeleteJournal(doc.path.clone()));
                 }
             }
         }
@@ -298,8 +434,70 @@ impl App {
             if restore_last_document {
                 self.root = session.root.clone().filter(|p| p.is_dir());
                 self.cargo_project = self.root.as_ref().is_some_and(|p| is_cargo_root(p));
-                if let Some(path) = session.file.clone().filter(|p| p.is_file()) {
-                    self.open_file(path);
+
+                let mut documents = session.documents.clone();
+                if documents.is_empty()
+                    && let Some(path) = session.file.clone()
+                {
+                    documents.push(persistence::DocumentSession {
+                        path,
+                        cursor_byte: session.cursor_byte,
+                        mode: session.mode.clone(),
+                    });
+                }
+                if let Some(active) = session.file.clone()
+                    && active.is_file()
+                    && !documents
+                        .iter()
+                        .any(|document| same_document_path(&document.path, &active))
+                {
+                    documents.push(persistence::DocumentSession {
+                        path: active,
+                        cursor_byte: session.cursor_byte,
+                        mode: session.mode.clone(),
+                    });
+                }
+                for journal in store.load_all_journals() {
+                    if !documents
+                        .iter()
+                        .any(|document| same_document_path(&document.path, &journal.path))
+                    {
+                        documents.push(persistence::DocumentSession {
+                            path: journal.path,
+                            cursor_byte: 0,
+                            mode: "rust".into(),
+                        });
+                    }
+                }
+                let mut seen = std::collections::HashSet::new();
+                documents.retain(|document| {
+                    document.path.is_file()
+                        && seen.insert(
+                            document
+                                .path
+                                .canonicalize()
+                                .unwrap_or_else(|_| document.path.clone()),
+                        )
+                });
+                if self.root.is_none() {
+                    self.root = documents
+                        .first()
+                        .and_then(|document| document.path.parent())
+                        .map(Path::to_path_buf);
+                }
+                self.cargo_project = self.root.as_ref().is_some_and(|p| is_cargo_root(p));
+                self.restore_active = session
+                    .file
+                    .clone()
+                    .filter(|path| path.is_file())
+                    .or_else(|| documents.last().map(|document| document.path.clone()));
+                for document in &documents {
+                    self.restore_states
+                        .insert(document.path.clone(), document.clone());
+                    self.restore_queue.push_back(document.path.clone());
+                }
+                if let Some(first) = self.restore_queue.pop_front() {
+                    self.open_file(first);
                 } else if let Some(mode) = self.recovered_mode.take() {
                     self.mode = mode;
                 }
@@ -311,13 +509,57 @@ impl App {
     }
 
     fn session_snapshot(&self) -> persistence::Session {
+        let mut documents = self
+            .documents
+            .iter()
+            .map(|doc| persistence::DocumentSession {
+                path: doc.path.clone(),
+                cursor_byte: doc.cursor_byte,
+                mode: doc.mode.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        // Session restoration is asynchronous. Persist the in-flight tab and
+        // queued tabs too, so closing/crashing halfway through restore cannot
+        // silently shrink the saved workspace to only the tabs already read.
+        let mut pending_paths = Vec::new();
+        if let Some((_, opening, _)) = self.opening.as_ref() {
+            pending_paths.push(opening.clone());
+        }
+        pending_paths.extend(self.restore_queue.iter().cloned());
+        for path in pending_paths {
+            if documents
+                .iter()
+                .any(|document| same_document_path(&document.path, &path))
+            {
+                continue;
+            }
+            let saved = self.restore_states.get(&path);
+            documents.push(persistence::DocumentSession {
+                path,
+                cursor_byte: saved.map_or(0, |state| state.cursor_byte),
+                mode: saved
+                    .map(|state| state.mode.clone())
+                    .unwrap_or_else(|| mode_name(self.mode).into()),
+            });
+        }
+
+        let active_file = self.restore_active.clone().or_else(|| self.file.clone());
+        let active_state = active_file.as_ref().and_then(|path| {
+            documents
+                .iter()
+                .find(|document| same_document_path(&document.path, path))
+        });
         persistence::Session {
             root: self.root.clone(),
-            file: self.file.clone(),
-            mode: mode_name(self.mode).into(),
+            file: active_file,
+            mode: active_state
+                .map(|document| document.mode.clone())
+                .unwrap_or_else(|| mode_name(self.mode).into()),
             lesson: self.lesson,
-            cursor_byte: self.cursor_byte,
+            cursor_byte: active_state.map_or(self.cursor_byte, |document| document.cursor_byte),
             completed_lessons: self.completed_lessons.clone(),
+            documents,
         }
     }
 
@@ -326,26 +568,23 @@ impl App {
     }
     fn flush_recovery_journal(&mut self) {
         self.recovery_due = None;
-        if let (Some(path), Some(worker)) = (self.file.clone(), self.state_worker.as_ref()) {
-            if self.dirty {
-                worker.send(persistence::Job::SaveJournal {
-                    path,
-                    baseline: self.saved_source.clone(),
-                    edited: self.rust.clone(),
-                });
-            } else {
-                worker.send(persistence::Job::DeleteJournal(path));
-            }
+        self.sync_active_document();
+        if let Some(path) = self.file.clone() {
+            self.persist_document_recovery(&path);
         }
     }
     fn discard_current_recovery(&mut self) {
-        if let (Some(path), Some(worker)) = (self.file.as_ref(), self.state_worker.as_ref()) {
-            worker.send(persistence::Job::DeleteJournal(path.clone()));
+        if let Some(path) = self.file.as_ref() {
+            if let Some(worker) = self.state_worker.as_ref() {
+                worker.send(persistence::Job::DeleteJournal(path.clone()));
+            }
+            self.documents.set_pending_recovery(path, None);
         }
         self.pending_recovery = None;
         self.recovery_due = None;
     }
     fn poll_persistence(&mut self) {
+        self.sync_active_document();
         if self
             .recovery_due
             .is_some_and(|due| std::time::Instant::now() >= due)
@@ -370,6 +609,7 @@ impl App {
     }
 
     fn start_lsp(&mut self) {
+        self.sync_active_document();
         let Some(root) = self.root.clone().and_then(|p| p.canonicalize().ok()) else {
             self.lsp_status = "请先打开实际 Cargo 项目目录。".into();
             return;
@@ -379,17 +619,26 @@ impl App {
             return;
         }
         self.lsp_task = None;
-        let worker = lsp::LspTask::start(root);
-        if let Some(path) = self.file.as_ref().and_then(|p| p.canonicalize().ok()) {
-            worker.open(path, self.rust.clone(), self.revision);
+        self.lsp_user_stopped = false;
+        let worker = lsp::LspTask::start(root.clone());
+        for doc in self.documents.iter() {
+            if let Ok(path) = doc.path.canonicalize()
+                && path.starts_with(&root)
+            {
+                worker.open(path, doc.source.clone(), self.revision.max(1));
+            }
         }
         self.lsp_task = Some(worker);
         self.lsp_ready = false;
         self.lsp_hover.clear();
         self.lsp_completions.clear();
         self.lsp_definitions.clear();
-        self.lsp_status = "正在初始化 rust-analyzer LSP；默认关闭 build.rs 与 proc macros。".into();
+        self.hover_target = None;
+        self.hover_due = None;
+        self.completion_due = None;
+        self.lsp_status = "正在初始化 rust-analyzer LSP；所有已打开文档将保持独立同步。".into();
     }
+
     fn poll_lsp(&mut self) {
         let Some(task) = self.lsp_task.as_ref() else {
             return;
@@ -409,27 +658,68 @@ impl App {
                 lsp::Event::Ready => {
                     self.lsp_ready = true;
                     self.lsp_status =
-                        "rust-analyzer LSP 已初始化；可以请求类型、补全和定义。".into();
+                        "rust-analyzer LSP 已初始化；当前项目的打开文档均已注册。".into();
                 }
                 lsp::Event::Status(text) => {
                     self.lsp_status = text;
                 }
-                lsp::Event::Hover { revision, text } if revision == self.revision => {
+                lsp::Event::Hover {
+                    path,
+                    revision,
+                    line,
+                    character,
+                    text,
+                } if self.hover_target.as_ref().is_some_and(|target| {
+                    target.0 == path
+                        && target.1 == revision
+                        && target.2 == line
+                        && target.3 == character
+                }) && revision == self.revision =>
+                {
                     self.lsp_hover = text.chars().take(12000).collect();
-                    self.lsp_status = "rust-analyzer 悬浮信息已返回。".into();
+                    self.lsp_status = if self.lsp_hover.is_empty() {
+                        "当前位置没有可显示的悬浮信息。".into()
+                    } else {
+                        "rust-analyzer 悬浮信息已返回。".into()
+                    };
                 }
-                lsp::Event::Completion { revision, items } if revision == self.revision => {
+                lsp::Event::Completion {
+                    path,
+                    revision,
+                    line,
+                    character,
+                    items,
+                } if self.completion_target.as_ref().is_some_and(|target| {
+                    target.0 == path
+                        && target.1 == revision
+                        && target.2 == line
+                        && target.3 == character
+                }) && revision == self.revision =>
+                {
                     self.lsp_completions = items;
+                    self.completion_selected = 0;
                     self.lsp_status = format!(
                         "rust-analyzer 返回 {} 项补全候选。",
                         self.lsp_completions.len()
                     );
                 }
                 lsp::Event::Definition {
+                    path,
                     revision,
+                    line,
+                    character,
                     locations,
-                } if revision == self.revision => {
+                } if self.definition_target.as_ref().is_some_and(|target| {
+                    target.0 == path
+                        && target.1 == revision
+                        && target.2 == line
+                        && target.3 == character
+                }) && revision == self.revision =>
+                {
                     self.lsp_definitions = locations;
+                    if let Some(location) = self.lsp_definitions.first().cloned() {
+                        self.jump_lsp_definition(location);
+                    }
                     self.lsp_status = format!(
                         "rust-analyzer 返回 {} 个定义位置。",
                         self.lsp_definitions.len()
@@ -439,24 +729,61 @@ impl App {
             }
         }
     }
-    fn lsp_query(&mut self, kind: lsp::Kind) {
+
+    fn lsp_query_at(&mut self, kind: lsp::Kind, byte: usize) {
         let Some(task) = self.lsp_task.as_ref() else {
             return;
         };
-        let byte = self
-            .selected
-            .and_then(|idx| self.projection.anchors.get(idx))
-            .map_or(self.cursor_byte, |anchor| anchor.rust.start);
+        let Some(path) = self.file.as_ref().and_then(|path| path.canonicalize().ok()) else {
+            return;
+        };
+        if !path.starts_with(&task.root) {
+            self.lsp_status =
+                "当前文件不属于已启动的 Cargo 工作区；请切换到对应项目后启动 LSP。".into();
+            return;
+        }
         let pos = lsp::position_for_byte(&self.rust, byte);
-        task.query(kind, self.revision, pos.line, pos.character);
-        self.lsp_status = format!("正在请求 {:?}，源版本 {}…", kind, self.revision);
+        let target = (path.clone(), self.revision, pos.line, pos.character);
+        match kind {
+            lsp::Kind::Hover => self.hover_target = Some(target),
+            lsp::Kind::Completion => self.completion_target = Some(target),
+            lsp::Kind::Definition => self.definition_target = Some(target),
+        }
+        task.query(path, kind, self.revision, pos.line, pos.character);
+        self.lsp_status = format!("正在请求 {:?}，文档版本 {}…", kind, self.revision);
     }
+
+    fn dispatch_lsp_debounced(&mut self) {
+        let now = std::time::Instant::now();
+        if self.hover_due.is_some_and(|due| now >= due) {
+            self.hover_due = None;
+            if let (Some(task), Some((path, revision, line, character))) =
+                (self.lsp_task.as_ref(), self.hover_target.clone())
+                && revision == self.revision
+                && self.lsp_ready
+            {
+                task.query(path, lsp::Kind::Hover, revision, line, character);
+            }
+        }
+        if self.completion_due.is_some_and(|due| now >= due) {
+            self.completion_due = None;
+            if self.lsp_ready {
+                self.lsp_query_at(lsp::Kind::Completion, self.cursor_byte);
+            }
+        }
+    }
+
     fn insert_completion(&mut self, completion: lsp::Completion) {
         if self.file.is_none() {
             return;
         }
-        if completion.text.contains('$') && completion.text.contains('{') {
-            self.lsp_status = "服务端给出了片段占位符；为避免破坏源码，暂不自动插入。".into();
+        let text = if completion.is_snippet {
+            lsp::expand_snippet(&completion.text)
+        } else {
+            completion.text.clone()
+        };
+        if text.is_empty() {
+            self.lsp_status = "补全项没有可插入的文本。".into();
             return;
         }
         let cursor = self.cursor_byte.min(self.rust.len());
@@ -489,24 +816,36 @@ impl App {
         {
             return;
         }
-        self.rust.replace_range(range.clone(), &completion.text);
-        self.cursor_byte = range.start + completion.text.len();
-        self.update_projection();
+        self.rust.replace_range(range.clone(), &text);
+        self.source_edited(range.clone(), &text);
+        self.cursor_byte = range.start + text.len();
+        self.editor_jump = Some(parser::ByteSpan {
+            start: self.cursor_byte,
+            end: self.cursor_byte,
+        });
         self.dirty = self.rust != self.saved_source;
         self.mark_dirty_for_recovery();
         self.lsp_completions.clear();
-        self.status = "已插入真实 rust-analyzer 补全文本；原始 Rust 文件尚未保存。".into();
+        self.completion_due = None;
+        self.completion_target = None;
+        self.hover_target = None;
+        self.hover_due = None;
+        self.lsp_hover.clear();
+        self.status = "已插入 rust-analyzer 补全文本；原始 Rust 文件尚未保存。".into();
     }
+
     fn jump_lsp_definition(&mut self, location: lsp::Location) {
-        if self.dirty {
-            self.status = "当前文件仍有未保存修改，请保存后再跨文件跳转。".into();
-            return;
-        }
         let position = lsp::SpanPosition {
             line: location.line,
             character: location.character,
         };
-        if self.file.as_ref() == Some(&location.path) {
+        if self.file.as_ref().is_some_and(|path| {
+            path.canonicalize().unwrap_or_else(|_| path.clone())
+                == location
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| location.path.clone())
+        }) {
             if let Some(byte) = lsp::byte_for_position(&self.rust, &position) {
                 self.editor_jump = Some(parser::ByteSpan {
                     start: byte,
@@ -517,7 +856,7 @@ impl App {
             }
         } else {
             self.lsp_target = Some((location.path.clone(), position));
-            self.open_file(location.path);
+            self.open(location.path);
         }
     }
 
@@ -530,8 +869,9 @@ impl App {
         let Some(root) = self.root.clone() else {
             return;
         };
-        if self.dirty || self.saving.is_some() {
-            self.cargo_status = "当前 Rust 文件有未保存修改，请先保存再运行 Cargo。".into();
+        self.sync_active_document();
+        if self.documents.dirty_count() > 0 || self.saving.is_some() {
+            self.cargo_status = "有 Rust 文档尚未保存；请先全部保存再运行 Cargo。".into();
             return;
         }
         if !is_cargo_root(&root) {
@@ -589,26 +929,61 @@ impl App {
             self.mode = Mode::Rust;
         } else {
             self.cargo_diag_target = Some((diag.path.clone(), diag.line, diag.column));
-            self.open_file(diag.path);
+            self.open(diag.path);
         }
     }
 
     fn close_requires_confirmation(&self) -> bool {
-        self.dirty || self.saving.is_some()
+        self.dirty || self.documents.dirty_count() > 0 || self.saving.is_some()
     }
+
     fn open(&mut self, path: PathBuf) {
-        if self.saving.is_some() {
-            self.pending_open = Some(path);
-            self.pending_project = None;
-            self.after_save_open = true;
-            self.after_save_project = false;
+        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if self
+            .file
+            .as_ref()
+            .is_some_and(|active| active.canonicalize().unwrap_or_else(|_| active.clone()) == key)
+        {
             return;
         }
-        if self.dirty {
-            self.pending_open = Some(path);
-            self.pending_project = None;
-            self.after_save_open = false;
+        if self.opening.as_ref().is_some_and(|(_, opening, _)| {
+            opening.canonicalize().unwrap_or_else(|_| opening.clone()) == key
+        }) {
             return;
+        }
+
+        self.sync_active_document();
+        if let Some(active) = self.file.clone() {
+            self.recovery_due = None;
+            self.persist_document_recovery(&active);
+        }
+
+        if self.documents.contains(&path) {
+            if !self.restore_queue.is_empty() {
+                self.restore_active = Some(path.clone());
+                self.activate_document(path);
+                return;
+            }
+            if let Some(io) = self.document_io.as_ref() {
+                io.cancel_open();
+            }
+            self.opening = None;
+            self.opening_started = None;
+            self.activate_document(path);
+            return;
+        }
+        if !self.restore_queue.is_empty() {
+            if let Some((_, opening, _)) = self.opening.as_ref()
+                && self.restore_states.contains_key(opening)
+                && !self.documents.contains(opening)
+                && !self
+                    .restore_queue
+                    .iter()
+                    .any(|queued| same_document_path(queued, opening))
+            {
+                self.restore_queue.push_front(opening.clone());
+            }
+            self.restore_active = Some(path.clone());
         }
         self.open_file(path);
     }
@@ -618,26 +993,41 @@ impl App {
             self.status = format!("项目目录不可用：{}", folder.display());
             return;
         }
+        self.sync_active_document();
         self.pending_open = None;
-        if self.saving.is_some() {
+        if self.saving.is_some()
+            || self.documents.dirty_count() > 0
+            || self.documents.recovery_count() > 0
+            || self.dirty
+        {
             self.pending_project = Some(folder);
             self.after_save_open = false;
-            self.after_save_project = true;
-            self.status =
-                "当前已接受的保存完成后切换项目；如果保存期间又有修改，需要再次确认。".into();
-            return;
-        }
-        self.after_save_open = false;
-        self.after_save_project = false;
-        if self.dirty {
-            self.pending_project = Some(folder);
-            self.status = "切换项目之前，请明确保存或放弃当前 Rust 修改。".into();
+            self.after_save_project = false;
+            self.status = format!(
+                "切换项目之前有 {} 个未保存文档、{} 个待恢复文档。",
+                self.documents.dirty_count(),
+                self.documents.recovery_count()
+            );
             return;
         }
         self.apply_project(folder);
     }
 
     fn apply_project(&mut self, folder: PathBuf) {
+        self.sync_active_document();
+        let old_documents = self.documents.clear();
+        if let Some(worker) = self.state_worker.as_ref() {
+            for document in old_documents {
+                if document.pending_recovery.is_none() || document.is_dirty() {
+                    worker.send(persistence::Job::DeleteJournal(document.path));
+                }
+            }
+        }
+        self.restore_queue.clear();
+        self.restore_states.clear();
+        self.restore_active = None;
+        self.pending_close_document = None;
+        self.save_queue.clear();
         if let Some(io) = self.document_io.as_ref() {
             io.cancel_open();
         }
@@ -645,11 +1035,19 @@ impl App {
             task.cancel();
         }
         self.lsp_ready = false;
-        self.lsp_status = "项目已切换；rust-analyzer LSP 已停止，请按需重新启动。".into();
+        self.lsp_user_stopped = false;
+        self.lsp_status = "项目已切换；进入 Rust 编辑器时将按需启动新项目 LSP。".into();
         self.lsp_hover.clear();
         self.lsp_completions.clear();
         self.lsp_definitions.clear();
         self.lsp_target = None;
+        self.hover_target = None;
+        self.hover_due = None;
+        self.hover_pointer = None;
+        self.completion_due = None;
+        self.completion_anchor = None;
+        self.completion_target = None;
+        self.definition_target = None;
 
         if let Some(task) = self.cargo_task.take() {
             task.cancel();
@@ -678,6 +1076,7 @@ impl App {
         self.root = Some(folder.clone());
         self.cargo_project = is_cargo_root(&folder);
         self.file = None;
+        self.mark_active_document_synced();
         self.file_watch = None;
         self.disk_stamp = None;
         self.opening = None;
@@ -686,7 +1085,7 @@ impl App {
         self.pending_project = None;
         self.after_save_open = false;
         self.after_save_project = false;
-        self.discard_on_open = false;
+        self.discard_on_open = None;
         self.pending_recovery = None;
 
         // A project switch closes the previous document context. The bundled
@@ -727,6 +1126,21 @@ impl App {
     }
 
     fn open_file(&mut self, path: PathBuf) {
+        if self.root.is_none()
+            && let Some(root) = find_cargo_root(&path)
+        {
+            self.cargo_project = true;
+            self.root = Some(root);
+        }
+        // A discard/reload intent is bound to one exact document path. If a
+        // newer open supersedes it, never apply that intent to the new target.
+        if self
+            .discard_on_open
+            .as_ref()
+            .is_some_and(|pending| !same_document_path(pending, &path))
+        {
+            self.discard_on_open = None;
+        }
         // Reading from slow disks/network mounts never blocks the rendering thread.
         self.io_revision += 1;
         let id = self.io_revision;
@@ -739,54 +1153,139 @@ impl App {
     }
 
     fn complete_open(&mut self, path: PathBuf, loaded: document_io::Loaded) {
-        if self.discard_on_open {
-            self.discard_current_recovery();
-            self.discard_on_open = false;
+        self.sync_active_document();
+        let discarding_recovery = self
+            .discard_on_open
+            .as_ref()
+            .is_some_and(|pending| same_document_path(pending, &path));
+        if discarding_recovery {
+            self.discard_on_open = None;
         }
-        self.disk_stamp = loaded.stamp;
-        self.external_change = false;
-        self.saved_source = loaded.source.clone();
-        self.rust = loaded.source;
-        self.dirty = false;
+        if discarding_recovery {
+            if self
+                .file
+                .as_ref()
+                .is_some_and(|active| same_document_path(active, &path))
+            {
+                self.file = None;
+                self.dirty = false;
+            }
+            self.documents.remove(&path);
+            if let Some(worker) = self.state_worker.as_ref() {
+                worker.send(persistence::Job::DeleteJournal(path.clone()));
+            }
+            self.pending_recovery = None;
+            self.discard_on_open = None;
+        }
+        let restored = self.restore_states.remove(&path);
+        let cursor_byte = restored
+            .as_ref()
+            .map_or(0, |state| state.cursor_byte.min(loaded.source.len()));
+        let mode = restored
+            .as_ref()
+            .map_or_else(|| "java".to_owned(), |state| state.mode.clone());
+        let loaded_source = loaded.source.clone();
+        self.documents
+            .insert_loaded(path.clone(), loaded.source, cursor_byte, mode, loaded.stamp);
+        let recovery = if discarding_recovery {
+            None
+        } else {
+            self.state_store
+                .as_ref()
+                .and_then(|store| store.load_journal(&path))
+                .filter(|journal| journal.edited != loaded_source)
+        };
+        self.documents.set_pending_recovery(&path, recovery);
+        self.activate_document(path);
+
+        if let Some(next) = self.restore_queue.pop_front() {
+            self.open_file(next);
+            return;
+        }
+        if let Some(active) = self.restore_active.take()
+            && self.documents.contains(&active)
+        {
+            self.activate_document(active);
+        }
+    }
+
+    fn activate_document(&mut self, path: PathBuf) {
+        self.sync_active_document();
+        let Some(document) = self.documents.activate(&path) else {
+            self.status = format!("文档尚未打开：{}", path.display());
+            return;
+        };
+
+        self.file = Some(document.path.clone());
+        self.rust = document.source;
+        self.saved_source = document.saved_source;
+        self.dirty = self.rust != self.saved_source;
+        self.cursor_byte = document.cursor_byte.min(self.rust.len());
+        if !self.rust.is_char_boundary(self.cursor_byte) {
+            self.cursor_byte = self
+                .rust
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .take_while(|offset| *offset <= self.cursor_byte)
+                .last()
+                .unwrap_or(0);
+        }
+        self.mode = mode_from_name(&document.mode);
+        self.disk_stamp = document.disk_stamp;
+        let current_stamp = file_watch::file_stamp(&document.path).ok();
+        self.external_change = current_stamp.is_some() && current_stamp != self.disk_stamp;
+        self.documents
+            .set_external_change(&document.path, self.external_change);
+
         self.update_projection();
-        self.file = Some(path.clone());
-        self.record_recent_file();
-        self.selected = None;
-        self.jump_to = None;
+        self.editor_gutter_revision = 0;
         self.editor_find = None;
         self.editor_jump = None;
         self.editor_page_start = 0;
         self.editor_page_target = 1;
         self.editor_scroll_override = None;
+        self.selected = None;
+        self.jump_to = None;
         self.scroll_follow = None;
         self.last_scroll = None;
-        self.mode = self.recovered_mode.take().unwrap_or(Mode::Java);
-        if let Some(store) = self.state_store.as_ref() {
-            self.pending_recovery = store
-                .load_journal(&path)
-                .filter(|journal| journal.edited != self.rust);
-        }
-        if self.cursor_byte <= self.rust.len() && self.rust.is_char_boundary(self.cursor_byte) {
-            self.editor_jump = Some(parser::ByteSpan {
-                start: self.cursor_byte,
-                end: self.cursor_byte,
-            });
-        }
+        self.lsp_hover.clear();
+        self.lsp_completions.clear();
+        self.lsp_definitions.clear();
+        self.hover_target = None;
+        self.hover_due = None;
+        self.hover_pointer = None;
+        self.completion_due = None;
+        self.completion_anchor = None;
+        self.completion_target = None;
+        self.definition_target = None;
+        self.completion_selected = 0;
+        self.record_recent_file();
+
+        self.pending_recovery = if self.restore_queue.is_empty() {
+            document.pending_recovery.clone()
+        } else {
+            None
+        };
+
         if let Some((target, span)) = self.symbol_target.take()
-            && target == path
+            && target == document.path
         {
             self.mode = Mode::Rust;
             self.editor_jump = Some(span);
         }
         if let Some((target, line, column)) = self.cargo_diag_target.take()
-            && target == path
+            && target == document.path
         {
             let span = diagnostic_location(&self.rust, line, column);
             self.editor_jump = Some(span);
             self.mode = Mode::Rust;
         }
         if let Some((target, pos)) = self.lsp_target.take()
-            && target == path
+            && target.canonicalize().unwrap_or_else(|_| target.clone())
+                == document
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| document.path.clone())
             && let Some(byte) = lsp::byte_for_position(&self.rust, &pos)
         {
             self.editor_jump = Some(parser::ByteSpan {
@@ -796,12 +1295,25 @@ impl App {
             self.cursor_byte = byte;
             self.mode = Mode::Rust;
         }
-        if let Some(task) = self.lsp_task.as_ref()
-            && let Ok(path) = path.canonicalize()
-        {
-            task.open(path, self.rust.clone(), self.revision);
+
+        if let Some(watch) = self.file_watch.as_mut() {
+            watch.set_target(document.path.clone(), self.disk_stamp.clone());
         }
-        self.status = "Opened actual Rust file. Java teaching view is read-only.".into();
+        if let Some(task) = self.lsp_task.as_ref()
+            && let Ok(path) = document.path.canonicalize()
+            && path.starts_with(&task.root)
+        {
+            task.open(path, self.rust.clone(), self.revision.max(1));
+        }
+        self.status = if self.external_change {
+            "文档在 RustBridge 外部发生了变化；保存已阻止，请先重新加载或另存副本。".into()
+        } else if self.dirty {
+            "已恢复此文档的独立未保存缓冲区。".into()
+        } else {
+            "已切换到打开的 Rust 文档；每个标签保留自己的编辑状态。".into()
+        };
+        self.mark_active_document_synced();
+        self.session_due = Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
     }
 
     fn poll_document_io(&mut self, ctx: &egui::Context) {
@@ -812,17 +1324,25 @@ impl App {
         {
             match reply {
                 document_io::Reply::Open { id, path, result } => {
-                    let matching = self.opening.as_ref().is_some_and(|(pending, p, rev)| {
-                        *pending == id && p == &path && *rev == self.revision
-                    });
+                    let matching = self
+                        .opening
+                        .as_ref()
+                        .is_some_and(|(pending, p, _)| *pending == id && p == &path);
                     if matching {
                         self.opening = None;
                         self.opening_started = None;
                         match result {
                             Ok(loaded) => self.complete_open(path, loaded),
                             Err(error) => {
-                                self.discard_on_open = false;
+                                self.discard_on_open = None;
                                 self.status = format!("Open failed: {error}");
+                                if let Some(next) = self.restore_queue.pop_front() {
+                                    self.open_file(next);
+                                } else if let Some(active) = self.restore_active.take()
+                                    && self.documents.contains(&active)
+                                {
+                                    self.activate_document(active);
+                                }
                             }
                         }
                     }
@@ -843,60 +1363,91 @@ impl App {
                     match result {
                         Ok(outcome) => {
                             let durable = matches!(&outcome, safe_save::SaveOutcome::Durable);
-                            self.saved_source = content;
-                            self.dirty = self.rust != self.saved_source;
-                            self.disk_stamp = file_watch::file_stamp(&path).ok();
-                            if let Some(watch) = self.file_watch.as_mut() {
-                                watch.set_target(path.clone(), self.disk_stamp.clone());
+                            let stamp = file_watch::file_stamp(&path).ok();
+                            self.documents
+                                .update_saved(&path, content.clone(), stamp.clone());
+                            let active_matches = self.file.as_ref().is_some_and(|active| {
+                                active.canonicalize().unwrap_or_else(|_| active.clone())
+                                    == path.canonicalize().unwrap_or_else(|_| path.clone())
+                            });
+                            if active_matches {
+                                self.saved_source = content.clone();
+                                self.disk_stamp = stamp.clone();
+                                self.dirty = self.rust != self.saved_source;
+                                self.external_change = false;
+                                if let Some(watch) = self.file_watch.as_mut() {
+                                    watch.set_target(path.clone(), stamp);
+                                }
+                                self.mark_active_document_synced();
                             }
-                            self.external_change = false;
-                            self.flush_recovery_journal();
+                            self.persist_document_recovery(&path);
                             self.status = match outcome {
                                 safe_save::SaveOutcome::Durable => {
-                                    "Saved original Rust source".into()
+                                    format!("已保存 {}", path.display())
                                 }
                                 safe_save::SaveOutcome::CommittedDurabilityUncertain(error) => {
                                     format!("内容已写入磁盘，但目录同步失败，持久性未确认：{error}")
                                 }
                             };
+
                             if !durable {
-                                // The content crossed the commit point, but the user
-                                // must explicitly acknowledge uncertain directory durability.
-                                if self.after_save_close {
-                                    self.confirm_close = true;
-                                }
                                 self.after_save_close = false;
                                 self.after_save_open = false;
                                 self.after_save_project = false;
-                            }
-                            if !self.dirty && durable && self.after_save_close {
-                                self.after_save_close = false;
-                                self.confirm_close = false;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
-                            if !self.dirty && durable && self.after_save_open {
-                                self.after_save_open = false;
-                                if let Some(next) = self.pending_open.take() {
-                                    self.open_file(next);
+                                self.save_queue.clear();
+                            } else {
+                                if self.documents.get(&path).is_some_and(|doc| doc.is_dirty())
+                                    && !self.save_queue.iter().any(|queued| queued == &path)
+                                {
+                                    self.save_queue.push_back(path.clone());
                                 }
-                            }
-                            if !self.dirty && durable && self.after_save_project {
-                                self.after_save_project = false;
-                                if let Some(next) = self.pending_project.take() {
+                                if let Some(next) = self.save_queue.pop_front() {
+                                    self.start_save_path(next);
+                                } else if self.pending_close_document.as_ref().is_some_and(
+                                    |pending| {
+                                        pending.canonicalize().unwrap_or_else(|_| pending.clone())
+                                            == path.canonicalize().unwrap_or_else(|_| path.clone())
+                                    },
+                                ) && self
+                                    .documents
+                                    .get(&path)
+                                    .is_some_and(|doc| !doc.is_dirty())
+                                {
+                                    self.close_document_now(path.clone(), false);
+                                } else if self.pending_project.is_some()
+                                    && self.documents.dirty_count() == 0
+                                    && let Some(next) = self.pending_project.take()
+                                {
                                     self.apply_project(next);
                                 }
+
+                                if self.after_save_open
+                                    && self.pending_open.as_ref().is_some_and(|pending| {
+                                        pending.canonicalize().unwrap_or_else(|_| pending.clone())
+                                            == path.canonicalize().unwrap_or_else(|_| path.clone())
+                                    })
+                                    && self.documents.get(&path).is_some_and(|doc| !doc.is_dirty())
+                                {
+                                    self.after_save_open = false;
+                                    if let Some(next) = self.pending_open.take() {
+                                        self.reload_file_from_disk(next);
+                                    }
+                                }
+                                if self.after_save_close && !self.close_requires_confirmation() {
+                                    self.after_save_close = false;
+                                    self.confirm_close = false;
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
                             }
-                            if self.dirty {
-                                self.after_save_close = false;
-                                self.after_save_open = false;
-                                self.after_save_project = false;
-                                self.status.push_str("；保存过程中又有新修改，请再次保存。");
+                            if active_matches && self.dirty {
+                                self.status.push_str("；保存期间又有新修改，请再次保存。");
                             }
                         }
                         Err(error) => {
                             self.after_save_close = false;
                             self.after_save_open = false;
                             self.after_save_project = false;
+                            self.save_queue.clear();
                             self.status =
                                 format!("Save failed (original source preserved): {error}");
                         }
@@ -921,9 +1472,109 @@ impl App {
     }
 
     fn reload_disk_copy(&mut self) {
-        if let Some(path) = self.file.clone() {
-            self.open(path);
+        let Some(path) = self.file.clone() else {
+            return;
+        };
+        self.sync_active_document();
+        if self.dirty {
+            self.pending_open = Some(path);
+            self.status = "重新加载将替换当前缓冲区；请明确保存、放弃或取消。".into();
+        } else {
+            self.reload_file_from_disk(path);
         }
+    }
+
+    fn reload_file_from_disk(&mut self, path: PathBuf) {
+        self.discard_on_open = Some(path.clone());
+        self.open_file(path);
+    }
+
+    fn request_close_document(&mut self, path: PathBuf) {
+        self.sync_active_document();
+        if self.saving.as_ref().is_some_and(|(_, saving_path, _)| {
+            saving_path
+                .canonicalize()
+                .unwrap_or_else(|_| saving_path.clone())
+                == path.canonicalize().unwrap_or_else(|_| path.clone())
+        }) {
+            self.pending_close_document = Some(path);
+            self.status = "该文档正在保存，保存完成后再关闭标签。".into();
+            return;
+        }
+        if self.documents.get(&path).is_some_and(|doc| doc.is_dirty()) {
+            self.pending_close_document = Some(path);
+            return;
+        }
+        self.close_document_now(path, false);
+    }
+
+    fn close_document_now(&mut self, path: PathBuf, discard: bool) {
+        if self.saving.as_ref().is_some_and(|(_, saving_path, _)| {
+            saving_path
+                .canonicalize()
+                .unwrap_or_else(|_| saving_path.clone())
+                == path.canonicalize().unwrap_or_else(|_| path.clone())
+        }) {
+            self.pending_close_document = Some(path);
+            return;
+        }
+        self.sync_active_document();
+        let was_active = self.file.as_ref().is_some_and(|active| {
+            active.canonicalize().unwrap_or_else(|_| active.clone())
+                == path.canonicalize().unwrap_or_else(|_| path.clone())
+        });
+        let has_pending_recovery = self
+            .documents
+            .get(&path)
+            .is_some_and(|doc| doc.pending_recovery.is_some());
+        if (discard
+            || (!has_pending_recovery
+                && self.documents.get(&path).is_some_and(|doc| !doc.is_dirty())))
+            && let Some(worker) = self.state_worker.as_ref()
+        {
+            worker.send(persistence::Job::DeleteJournal(path.clone()));
+        }
+        self.documents.remove(&path);
+        if let Some(task) = self.lsp_task.as_ref()
+            && let Ok(canonical) = path.canonicalize()
+        {
+            task.close(canonical);
+        }
+        if was_active {
+            self.hover_target = None;
+            self.hover_due = None;
+            self.hover_pointer = None;
+            self.completion_target = None;
+            self.completion_due = None;
+            self.completion_anchor = None;
+            self.definition_target = None;
+            self.lsp_hover.clear();
+            self.lsp_completions.clear();
+            self.lsp_definitions.clear();
+            self.editor_focused = false;
+            self.file = None;
+            self.mark_active_document_synced();
+            self.file_watch = None;
+            self.disk_stamp = None;
+            self.external_change = false;
+            self.pending_recovery = None;
+            self.dirty = false;
+            self.rust = include_str!("../examples/basics.rs").to_owned();
+            self.saved_source = self.rust.clone();
+            self.cursor_byte = 0;
+            self.mode = Mode::Java;
+            self.selected = None;
+            self.jump_to = None;
+            self.editor_jump = None;
+            self.editor_find = None;
+            self.update_projection();
+            if let Some(next) = self.documents.active_path() {
+                self.activate_document(next);
+            }
+        }
+        self.pending_close_document = None;
+        self.session_due = Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
+        self.status = format!("已关闭标签：{}", path.display());
     }
 
     fn update_projection(&mut self) {
@@ -939,28 +1590,91 @@ impl App {
         self.projection_pending = true;
         self.selected = None;
         self.jump_to = None;
+        self.hover_target = None;
+        self.hover_due = None;
+        self.hover_pointer = None;
+        self.completion_target = None;
+        self.completion_due = None;
+        self.definition_target = None;
+        self.lsp_hover.clear();
+        self.lsp_completions.clear();
         self.projection_due =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
     }
 
     fn save(&mut self) {
-        if self.saving.is_some() {
-            self.status = "保存任务已经在后台运行，请勿重复提交。".into();
-            return;
-        }
+        self.sync_active_document();
         let Some(path) = self.file.clone() else {
-            self.status = "Example is read-only; open a real .rs file to save.".into();
+            self.status = "内置示例为只读材料，打开真实 .rs 文件后才能保存。".into();
             return;
         };
+        self.start_save_path(path);
+    }
+
+    fn start_save_path(&mut self, path: PathBuf) {
+        if self.saving.is_some() {
+            self.status = "已有一个安全保存任务正在运行。".into();
+            return;
+        }
+        let Some(document) = self.documents.get(&path).cloned() else {
+            self.status = format!("文档已关闭，无法保存：{}", path.display());
+            return;
+        };
+        if !document.is_dirty() {
+            self.status = format!("{} 已经是最新版本。", path.display());
+            return;
+        }
+        if document.external_change {
+            self.status = format!("{} 已在外部修改；为避免覆盖，拒绝保存。", path.display());
+            return;
+        }
         self.io_revision += 1;
         let id = self.io_revision;
-        let content = self.rust.clone();
+        let content = document.source.clone();
         self.document_io
             .get_or_insert_with(document_io::DocumentIo::new)
-            .save(id, path.clone(), self.saved_source.clone(), content.clone());
-        self.saving = Some((id, path, content));
+            .save(
+                id,
+                path.clone(),
+                document.saved_source.clone(),
+                content.clone(),
+            );
+        self.saving = Some((id, path.clone(), content));
         self.saving_started = Some(std::time::Instant::now());
-        self.status = "正在后台安全保存 Rust 文件…".into();
+        self.status = format!("正在后台安全保存 {}…", path.display());
+    }
+
+    fn save_all_documents(&mut self) {
+        self.sync_active_document();
+        if self.saving.is_some() {
+            self.status = "当前保存完成后再继续保存其他文档。".into();
+            return;
+        }
+        self.save_queue = self.documents.dirty_paths().into();
+        if let Some(next) = self.save_queue.pop_front() {
+            self.start_save_path(next);
+        } else {
+            self.status = "所有打开的文档均已保存。".into();
+        }
+    }
+
+    fn cycle_document(&mut self, direction: isize) {
+        self.sync_active_document();
+        let paths = self.documents.paths();
+        if paths.len() < 2 {
+            return;
+        }
+        let Some(active) = self.file.as_ref() else {
+            return;
+        };
+        let Some(index) = paths.iter().position(|path| {
+            path.canonicalize().unwrap_or_else(|_| path.clone())
+                == active.canonicalize().unwrap_or_else(|_| active.clone())
+        }) else {
+            return;
+        };
+        let next = (index as isize + direction).rem_euclid(paths.len() as isize) as usize;
+        self.open(paths[next].clone());
     }
 
     fn directory(&mut self, ui: &mut egui::Ui, dir: &Path, depth: usize) {
@@ -1112,6 +1826,7 @@ impl App {
                 "File changed outside RustBridge; save is blocked until you reopen it.".into();
         }
         self.external_change = changed;
+        self.documents.set_external_change(path, changed);
     }
 
     fn check_analyzer(&mut self) {
@@ -1127,11 +1842,12 @@ impl App {
                 "Open a Cargo project before requesting diagnostics.".into();
             return;
         };
-        if self.dirty
-            && self
-                .file
-                .as_ref()
-                .is_some_and(|path| path.starts_with(&root))
+        self.sync_active_document();
+        if self
+            .documents
+            .dirty_paths()
+            .iter()
+            .any(|path| path.starts_with(&root))
         {
             self.analyzer_diagnostics_status =
                 "当前 Rust 文件有未保存修改：请先保存；诊断工具读取的是磁盘内容。".into();
@@ -1589,7 +2305,10 @@ impl App {
                 }
                 self.opening = None;
                 self.opening_started = None;
-                self.discard_on_open = false;
+                self.discard_on_open = None;
+                self.restore_queue.clear();
+                self.restore_states.clear();
+                self.restore_active = None;
                 self.status = "已取消当前打开请求；旧文件和未保存编辑保持不变。".into();
             }
             return;
@@ -1650,6 +2369,7 @@ impl eframe::App for App {
                 task.change(path, self.rust.clone(), self.revision);
             }
         }
+        self.dispatch_lsp_debounced();
         if let Some((revision, projection)) = self.worker.as_ref().and_then(|worker| worker.take())
             && revision == self.revision
         {
@@ -1706,115 +2426,202 @@ impl eframe::App for App {
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.close_requires_confirmation() {
-            if self.saving.is_some() {
-                self.after_save_close = true;
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.sync_active_document();
+            if self.close_requires_confirmation() {
+                if self.saving.is_some() {
+                    self.after_save_close = true;
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm_close = true;
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm_close = true;
         }
         if self.confirm_close {
             egui::Modal::new(egui::Id::new("confirm_close")).show(ctx, |ui| {
                 let durability_uncertain = self.status.contains("持久性未确认");
+                let dirty_count = self.documents.dirty_count();
                 ui.heading(if durability_uncertain {
                     "内容已提交，但目录持久性未确认"
                 } else {
-                    "Unsaved changes"
+                    "关闭 RustBridge"
                 });
+                ui.label(format!(
+                    "打开文档：{} 个；未保存文档：{} 个。",
+                    self.documents.len(),
+                    dirty_count
+                ));
                 ui.label(&self.status);
-                ui.horizontal(|ui| {
-                    if self.dirty
-                        && ui
-                            .add_enabled(self.saving.is_none(), egui::Button::new("Save and close"))
-                            .clicked()
-                    {
-                        self.after_save_close = true;
-                        self.save();
-                    }
-                    if durability_uncertain {
-                        if ui.button("确认警告并关闭").clicked() {
-                            self.confirm_close = false;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    } else if self.dirty
-                        && ui
-                            .add_enabled(
-                                self.saving.is_none(),
-                                egui::Button::new("Discard and close"),
-                            )
-                            .clicked()
-                    {
-                        self.discard_current_recovery();
-                        self.dirty = false;
+                if self.saving.is_some() {
+                    ui.spinner();
+                    ui.label("已接受的安全保存正在完成；关闭或放弃操作暂不可用。");
+                } else if durability_uncertain {
+                    if ui.button("确认风险并关闭").clicked() {
                         self.confirm_close = false;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    if ui.button("Cancel").clicked() {
-                        self.after_save_close = false;
-                        self.confirm_close = false;
-                    }
-                });
+                } else {
+                    ui.horizontal(|ui| {
+                        if dirty_count > 0 && ui.button("全部保存并关闭").clicked() {
+                            self.after_save_close = true;
+                            self.save_all_documents();
+                        }
+                        if dirty_count > 0 && ui.button("全部放弃并关闭").clicked() {
+                            self.sync_active_document();
+                            for path in self.documents.paths() {
+                                if let Some(worker) = self.state_worker.as_ref() {
+                                    worker.send(persistence::Job::DeleteJournal(path));
+                                }
+                            }
+                            self.documents.clear();
+                            self.file = None;
+                            self.dirty = false;
+                            self.confirm_close = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if dirty_count == 0 && ui.button("关闭").clicked() {
+                            self.confirm_close = false;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if ui.button("取消").clicked() {
+                            self.after_save_close = false;
+                            self.confirm_close = false;
+                        }
+                    });
+                }
             });
         }
+
         if (self.pending_open.is_some() || self.pending_project.is_some()) && !self.confirm_close {
             egui::Modal::new(egui::Id::new("confirm_open")).show(ctx, |ui| {
                 let switching_project = self.pending_project.is_some();
+                let dirty_count = self.documents.dirty_count();
+                let recovery_count = self.documents.recovery_count();
                 ui.heading(if switching_project {
                     "切换项目"
                 } else {
-                    "切换文件"
+                    "重新加载磁盘版本"
                 });
                 ui.label(if switching_project {
-                    "新项目只有在当前文档的保存或放弃决定完成后才会打开。"
+                    format!(
+                        "当前有 {dirty_count} 个未保存文档、{recovery_count} 个待恢复文档。切换项目会关闭这些标签；待恢复快照可以保留。"
+                    )
                 } else {
-                    "打开另一个文件前，请先处理当前未保存修改。"
+                    "重新加载将丢弃当前文档缓冲区；其他打开的文档不会受影响。".to_owned()
                 });
                 ui.label(&self.status);
 
                 if self.saving.is_some() {
                     ui.spinner();
-                    ui.label("已接受的保存任务仍在执行。保存完成后会继续切换；如有新修改，需要再次确认。");
+                    ui.label("已接受的保存任务仍在执行。");
                 } else {
                     let durability_uncertain = self.status.contains("持久性未确认");
-                    if durability_uncertain && !self.dirty {
+                    if durability_uncertain && dirty_count == 0 {
                         if ui.button("确认风险并继续").clicked() {
                             if let Some(folder) = self.pending_project.take() {
                                 self.apply_project(folder);
                             } else if let Some(path) = self.pending_open.take() {
-                                self.open_file(path);
+                                self.reload_file_from_disk(path);
                             }
                         }
-                    } else if self.dirty {
+                    } else {
                         ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(self.saving.is_none(), egui::Button::new("保存并继续"))
-                                .clicked()
-                            {
-                                self.after_save_open = self.pending_open.is_some();
-                                self.after_save_project = self.pending_project.is_some();
-                                self.save();
-                            }
-                            if ui
-                                .add_enabled(self.saving.is_none(), egui::Button::new("放弃并继续"))
-                                .clicked()
-                            {
-                                self.discard_current_recovery();
-                                self.dirty = false;
-                                if let Some(folder) = self.pending_project.take() {
-                                    self.apply_project(folder);
-                                } else if let Some(path) = self.pending_open.take() {
-                                    self.discard_on_open = true;
-                                    self.open_file(path);
+                            if switching_project {
+                                if dirty_count > 0
+                                    && ui.button("全部保存并切换").clicked()
+                                {
+                                    self.save_all_documents();
                                 }
+                                if dirty_count > 0
+                                    && ui.button("全部放弃并切换").clicked()
+                                {
+                                    for path in self.documents.paths() {
+                                        if let Some(worker) = self.state_worker.as_ref() {
+                                            worker.send(persistence::Job::DeleteJournal(path));
+                                        }
+                                    }
+                                    if let Some(folder) = self.pending_project.take() {
+                                        self.apply_project(folder);
+                                    }
+                                }
+                                if dirty_count == 0 && recovery_count > 0 {
+                                    if ui.button("保留恢复记录并切换").clicked()
+                                        && let Some(folder) = self.pending_project.take()
+                                    {
+                                        self.apply_project(folder);
+                                    }
+                                    if ui.button("删除恢复记录并切换").clicked() {
+                                        for path in self.documents.paths() {
+                                            if let Some(worker) = self.state_worker.as_ref() {
+                                                worker.send(persistence::Job::DeleteJournal(path));
+                                            }
+                                        }
+                                        if let Some(folder) = self.pending_project.take() {
+                                            self.apply_project(folder);
+                                        }
+                                    }
+                                }
+                                if dirty_count == 0
+                                    && recovery_count == 0
+                                    && let Some(folder) = self.pending_project.take()
+                                {
+                                    self.apply_project(folder);
+                                }
+                            } else if self.dirty {
+                                if ui.button("保存并重新加载").clicked() {
+                                    self.after_save_open = true;
+                                    self.save();
+                                }
+                                if ui.button("放弃当前修改并重新加载").clicked()
+                                    && let Some(path) = self.pending_open.take()
+                                {
+                                    self.reload_file_from_disk(path);
+                                }
+                            } else if let Some(path) = self.pending_open.take() {
+                                self.reload_file_from_disk(path);
+                            }
+                            if ui.button("取消").clicked() {
+                                self.pending_open = None;
+                                self.pending_project = None;
+                                self.after_save_open = false;
+                                self.after_save_project = false;
                             }
                         });
                     }
                 }
-                if ui.button("取消").clicked() {
-                    self.pending_open = None;
-                    self.pending_project = None;
-                    self.after_save_open = false;
-                    self.after_save_project = false;
+            });
+        }
+
+        if let Some(path) = self.pending_close_document.clone()
+            && !self.confirm_close
+            && self.pending_project.is_none()
+            && self.pending_open.is_none()
+        {
+            egui::Modal::new(egui::Id::new("close_document")).show(ctx, |ui| {
+                let dirty = self.documents.get(&path).is_some_and(|doc| doc.is_dirty());
+                ui.heading("关闭文档标签");
+                ui.label(path.display().to_string());
+                if self
+                    .saving
+                    .as_ref()
+                    .is_some_and(|(_, saving_path, _)| saving_path == &path)
+                {
+                    ui.spinner();
+                    ui.label("正在保存；保存完成后会自动关闭标签。");
+                } else if dirty {
+                    ui.label("该文档有独立的未保存修改。");
+                    ui.horizontal(|ui| {
+                        if ui.button("保存并关闭").clicked() {
+                            self.start_save_path(path.clone());
+                        }
+                        if ui.button("放弃并关闭").clicked() {
+                            self.close_document_now(path.clone(), true);
+                        }
+                        if ui.button("取消").clicked() {
+                            self.pending_close_document = None;
+                        }
+                    });
+                } else {
+                    self.close_document_now(path.clone(), false);
                 }
             });
         }
@@ -1855,6 +2662,7 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.pending_recovery = None;
+                        self.documents.set_pending_recovery(&journal.path, None);
                         self.rust = journal.edited.clone();
                         self.update_projection();
                         self.dirty = true;
@@ -1882,40 +2690,55 @@ impl eframe::App for App {
         }
         // Capture Ctrl+S before TextEdit can consume the event, but only save
         // AFTER the editor has applied all changes from this frame.
-        let (save_shortcut, mode_shortcut, page_delta) = ctx.input(|i| {
-            let mod_pressed = i.modifiers.ctrl || i.modifiers.command;
-            let requested_mode = if !mod_pressed {
-                None
-            } else if i.key_pressed(egui::Key::Num1) {
-                Some(Mode::Java)
-            } else if i.key_pressed(egui::Key::Num2) {
-                Some(Mode::Rust)
-            } else if i.key_pressed(egui::Key::Num3) {
-                Some(Mode::Compare)
-            } else if i.key_pressed(egui::Key::Num4) {
-                Some(Mode::Learn)
-            } else {
-                None
-            };
-            let page_delta = if !mod_pressed {
-                0_i32
-            } else if i.key_pressed(egui::Key::PageDown) {
-                1
-            } else if i.key_pressed(egui::Key::PageUp) {
-                -1
-            } else {
-                0
-            };
-            (
-                mod_pressed && i.key_pressed(egui::Key::S),
-                requested_mode,
-                page_delta,
-            )
-        });
+        let (save_shortcut, mode_shortcut, page_delta, close_tab_shortcut, document_cycle) = ctx
+            .input(|i| {
+                let mod_pressed = i.modifiers.ctrl || i.modifiers.command;
+                let requested_mode = if !mod_pressed {
+                    None
+                } else if i.key_pressed(egui::Key::Num1) {
+                    Some(Mode::Java)
+                } else if i.key_pressed(egui::Key::Num2) {
+                    Some(Mode::Rust)
+                } else if i.key_pressed(egui::Key::Num3) {
+                    Some(Mode::Compare)
+                } else if i.key_pressed(egui::Key::Num4) {
+                    Some(Mode::Learn)
+                } else {
+                    None
+                };
+                let page_delta = if !mod_pressed {
+                    0_i32
+                } else if i.key_pressed(egui::Key::PageDown) {
+                    1
+                } else if i.key_pressed(egui::Key::PageUp) {
+                    -1
+                } else {
+                    0
+                };
+                let close_tab = mod_pressed && i.key_pressed(egui::Key::W);
+                let cycle = if mod_pressed && i.key_pressed(egui::Key::Tab) {
+                    Some(if i.modifiers.shift { -1 } else { 1 })
+                } else {
+                    None
+                };
+                (
+                    mod_pressed && i.key_pressed(egui::Key::S),
+                    requested_mode,
+                    page_delta,
+                    close_tab,
+                    cycle,
+                )
+            });
         if let Some(mode) = mode_shortcut {
             self.mode = mode;
             self.last_scroll = None;
             self.jump_to = self.selected;
+        }
+        if close_tab_shortcut && let Some(path) = self.file.clone() {
+            self.request_close_document(path);
+        }
+        if let Some(direction) = document_cycle {
+            self.cycle_document(direction);
         }
         if page_delta != 0
             && self.mode == Mode::Rust
@@ -1937,7 +2760,11 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         self.poll_persistence();
-        if self.recovery_due.is_some() || self.session_due.is_some() {
+        if self.recovery_due.is_some()
+            || self.session_due.is_some()
+            || self.hover_due.is_some()
+            || self.completion_due.is_some()
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -1961,6 +2788,12 @@ fn diagnostic_location(source: &str, line: usize, column: usize) -> parser::Byte
         end: byte,
     }
 }
+
+fn same_document_path(left: &Path, right: &Path) -> bool {
+    left.canonicalize().unwrap_or_else(|_| left.to_path_buf())
+        == right.canonicalize().unwrap_or_else(|_| right.to_path_buf())
+}
+
 fn mode_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Java => "java",
@@ -1981,6 +2814,14 @@ fn normalized_completion(list: &[bool]) -> Vec<bool> {
     (0..lessons::LESSONS.len())
         .map(|i| list.get(i).copied().unwrap_or(false))
         .collect()
+}
+
+fn find_cargo_root(path: &Path) -> Option<PathBuf> {
+    let start = if path.is_dir() { path } else { path.parent()? };
+    start
+        .ancestors()
+        .find(|candidate| candidate.join("Cargo.toml").is_file())
+        .map(Path::to_path_buf)
 }
 
 fn is_cargo_root(path: &Path) -> bool {
@@ -2085,6 +2926,11 @@ mod file_tests {
             lesson: 6,
             cursor_byte: 3,
             completed_lessons: vec![true, false, true],
+            documents: vec![persistence::DocumentSession {
+                path: file.clone(),
+                cursor_byte: 3,
+                mode: "compare".into(),
+            }],
         };
         store.save_session(&session).unwrap();
         let mut app = App::default();
@@ -2146,6 +2992,207 @@ mod file_tests {
     }
 
     #[test]
+    fn two_open_documents_keep_independent_unsaved_buffers_and_save_baselines() {
+        let root = std::env::temp_dir().join(format!(
+            "rustbridge-document-manager-app-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"doc-manager-test\"\n",
+        )
+        .unwrap();
+        let a = root.join("src/a.rs");
+        let b = root.join("src/b.rs");
+        fs::write(&a, "fn a() {}").unwrap();
+        fs::write(&b, "fn b() {}").unwrap();
+
+        let mut app = App::default();
+        app.open_file(a.clone());
+        app.wait_for_document_io();
+        let edit_a = "\n// unsaved A";
+        let start_a = app.rust.len();
+        app.rust.push_str(edit_a);
+        app.source_edited(start_a..start_a, edit_a);
+        app.dirty = true;
+        app.sync_active_document();
+
+        app.open(b.clone());
+        app.wait_for_document_io();
+        assert_eq!(app.rust, "fn b() {}");
+        let edit_b = "\n// unsaved B";
+        let start_b = app.rust.len();
+        app.rust.push_str(edit_b);
+        app.source_edited(start_b..start_b, edit_b);
+        app.dirty = true;
+        app.sync_active_document();
+
+        app.open(a.clone());
+        assert!(app.dirty);
+        assert!(app.rust.contains("unsaved A"));
+        app.open(b.clone());
+        assert!(app.dirty);
+        assert!(app.rust.contains("unsaved B"));
+
+        app.save();
+        app.wait_for_document_io();
+        assert_eq!(fs::read_to_string(&b).unwrap(), "fn b() {}\n// unsaved B");
+        assert!(app.documents.get(&a).unwrap().is_dirty());
+        assert!(!app.documents.get(&b).unwrap().is_dirty());
+
+        app.open(a.clone());
+        assert!(app.dirty);
+        assert!(app.rust.contains("unsaved A"));
+
+        app.save_all_documents();
+        app.wait_for_document_io();
+        assert_eq!(fs::read_to_string(&a).unwrap(), "fn a() {}\n// unsaved A");
+        assert!(!app.documents.get(&a).unwrap().is_dirty());
+        assert!(!app.documents.get(&b).unwrap().is_dirty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn syncing_cursor_and_mode_does_not_clone_document_source_each_frame() {
+        let root =
+            std::env::temp_dir().join(format!("rustbridge-sync-no-clone-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"sync-no-clone\"\n",
+        )
+        .unwrap();
+        let path = root.join("src/main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let mut app = App::default();
+        app.open_file(path.clone());
+        app.wait_for_document_io();
+        let original_ptr = app.documents.get(&path).unwrap().source.as_ptr();
+
+        app.sync_active_document();
+        assert_eq!(
+            app.documents.get(&path).unwrap().source.as_ptr(),
+            original_ptr
+        );
+
+        app.cursor_byte = 4;
+        app.sync_active_document();
+        assert_eq!(
+            app.documents.get(&path).unwrap().source.as_ptr(),
+            original_ptr
+        );
+
+        app.mode = Mode::Compare;
+        app.sync_active_document();
+        assert_eq!(
+            app.documents.get(&path).unwrap().source.as_ptr(),
+            original_ptr
+        );
+
+        let insertion = " // edited";
+        let offset = app.rust.len();
+        app.rust.push_str(insertion);
+        app.source_edited(offset..offset, insertion);
+        app.dirty = true;
+        app.sync_active_document();
+        assert_ne!(
+            app.documents.get(&path).unwrap().source.as_ptr(),
+            original_ptr
+        );
+        assert!(app.documents.get(&path).unwrap().is_dirty());
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restoring_a_session_reopens_every_document_and_keeps_recovery_per_tab() {
+        let root =
+            std::env::temp_dir().join(format!("rustbridge-session-docs-{}", std::process::id()));
+        let state_dir = std::env::temp_dir().join(format!(
+            "rustbridge-session-state-multi-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"session-docs-test\"\n",
+        )
+        .unwrap();
+        let a = root.join("src/a.rs");
+        let b = root.join("src/b.rs");
+        let bad = root.join("src/not-rust.txt");
+        fs::write(&a, "fn a() {}").unwrap();
+        fs::write(&b, "fn b() {}").unwrap();
+        fs::write(&bad, "not a Rust source file").unwrap();
+
+        let store = persistence::Store::new(state_dir.clone()).unwrap();
+        store
+            .save_session(&persistence::Session {
+                root: Some(root.clone()),
+                file: Some(b.clone()),
+                mode: "compare".into(),
+                documents: vec![
+                    persistence::DocumentSession {
+                        path: bad,
+                        cursor_byte: 0,
+                        mode: "rust".into(),
+                    },
+                    persistence::DocumentSession {
+                        path: a.clone(),
+                        cursor_byte: 3,
+                        mode: "rust".into(),
+                    },
+                    persistence::DocumentSession {
+                        path: b.clone(),
+                        cursor_byte: 5,
+                        mode: "compare".into(),
+                    },
+                ],
+                ..persistence::Session::default()
+            })
+            .unwrap();
+        store
+            .save_journal(&a, "fn a() {}", "fn a() { /* recovered A */ }")
+            .unwrap();
+        store
+            .save_journal(&b, "fn b() {}", "fn b() { /* recovered B */ }")
+            .unwrap();
+
+        let mut app = App::default();
+        app.initialize_state_from_store(store, true);
+        let in_flight_session = app.session_snapshot();
+        assert_eq!(in_flight_session.documents.len(), 3);
+        assert_eq!(in_flight_session.file, Some(b.clone()));
+        assert_eq!(in_flight_session.cursor_byte, 5);
+
+        // Opening another file while the first restored tab is still loading
+        // must not drop that in-flight tab from the restore queue.
+        let c = root.join("src/c.rs");
+        fs::write(&c, "fn c() {}").unwrap();
+        app.open(c.clone());
+        app.wait_for_document_io();
+
+        assert_eq!(app.documents.len(), 3);
+        assert_eq!(app.file.as_ref(), Some(&c));
+        assert!(app.documents.get(&a).unwrap().pending_recovery.is_some());
+        assert!(app.documents.get(&b).unwrap().pending_recovery.is_some());
+        app.open(b.clone());
+        assert_eq!(
+            app.pending_recovery
+                .as_ref()
+                .map(|journal| journal.path.clone()),
+            Some(b)
+        );
+
+        drop(app);
+        fs::remove_dir_all(state_dir).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn closing_a_background_save_always_requires_confirmation() {
         let mut app = App::default();
         assert!(!app.close_requires_confirmation());
@@ -2162,13 +3209,24 @@ mod file_tests {
         app.rust.push_str("\n// unsaved");
         app.dirty = true;
         let before = app.rust.clone();
-        app.discard_on_open = true;
-        app.open_file(std::env::temp_dir().join("this-path-does-not-exist-failed-open.rs"));
+        let target = std::env::temp_dir().join("this-path-does-not-exist-failed-open.rs");
+        app.discard_on_open = Some(target.clone());
+        app.open_file(target);
         app.wait_for_document_io();
         assert_eq!(app.rust, before);
         assert!(app.dirty);
-        assert!(!app.discard_on_open);
+        assert!(app.discard_on_open.is_none());
     }
+    #[test]
+    fn discard_intent_is_bound_to_its_original_document_path() {
+        let mut app = App::default();
+        let target = std::env::temp_dir().join("rustbridge-discard-target.rs");
+        let other = std::env::temp_dir().join("rustbridge-other-target.rs");
+        app.discard_on_open = Some(target);
+        app.open_file(other);
+        assert!(app.discard_on_open.is_none());
+    }
+
     #[test]
     fn external_changes_and_deletion_block_save() {
         let path =

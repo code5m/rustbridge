@@ -10,20 +10,20 @@
 - Project navigation explains: "Open a folder to browse the real project; open a .rs file to edit source."
 - Java reading remains the default mode.
 - Rust Source mode must show a read-only explanation and a disabled editor for the bundled sample. Save must be disabled.
-- Do not auto-run Cargo, start rust-analyzer, or index a workspace on startup.
+- Do not auto-run Cargo or start rust-analyzer on application/project startup. Start rust-analyzer lazily only when the user enters the Rust editor for a real Cargo-project file; manual Stop suppresses auto-restart until the user manually starts it again.
 
 ### Open project
 1. User selects **Open Project**.
-2. If the current source is dirty or saving, show the shared transition dialog.
-3. **Save and open:** wait for a durable save; only then switch.
-4. **Discard and open:** discard the current recovery journal under explicit user consent; only then switch.
+2. If any open document is dirty, saving, or has an unresolved recovery snapshot, show the shared project-transition dialog with the state of every affected document.
+3. **Save and open:** save all dirty documents sequentially and wait for durable completion; only then switch.
+4. **Discard and open:** discard all dirty buffers only under explicit user consent. Unresolved crash-recovery snapshots must be separately preserved or explicitly deleted.
 5. **Cancel:** retain the old project, file, buffer, cursor, and dirty state.
 6. After confirmation, stop project-scoped background tasks, clear stale diagnostics/results, reset file watcher and directory index, close the old file context, and display the new real filesystem root.
 7. A failed directory selection/open leaves the prior project intact.
 
 ### Open file
 1. User selects a real `.rs` file from Project, Search, Recent, or Open File.
-2. Apply the same Save / Discard / Cancel protection.
+2. If the file is already open, activate its existing tab. If it is new, open it as another document tab; do not require saving or discarding other tabs.
 3. Read asynchronously; keep the previous buffer visible until the new read succeeds.
 4. If read fails or is cancelled, retain the previous file and its dirty state.
 5. On success, update the file path, source baseline, projection, cursor/session state, and file watcher together.
@@ -40,7 +40,18 @@ Always expose:
 - Bottom Tool Window visibility.
 - Current file/project and dirty/external-change state.
 
-The bar may wrap on narrow windows. It must not hide the only way to restore a panel.
+The bar may wrap on narrow windows. It must not hide the only way to restore a panel. Show a real document tab strip with per-tab dirty/external-change markers and a close action; Save All is available when more than one document is dirty.
+
+## 2.1 Document tabs and save lifecycle
+
+- Each tab owns a stable Document ID, source buffer, saved baseline, dirty state, cursor, reading mode, disk identity/external-change state and pending recovery snapshot.
+- Reopening an already-open path activates the existing tab; it must not create a duplicate buffer or overwrite unsaved text from disk.
+- Switching tabs preserves every document's buffer and dirty state. Opening a new file is asynchronous and does not block the editor.
+- Closing a clean tab closes immediately. Closing a dirty tab requires Save / Discard / Cancel for that document only. A save already in flight must finish before the tab closes.
+- Save All serializes accepted saves, reports the exact failing document and stops the remaining queue on conflict/failure. No successful save may mark a newer unsaved buffer clean.
+- Session persistence records tab order, active path, per-tab cursor/mode and all pending document paths even while asynchronous restore is in progress.
+- Restart restores all valid tabs; an unreadable/unsupported entry must not prevent later tabs from restoring. Dirty recovery journals remain attached to their own document and are never silently overwritten by another tab.
+- Project switch and application close account for all dirty documents, not only the active editor. Unresolved recovery snapshots must be explicitly preserved or deleted when changing projects.
 
 ## 3. Left navigation
 
@@ -49,7 +60,7 @@ The bar may wrap on narrow windows. It must not hide the only way to restore a p
 - Display actual directories and files in filesystem order policy; do not replace paths with tutorial categories.
 - Excluded technical directories are hidden only by explicit documented defaults and can be shown on demand.
 - Recent files remain secondary to the current real tree.
-- File selection always goes through the document transition guard.
+- Selecting an already-open file activates its existing tab. Selecting a new file in the same project opens a new document without discarding other tabs or their unsaved buffers.
 
 ### Structure
 - Show declarations/concepts extracted from the current Rust AST.
@@ -61,7 +72,7 @@ The bar may wrap on narrow windows. It must not hide the only way to restore a p
 - Search real Rust filenames in the current project.
 - Search same-name AST declaration candidates separately; label them as candidates, not resolved definitions.
 - Empty and no-result states explain whether a project is required or no match was found.
-- Clicking a result uses the document transition guard.
+- Clicking a result activates its existing document tab or asynchronously opens a new one; other tabs and their dirty buffers remain untouched.
 
 ### Learn
 - Show all twelve lessons and completion progress.
@@ -69,8 +80,8 @@ The bar may wrap on narrow windows. It must not hide the only way to restore a p
 - Returning from a concept-linked lesson returns to the prior code mode and selected AST anchor.
 
 ### Tools
-- Show rust-analyzer availability, optional LSP start/stop, and analyzer diagnostics controls.
-- State clearly that LSP/diagnostics are opt-in and may index the project.
+- Show rust-analyzer status and manual start/stop override, plus analyzer diagnostics controls.
+- Explain that LSP starts lazily on entry to the real Rust editor in a Cargo project and may index the workspace; analyzer diagnostics remain explicitly opt-in.
 - Do not mix Cargo run actions into the Project section.
 
 ## 4. Central workbench
@@ -84,7 +95,7 @@ The bar may wrap on narrow windows. It must not hide the only way to restore a p
 ### Rust Source
 - Only a real opened `.rs` file is editable.
 - Show real path, dirty state, and external-change warning.
-- Hover/type/definition interactions should progressively become editor-native when the LSP implementation supports reliable cursor-position integration; do not simulate automatic behavior with unrelated buttons.
+- Hover displays type information near the pointer; typing triggers debounced Completion; F12 jumps to Definition; Ctrl+Space opens the completion list. These interactions must be driven by editor cursor/pointer events, not separate request buttons. Replies are discarded when the document path, revision or queried position is stale.
 - Large files retain bounded page rendering and absolute source positions.
 
 ### Compare

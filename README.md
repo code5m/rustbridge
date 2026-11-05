@@ -28,16 +28,16 @@ RustBridge is written in Rust (egui/eframe + Tree-sitter). There is no JVM, Elec
 RustBridge v0.5 keeps real Rust files as the only editable source. Java code on screen is a read-only conceptual projection, not an executable transpilation.
 
 - **Crash recovery:** private local journal of dirty Rust source with a full saved baseline; on restart, restore into the editor only if the disk still matches that baseline. Otherwise export a non-overwriting recovery copy.
-- **Session continuity:** resume real project/file, reading mode, lesson progress and Rust cursor position.
+- **Multi-document workspace:** real document tabs with stable Document IDs, independent source buffers, save baselines, dirty/external-change state, cursor/mode and per-document recovery. Ctrl+Tab cycles tabs; Ctrl+W closes the current tab. Save and Save All operate on the intended document(s). Session restore reopens all tabs and continues after an individual unreadable tab.
 - **Interactive learning:** twelve short Java8→Rust quizzes; incorrect answers have conceptual explanations, and progress is stored privately.
-- **Optional rust-analyzer LSP:** real JSON-RPC hover, completion, same/cross-file definition locations, UTF-16 coordinates and cancellable server lifecycle. Enable explicitly; semantic indexing may take time.
+- **Editor-native rust-analyzer LSP:** real JSON-RPC Hover, Completion and same/cross-file Definition with UTF-16 coordinates, path/version-scoped replies, snippet expansion and cancellable server lifecycle. It starts lazily when entering a real Rust editor in a Cargo project (not on app/project startup); manual Stop suppresses automatic restart until manually started again. Semantic indexing may take time.
 - **User-authorized Cargo:** explicit trust approval before cargo check/test/run (including potentially unsafe build.rs/project code), bounded subprocess output, timeouts, cancellation and clickable rustc diagnostics.
 - **Sliding virtual source window:** a global line slider, wheel-edge rebase and keyboard navigation across a bounded 240-line moving editor. This is not a full rope-based text editor.
 - **Source safety:** per-path cooperative Unix lock, exclusive Windows open handles, separate read/save workers with cancelable reads and slow-I/O status. Accepted saves never silently exit on a close request.
 - **Three native platforms:** Debian .deb, macOS .app zip, Windows portable zip and NSIS user installer. Mac/Windows write through the existing open file handle plus a private recovery backup, **not** the same power-loss atomic rename as Linux. Windows/macOS builds are unsigned/unnotarized.
 - **Verification:** Linux real X11 keyboard, source-save/crash-restart checks, real Ubuntu GNOME Wayland window probe, native Windows/macOS CI build/test/package, CPU/RSS/fd budgets and scheduled endurance. See the v0.5 integrated 13-workstream report in docs/v0.5-integrated-13.md.
 
-Keyboard: Ctrl+1/2/3/4 switches Java/Rust/Compare/Lessons; Ctrl+PageDown/Up traverses large source windows; Ctrl+S saves the actual Rust source.
+Keyboard: Ctrl+1/2/3/4 switches Java/Rust/Compare/Lessons; Ctrl+PageDown/Up traverses large source windows; Ctrl+S saves the active Rust document; Ctrl+Tab cycles document tabs; Ctrl+W closes the active tab; F12 jumps to definition; Ctrl+Space requests completion.
 
 ## v0.4 safety, UX and Linux release
 
@@ -122,11 +122,12 @@ larger than or equal to 512 KiB, with a sliding window and global line slider; t
 | `src/safe_save.rs` | Staged atomic writes and external-editor conflict checks |
 | `src/analyzer.rs` | Opt-in process-scoped rust-analyzer diagnostic checks |
 | `src/file_watch.rs` | Reusable background file identity/ctime/mtime monitoring |
-| `src/document_io.rs` | Async source open/save, generation-based cancellation and file limits |
+| src/document_manager.rs | Stable document identity, independent buffers, dirty state, saved baselines, recovery and active-tab ownership |
+| src/document_io.rs | Async source open/save, generation-based cancellation and file limits |
 | `src/symbol_search.rs` | Bounded AST-only declaration candidate search (not a resolver) |
 | src/lessons.rs / src/lesson_quiz.rs | 12 Java↔Rust lessons, quizzes and mastery progress |
 | src/persistence.rs | Crash journals, atomic session snapshots and private recovery export |
-| src/lsp.rs | Opt-in rust-analyzer JSON-RPC client and UTF-16 position mapping |
+| src/lsp.rs | Lazy-start rust-analyzer JSON-RPC client, multi-document synchronization, snippet expansion and UTF-16 position mapping |
 | src/cargo_runner.rs | User-approved Cargo check/test/run, cancellation and compiler diagnostics |
 | src/line_index.rs | Incremental UTF-8 source line-offset maintenance |
 | scripts/package-deb.sh / scripts/package-macos.sh / scripts/package-windows.ps1 | Native Linux/macOS/Windows packages |
@@ -144,7 +145,7 @@ Text transforms never reorder source statements or insert/remove newlines, prese
 
 ## Honest limits after v0.5
 
-- **Semantics:** LSP is opt-in and may need indexing and Cargo configuration beyond default safe options. Java projection is not a type-resolved translator; Rust code executes only with explicit Cargo authorization.
+- **Semantics:** LSP starts lazily on entry to a Cargo project's Rust editor and may need indexing and Cargo configuration beyond default safe options. Hover/Completion/Definition are compiler-backed, but workspace edits are never applied automatically. Java projection is not a type-resolved translator; Rust code executes only with explicit Cargo authorization.
 - **Source correctness:** cooperating RustBridge writers are serialized, but uncooperative editors can still race final Linux rename. Remote filesystem system calls can block despite worker deadlines checked between chunks.
 - **OS differences:** macOS and Windows preserve the file's metadata through its existing open handle and private rollback backup, not a power-loss-atomic rename. Linux has real automated X11 interaction; the Wayland window probe does not substitute for human usability acceptance.
 - **Distribution:** Windows/macOS artifacts are unsigned. No debugger, general plugin marketplace or complete general-purpose IDE replacement.

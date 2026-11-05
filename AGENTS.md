@@ -95,8 +95,8 @@ The binding product and architecture decisions are recorded in `docs/ui-2.0-deci
 - Compare must preserve exact AST token pairing and linked scrolling. A draggable divider may change layout only; it must never change source mapping or selection.
 - Opening a project must use the same unsaved/save-in-progress lifecycle guard as opening a file. On project switch, cancel old project tasks and clear stale diagnostics before presenting the new root.
 - The bundled example is read-only. Never show an enabled editor/save action for a buffer without a real source path.
-- LSP and diagnostics remain opt-in. Cargo Check/Test/Run always require explicit project trust confirmation; opening a project never executes user code.
-- Do not fake multi-document tabs with a list of recent paths. A true tab implementation requires per-document buffers, dirty baselines, watchers, recovery journals, and asynchronous I/O ownership.
+- rust-analyzer LSP starts lazily only when the user enters the real Rust editor for a Cargo-project file; application/project startup does not launch indexing. Manual Stop suppresses automatic restart until manual Start. Analyzer diagnostics remain opt-in. Cargo Check/Test/Run always require explicit project trust confirmation; opening a project never executes user code.
+- Multi-document tabs are real Document Manager entities, not recent-path buttons. Preserve per-document buffer, dirty baseline, cursor/mode, disk identity, recovery journal and async I/O ownership. Same-project tab switching must never discard another document's unsaved buffer.
 - Responsive behavior must collapse secondary panels before making code panes unreadable. Keep the minimum window usable and provide visible controls to restore hidden panels.
 - Do not weaken existing safe-save, recovery, CRLF/Unicode, large-file, process-cancellation, or resource guarantees for visual convenience.
 - UI changes require unit/regression tests plus a real desktop visual/interaction check when possible. Headless window survival is not proof of visual usability.

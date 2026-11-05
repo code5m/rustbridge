@@ -34,7 +34,7 @@ The application shell has five regions:
 - **Structure:** AST-backed declarations and concepts from the current real Rust file. Do not claim unresolved symbols are semantically resolved.
 - **Search:** real Rust file search and explicitly labeled same-name AST declaration candidates.
 - **Learn:** the twelve Java 8 → Rust lessons, completion state, and direct entry to the teaching workspace.
-- **Tools:** optional rust-analyzer availability/diagnostics and LSP lifecycle controls. Advanced tools are discoverable but not permanently mixed into Project.
+- **Tools:** rust-analyzer status and manual start/stop override, plus explicitly opt-in diagnostics. LSP starts lazily on entry to the real Rust editor in a Cargo project; advanced tools remain discoverable without being mixed into Project.
 
 Cargo Check/Test/Run actions belong to the bottom Build/Run tool windows, not the Project tree.
 
@@ -95,7 +95,7 @@ Use a restrained native IDE visual language inspired by the clarity of Chrome an
 - Unknown or approximate mappings remain visibly conservative.
 
 ### Tools and feedback
-- LSP and analyzer are opt-in; opening a project must not implicitly launch indexing or execute project code.
+- Opening an application or project must not launch LSP or indexing. rust-analyzer starts lazily only when a user enters the real Rust editor for a Cargo-project file; a manual Stop disables automatic restart until manual Start. Analyzer diagnostics remain opt-in, and no LSP workspace edits or Cargo execution are applied automatically.
 - Cargo Check/Test/Run require explicit project trust confirmation every time a new action is started.
 - Diagnostics are actionable: clicking a diagnostic navigates to its real file/line when safe; stale results from another project are never shown as current.
 - Background work has visible pending, success, warning, failure, and cancellation feedback.
@@ -115,7 +115,7 @@ Use a restrained native IDE visual language inspired by the clarity of Chrome an
 - Keep filesystem, parsing, projection, LSP, Cargo, and save work off the rendering thread where already designed.
 - Do not weaken the current safety, recovery, CRLF, Unicode, large-file, or resource guarantees to achieve a visual change.
 - UI state must not become a second source of truth for the filesystem or document contents.
-- A tab strip must not be faked with recent-file buttons. True multi-document tabs require a real Document Manager with per-document buffer, dirty state, save baseline, watcher, recovery, and async I/O ownership.
+- A tab strip must not be faked with recent-file buttons. True multi-document tabs require a real Document Manager with per-document buffer, dirty state, save baseline, watcher, recovery, and async I/O ownership. This is implemented in src/document_manager.rs and integrated with DocumentIo and session persistence.
 
 ## 10. Explicit non-goals for this UI pass
 
