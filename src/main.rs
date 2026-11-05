@@ -24,7 +24,9 @@ mod ui_layout;
 
 use editor_core::line_number_gutter;
 use eframe::egui::{self, Color32};
-use file_watch::{FileStamp, file_stamp};
+use file_watch::FileStamp;
+#[cfg(test)]
+use file_watch::file_stamp;
 #[cfg(test)]
 use safe_save::save_if_unchanged;
 #[cfg(test)]
@@ -110,7 +112,13 @@ struct App {
     restore_queue: VecDeque<PathBuf>,
     restore_states: HashMap<PathBuf, persistence::DocumentSession>,
     restore_active: Option<PathBuf>,
-    orphan_recovery: Vec<persistence::Journal>,
+    orphan_recovery: Vec<persistence::RecoveryEntry>,
+    orphan_recovery_offset: usize,
+    recovery_scan_warning: Option<String>,
+    recovery_export_receiver: Option<std::sync::mpsc::Receiver<String>>,
+    startup_receiver: Option<std::sync::mpsc::Receiver<StartupResult>>,
+    startup_restore_last_document: bool,
+    startup_explicit_path: Option<PathBuf>,
     pending_close_document: Option<PathBuf>,
     save_queue: VecDeque<PathBuf>,
     save_errors: Vec<String>,
@@ -193,6 +201,16 @@ struct App {
     hover_pointer: Option<egui::Pos2>,
 }
 
+/// Startup disk I/O is deliberately kept off the egui render loop.
+type StartupResult = Result<
+    (
+        persistence::Store,
+        Option<persistence::Session>,
+        persistence::RecoveryInventory,
+    ),
+    String,
+>;
+
 impl Default for App {
     fn default() -> Self {
         let rust = include_str!("../examples/basics.rs").to_owned();
@@ -250,6 +268,12 @@ impl Default for App {
             restore_states: HashMap::new(),
             restore_active: None,
             orphan_recovery: Vec::new(),
+            orphan_recovery_offset: 0,
+            recovery_scan_warning: None,
+            recovery_export_receiver: None,
+            startup_receiver: None,
+            startup_restore_last_document: false,
+            startup_explicit_path: None,
             pending_close_document: None,
             save_queue: VecDeque::new(),
             save_errors: Vec::new(),
@@ -487,32 +511,116 @@ impl App {
     }
 
     fn initialize_state(&mut self, restore_last_document: bool) {
-        let store = match persistence::Store::from_system() {
-            Ok(store) => store,
-            Err(error) => {
-                self.status = format!("Session storage unavailable: {error}");
-                return;
-            }
-        };
-        self.initialize_state_from_store(store, restore_last_document);
+        self.startup_restore_last_document = restore_last_document;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.startup_receiver = Some(rx);
+        self.status = "正在后台读取工作区状态及崩溃恢复索引…".into();
+        std::thread::spawn(move || {
+            let result: StartupResult = (|| {
+                let store = persistence::Store::from_system().map_err(|error| error.to_string())?;
+                let session = store.load_session();
+                let inventory = store.scan_journals();
+                Ok((store, session, inventory))
+            })();
+            let _ = tx.send(result);
+        });
     }
+
+    fn poll_startup_state(&mut self, ctx: &egui::Context) -> bool {
+        let Some(receiver) = self.startup_receiver.as_ref() else {
+            return true;
+        };
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.startup_receiver = None;
+                match result {
+                    Ok((store, session, inventory)) => {
+                        self.initialize_state_from_scanned(
+                            store,
+                            session,
+                            inventory,
+                            self.startup_restore_last_document,
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("工作区恢复存储不可用：{error}");
+                    }
+                }
+                if let Some(path) = self.startup_explicit_path.take() {
+                    self.apply_explicit_startup_path(path);
+                }
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.startup_receiver = None;
+                self.status = "后台工作区恢复进程异常退出，未读取任何历史状态。".into();
+                if let Some(path) = self.startup_explicit_path.take() {
+                    self.apply_explicit_startup_path(path);
+                }
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.heading("RustBridge");
+                        ui.spinner();
+                        ui.label("正在后台读取会话和崩溃恢复索引，界面仍可响应。");
+                        ui.small("无文件覆盖；加载完成后恢复文件标签。");
+                    });
+                });
+                ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                false
+            }
+        }
+    }
+
+    fn apply_explicit_startup_path(&mut self, path: PathBuf) {
+        if path.is_dir() {
+            self.cargo_project = is_cargo_root(&path);
+            self.root = Some(path);
+        } else if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            self.open_file(path);
+        } else {
+            self.status = "参数必须是实际目录或可读的 .rs 文件。".into();
+        }
+    }
+
+    /// Synchronous path remains available to deterministic unit tests.
+    #[cfg(test)]
     fn initialize_state_from_store(
         &mut self,
         store: persistence::Store,
         restore_last_document: bool,
     ) {
-        // A crash may happen before the first session.json was committed.
-        // Journals remain discoverable even without a saved session.
-        let saved_journals = store.load_all_journals();
+        let session = store.load_session();
+        let inventory = store.scan_journals();
+        self.initialize_state_from_scanned(store, session, inventory, restore_last_document);
+    }
+
+    fn initialize_state_from_scanned(
+        &mut self,
+        store: persistence::Store,
+        session: Option<persistence::Session>,
+        inventory: persistence::RecoveryInventory,
+        restore_last_document: bool,
+    ) {
+        self.recovery_scan_warning = inventory.warning();
+        let saved_journals = inventory.entries;
         self.orphan_recovery = saved_journals
             .iter()
-            .filter(|journal| !journal.path.is_file())
+            .filter(|entry| !entry.source_exists)
             .cloned()
             .collect();
-        if let Some(session) = store.load_session().or_else(|| {
+        // Must install the recovery store *before* scheduling the first
+        // asynchronous source open. Otherwise its Open job captures None
+        // and the first tab silently loses its crash journal.
+        self.state_worker = Some(persistence::PersistenceWorker::spawn(store.clone()));
+        self.state_store = Some(store);
+        if let Some(session) = session.or_else(|| {
             saved_journals
                 .iter()
-                .any(|journal| journal.path.is_file())
+                .any(|entry| entry.source_exists)
                 .then(persistence::Session::default)
         }) {
             self.lesson = session.lesson.min(lessons::LESSONS.len().saturating_sub(1));
@@ -557,10 +665,7 @@ impl App {
                         mode: session.mode.clone(),
                     });
                 }
-                for journal in saved_journals
-                    .iter()
-                    .filter(|journal| journal.path.is_file())
-                {
+                for journal in saved_journals.iter().filter(|entry| entry.source_exists) {
                     if !documents
                         .iter()
                         .any(|document| same_document_path(&document.path, &journal.path))
@@ -607,8 +712,49 @@ impl App {
             }
             self.last_session = Some(session);
         }
-        self.state_worker = Some(persistence::PersistenceWorker::spawn(store.clone()));
-        self.state_store = Some(store);
+    }
+
+    fn start_recovery_export(&mut self, source: PathBuf, destination: PathBuf) {
+        if self.recovery_export_receiver.is_some() {
+            self.status = "当前恢复导出仍在执行，请先查看其完成结果。".into();
+            return;
+        }
+        let Some(store) = self.state_store.clone() else {
+            self.status = "当前恢复存储不可用，无法导出。".into();
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.recovery_export_receiver = Some(rx);
+        self.status = format!("正在后台导出恢复副本：{}", destination.display());
+        std::thread::spawn(move || {
+            let result = match store.load_journal(&source) {
+                Some(journal) => match store.export_recovery(&journal, &destination) {
+                    Ok(()) => format!("已导出恢复副本：{}", destination.display()),
+                    Err(error) => format!("恢复导出失败；没有覆盖已有文件：{error}"),
+                },
+                None => "恢复快照已丢失、损坏或超过大小上限，未写入目标文件。".into(),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_recovery_export(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.recovery_export_receiver.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(message) => {
+                self.recovery_export_receiver = None;
+                self.status = message;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.recovery_export_receiver = None;
+                self.status = "恢复副本导出任务异常终止，目标文件需人工核查。".into();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+            }
+        }
     }
 
     fn session_snapshot(&self) -> persistence::Session {
@@ -1316,7 +1462,7 @@ impl App {
         self.opening_started = Some(std::time::Instant::now());
         self.document_io
             .get_or_insert_with(document_io::DocumentIo::new)
-            .open(id, path);
+            .open_with_recovery(id, path, self.state_store.clone());
         self.status = "正在后台读取 Rust 文件…".into();
     }
 
@@ -1352,17 +1498,15 @@ impl App {
         let mode = restored
             .as_ref()
             .map_or_else(|| "java".to_owned(), |state| state.mode.clone());
-        let loaded_source = loaded.source.clone();
-        self.documents
-            .insert_loaded(path.clone(), loaded.source, cursor_byte, mode, loaded.stamp);
         let recovery = if discarding_recovery {
             None
         } else {
-            self.state_store
-                .as_ref()
-                .and_then(|store| store.load_journal(&path))
-                .filter(|journal| journal.edited != loaded_source)
+            loaded
+                .recovery
+                .filter(|journal| journal.edited != loaded.source)
         };
+        self.documents
+            .insert_loaded(path.clone(), loaded.source, cursor_byte, mode, loaded.stamp);
         self.documents.set_pending_recovery(&path, recovery);
         self.activate_document(path);
 
@@ -1400,10 +1544,10 @@ impl App {
         }
         self.mode = mode_from_name(&document.mode);
         self.disk_stamp = document.disk_stamp;
-        let current_stamp = file_watch::file_stamp(&document.path).ok();
-        self.external_change = current_stamp.is_some() && current_stamp != self.disk_stamp;
-        self.documents
-            .set_external_change(&document.path, self.external_change);
+        // Never synchronously query a slow filesystem during tab activation.
+        // The reusable background watcher revalidates the switched-to path;
+        // explicit saves independently re-check disk identity and contents.
+        self.external_change = document.external_change;
 
         self.update_projection();
         self.editor_gutter_revision = 0;
@@ -2012,11 +2156,10 @@ impl App {
         self.recent_files.truncate(8);
     }
 
-    fn check_external_change(&mut self) {
+    fn apply_external_stamp(&mut self, current: Option<FileStamp>) {
         let Some(path) = self.file.as_ref() else {
             return;
         };
-        let current = file_stamp(path).ok();
         let changed = current != self.disk_stamp;
         if changed && !self.external_change {
             self.status =
@@ -2024,6 +2167,12 @@ impl App {
         }
         self.external_change = changed;
         self.documents.set_external_change(path, changed);
+    }
+
+    #[cfg(test)]
+    fn check_external_change(&mut self) {
+        let stamp = self.file.as_ref().and_then(|path| file_stamp(path).ok());
+        self.apply_external_stamp(stamp);
     }
 
     fn check_analyzer(&mut self) {
@@ -2547,6 +2696,10 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.poll_startup_state(ctx) {
+            return;
+        }
+        self.poll_recovery_export(ctx);
         self.poll_document_io(ctx);
         self.poll_cargo();
         self.poll_practice();
@@ -2565,12 +2718,12 @@ impl eframe::App for App {
                     ctx.clone(),
                 ));
             }
-            if self
+            if let Some(stamp) = self
                 .file_watch
                 .as_ref()
-                .is_some_and(|watch| watch.changed())
+                .and_then(|watch| watch.take_changed_stamp())
             {
-                self.check_external_change();
+                self.apply_external_stamp(stamp);
             }
         } else {
             self.file_watch = None;
@@ -2900,15 +3053,7 @@ impl eframe::App for App {
                     }
                     if ui.button("导出恢复副本").clicked() {
                         let destination = journal.path.with_extension("rustbridge-recovery.rs");
-                        let result = self
-                            .state_store
-                            .as_ref()
-                            .unwrap()
-                            .export_recovery(&journal, &destination);
-                        self.status = match result {
-                            Ok(()) => format!("恢复副本已导出：{}", destination.display()),
-                            Err(error) => format!("导出失败（不会覆盖）：{error}"),
-                        };
+                        self.start_recovery_export(journal.path.clone(), destination);
                     }
                     if ui.button("忽略并清除快照").clicked() {
                         self.pending_recovery = None;
@@ -3083,18 +3228,12 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             let _ = ui_fonts::install_system_cjk_fallback(&cc.egui_ctx);
-            let mut app = App::default();
-            app.initialize_state(startup_path.is_none());
-            if let Some(path) = startup_path {
-                if path.is_dir() {
-                    app.cargo_project = is_cargo_root(&path);
-                    app.root = Some(path);
-                } else if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
-                    app.open_file(path);
-                } else {
-                    app.status = "参数必须是实际目录或可读的 .rs 文件。".into();
-                }
-            }
+            let mut app = App {
+                startup_explicit_path: startup_path,
+                ..App::default()
+            };
+            let restore_last_document = app.startup_explicit_path.is_none();
+            app.initialize_state(restore_last_document);
             Ok(Box::new(app))
         }),
     )
@@ -3343,6 +3482,38 @@ mod file_tests {
         );
         assert!(app.documents.get(&path).unwrap().is_dirty());
 
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn initial_restored_document_recovers_even_without_a_session_file() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rustbridge-first-recovery-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = persistence::Store::new(root.join("state")).unwrap();
+        let path = root.join("first.rs");
+        fs::write(&path, "fn baseline() {}").unwrap();
+        store
+            .save_journal(&path, "fn baseline() {}", "fn edited_and_uncommitted() {}")
+            .unwrap();
+        // Intentional: no session.json exists. Startup must discover the
+        // orphaned tab from its private recovery metadata.
+        let mut app = App::default();
+        app.initialize_state_from_store(store.clone(), true);
+        app.wait_for_document_io();
+        let recovery = app
+            .documents
+            .get(&path)
+            .and_then(|doc| doc.pending_recovery.as_ref())
+            .expect("first restored document must retain its journal");
+        assert_eq!(recovery.edited, "fn edited_and_uncommitted() {}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "fn baseline() {}");
         drop(app);
         fs::remove_dir_all(root).unwrap();
     }

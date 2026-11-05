@@ -306,6 +306,11 @@ fn portable_save_in_place(
         stage.write_all(expected.as_bytes())?;
         stage.sync_all()?;
     }
+    // A synced file is not enough if its containing directory is lost on
+    // abrupt shutdown. Require the private backup directory to be durable
+    // on macOS before beginning the non-atomic in-place write.
+    #[cfg(target_os = "macos")]
+    File::open(&backup_dir)?.sync_all()?;
     // Keep the backup when the write fails, leaving a recovery option.
     file.seek(SeekFrom::Start(0))?;
     let commit = (|| {
@@ -340,14 +345,28 @@ fn portable_save_in_place(
             ));
         }
     }
-    let _ = fs::remove_file(&backup);
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    // Do not discard the only independent rollback copy until the source
+    // filesystem acknowledges the post-commit directory durability barrier.
     match sync_directory(parent) {
-        Ok(()) => Ok(SaveOutcome::Durable),
-        Err(error) => Ok(SaveOutcome::CommittedDurabilityUncertain(error.to_string())),
+        Ok(()) => {
+            if let Err(error) = fs::remove_file(&backup) {
+                // Do not misreport a successful committed source update as a
+                // failed save just because an optional backup cleanup failed.
+                eprintln!(
+                    "RustBridge private save backup retained at {}: {error}",
+                    backup.display()
+                );
+            }
+            Ok(SaveOutcome::Durable)
+        }
+        Err(error) => Ok(SaveOutcome::CommittedDurabilityUncertain(format!(
+            "{error}; private rollback retained at {}",
+            backup.display(),
+        ))),
     }
 }
 

@@ -2,6 +2,7 @@
 //! Open requests are supersedable; saves are explicit, serialized and never silently cancelled.
 use crate::{
     file_watch::{FileStamp, file_stamp},
+    persistence::{Journal, Store},
     safe_save::{SaveOutcome, save_if_unchanged},
 };
 #[cfg(test)]
@@ -24,6 +25,8 @@ pub const MAX_DOCUMENT_BYTES: u64 = 32 * 1024 * 1024;
 pub struct Loaded {
     pub source: String,
     pub stamp: Option<FileStamp>,
+    /// Loaded in the background together with source bytes, never on the GUI.
+    pub recovery: Option<Journal>,
 }
 pub enum Reply {
     Open {
@@ -42,6 +45,7 @@ enum Job {
     Open {
         id: u64,
         path: PathBuf,
+        store: Option<Store>,
     },
     Save {
         id: u64,
@@ -99,15 +103,21 @@ impl DocumentIo {
                         return;
                     };
                     let reply = match job {
-                        Job::Open { id, path } => {
+                        Job::Open { id, path, store } => {
                             if work.latest_open.load(Ordering::Acquire) != id {
                                 continue;
                             }
-                            let result = read_capped(
+                            let mut result = read_capped(
                                 &path,
                                 || work.latest_open.load(Ordering::Relaxed) != id,
                                 Duration::from_secs(30),
                             );
+                            if work.latest_open.load(Ordering::Acquire) != id {
+                                continue;
+                            }
+                            if let (Some(store), Ok(loaded)) = (store, &mut result) {
+                                loaded.recovery = store.load_journal(&path);
+                            }
                             if work.latest_open.load(Ordering::Acquire) != id {
                                 continue;
                             }
@@ -136,11 +146,16 @@ impl DocumentIo {
         }
         Self { shared, receiver }
     }
+    #[cfg(test)]
     pub fn open(&self, id: u64, path: PathBuf) {
+        self.open_with_recovery(id, path, None);
+    }
+
+    pub fn open_with_recovery(&self, id: u64, path: PathBuf, store: Option<Store>) {
         let mut state = self.shared.state.lock().unwrap();
         self.shared.latest_open.store(id, Ordering::Release);
         state.queue.retain(|job| !matches!(job, Job::Open { .. }));
-        state.queue.push_back(Job::Open { id, path });
+        state.queue.push_back(Job::Open { id, path, store });
         self.shared.cv.notify_all();
     }
     pub fn save(&self, id: u64, path: PathBuf, expected: String, content: String) {
@@ -247,12 +262,48 @@ fn read_capped(path: &Path, cancelled: impl Fn() -> bool, timeout: Duration) -> 
     Ok(Loaded {
         source,
         stamp: file_stamp(path).ok(),
+        recovery: None,
     })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    #[test]
+    fn opening_a_source_also_loads_recovery_off_the_ui_thread() {
+        let folder =
+            std::env::temp_dir().join(format!("rustbridge-async-recovery-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let state = Store::new(folder.join("state")).unwrap();
+        let path = folder.join("recovered.rs");
+        fs::write(&path, "fn old() {}").unwrap();
+        state
+            .save_journal(&path, "fn old() {}", "fn changed() {}")
+            .unwrap();
+        let worker = DocumentIo::new();
+        worker.open_with_recovery(1, path.clone(), Some(state));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(Reply::Open {
+                path: name, result, ..
+            }) = worker.take()
+            {
+                assert_eq!(name, path);
+                let loaded = result.unwrap();
+                assert_eq!(loaded.source, "fn old() {}");
+                assert_eq!(loaded.recovery.unwrap().edited, "fn changed() {}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background recovery did not complete"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(worker);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
     #[test]
     fn asynchronous_open_save_and_latest_revision() {
         let folder = std::env::temp_dir().join(format!("rustbridge-doc-{}", std::process::id()));
