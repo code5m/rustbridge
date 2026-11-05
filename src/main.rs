@@ -18,6 +18,7 @@ mod projection_worker;
 mod safe_save;
 mod symbol_search;
 mod ui_fonts;
+mod ui_layout;
 
 use editor_core::line_number_gutter;
 use eframe::egui::{self, Color32};
@@ -39,6 +40,23 @@ enum Mode {
     Learn,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidebarSection {
+    Project,
+    Structure,
+    Search,
+    Learn,
+    Tools,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BottomTab {
+    Problems,
+    Build,
+    Run,
+    Output,
+}
+
 struct App {
     root: Option<PathBuf>,
     cargo_project: bool,
@@ -50,6 +68,12 @@ struct App {
     projection_pending: bool,
     projection_due: Option<std::time::Instant>,
     mode: Mode,
+    sidebar_section: SidebarSection,
+    show_left_sidebar: bool,
+    show_right_guide: bool,
+    show_bottom_panel: bool,
+    bottom_tab: BottomTab,
+    compare_split: f32,
     lesson: usize,
     selected: Option<usize>,
     jump_to: Option<usize>,
@@ -60,6 +84,7 @@ struct App {
     saved_source: String,
     confirm_close: bool,
     pending_open: Option<PathBuf>,
+    pending_project: Option<PathBuf>,
     show_excluded: bool,
     dir_index: file_tree::DirectoryIndex,
     directory_limits: HashMap<PathBuf, usize>,
@@ -79,6 +104,7 @@ struct App {
     opening_started: Option<std::time::Instant>,
     saving_started: Option<std::time::Instant>,
     after_save_open: bool,
+    after_save_project: bool,
     after_save_close: bool,
     discard_on_open: bool,
     symbol_worker: Option<symbol_search::SymbolSearch>,
@@ -144,6 +170,12 @@ impl Default for App {
             saved_source: rust.clone(),
             rust,
             mode: Mode::Java,
+            sidebar_section: SidebarSection::Project,
+            show_left_sidebar: true,
+            show_right_guide: true,
+            show_bottom_panel: false,
+            bottom_tab: BottomTab::Problems,
+            compare_split: 0.5,
             lesson: 0,
             selected: None,
             jump_to: None,
@@ -153,6 +185,7 @@ impl Default for App {
             dirty: false,
             confirm_close: false,
             pending_open: None,
+            pending_project: None,
             show_excluded: false,
             dir_index: file_tree::DirectoryIndex::new(),
             directory_limits: HashMap::new(),
@@ -172,6 +205,7 @@ impl Default for App {
             opening_started: None,
             saving_started: None,
             after_save_open: false,
+            after_save_project: false,
             after_save_close: false,
             discard_on_open: false,
             symbol_worker: None,
@@ -488,6 +522,11 @@ impl App {
     }
 
     fn start_cargo_action(&mut self, action: cargo_runner::Action) {
+        self.show_bottom_panel = true;
+        self.bottom_tab = match action {
+            cargo_runner::Action::Run => BottomTab::Run,
+            cargo_runner::Action::Check | cargo_runner::Action::Test => BottomTab::Build,
+        };
         let Some(root) = self.root.clone() else {
             return;
         };
@@ -558,11 +597,133 @@ impl App {
         self.dirty || self.saving.is_some()
     }
     fn open(&mut self, path: PathBuf) {
-        if self.dirty || self.saving.is_some() {
+        if self.saving.is_some() {
             self.pending_open = Some(path);
+            self.pending_project = None;
+            self.after_save_open = true;
+            self.after_save_project = false;
+            return;
+        }
+        if self.dirty {
+            self.pending_open = Some(path);
+            self.pending_project = None;
+            self.after_save_open = false;
             return;
         }
         self.open_file(path);
+    }
+
+    fn open_project(&mut self, folder: PathBuf) {
+        if !folder.is_dir() {
+            self.status = format!("项目目录不可用：{}", folder.display());
+            return;
+        }
+        self.pending_open = None;
+        if self.saving.is_some() {
+            self.pending_project = Some(folder);
+            self.after_save_open = false;
+            self.after_save_project = true;
+            self.status =
+                "当前已接受的保存完成后切换项目；如果保存期间又有修改，需要再次确认。".into();
+            return;
+        }
+        self.after_save_open = false;
+        self.after_save_project = false;
+        if self.dirty {
+            self.pending_project = Some(folder);
+            self.status = "切换项目之前，请明确保存或放弃当前 Rust 修改。".into();
+            return;
+        }
+        self.apply_project(folder);
+    }
+
+    fn apply_project(&mut self, folder: PathBuf) {
+        if let Some(io) = self.document_io.as_ref() {
+            io.cancel_open();
+        }
+        if let Some(task) = self.lsp_task.take() {
+            task.cancel();
+        }
+        self.lsp_ready = false;
+        self.lsp_status = "项目已切换；rust-analyzer LSP 已停止，请按需重新启动。".into();
+        self.lsp_hover.clear();
+        self.lsp_completions.clear();
+        self.lsp_definitions.clear();
+        self.lsp_target = None;
+
+        if let Some(task) = self.cargo_task.take() {
+            task.cancel();
+        }
+        self.cargo_diagnostics.clear();
+        self.cargo_log.clear();
+        self.cargo_status = "新项目已打开；Cargo 操作需要重新授权。".into();
+        self.cargo_diag_target = None;
+
+        if let Some(task) = self.analyzer_diagnostics.take() {
+            task.cancel();
+        }
+        self.analyzer_diagnostics_status = "已切换项目；原项目诊断已取消。".into();
+
+        self.symbol_revision += 1;
+        self.symbol_hits.clear();
+        self.symbol_pending = false;
+        self.symbol_target = None;
+        self.file_search_revision += 1;
+        self.file_search_pending = false;
+        self.search_results.clear();
+        self.file_query.clear();
+
+        self.dir_index = file_tree::DirectoryIndex::new();
+        self.directory_limits.clear();
+        self.root = Some(folder.clone());
+        self.cargo_project = is_cargo_root(&folder);
+        self.file = None;
+        self.file_watch = None;
+        self.disk_stamp = None;
+        self.opening = None;
+        self.opening_started = None;
+        self.pending_open = None;
+        self.pending_project = None;
+        self.after_save_open = false;
+        self.after_save_project = false;
+        self.discard_on_open = false;
+        self.pending_recovery = None;
+
+        // A project switch closes the previous document context. The bundled
+        // sample is restored as an explicitly read-only landing document.
+        self.rust = include_str!("../examples/basics.rs").to_owned();
+        self.saved_source = self.rust.clone();
+        self.dirty = false;
+        self.update_projection();
+        self.editor_gutter_revision = 0;
+        self.editor_find = None;
+        self.editor_jump = None;
+        self.editor_page_start = 0;
+        self.editor_page_target = 1;
+        self.editor_scroll_override = None;
+        self.cursor_byte = 0;
+        self.selected = None;
+        self.jump_to = None;
+        self.scroll_follow = None;
+        self.last_scroll = None;
+        self.symbol_query.clear();
+        self.recent_files.retain(|path| path.starts_with(&folder));
+        self.mode = Mode::Java;
+        self.sidebar_section = SidebarSection::Project;
+        self.lesson_return = None;
+        self.quiz_choice = None;
+        self.status = if self.cargo_project {
+            format!(
+                "已打开 Cargo 项目：{}。源码仍以真实 .rs 文件为准。",
+                folder.display()
+            )
+        } else {
+            format!(
+                "已打开目录：{}。未发现根目录 Cargo.toml。",
+                folder.display()
+            )
+        };
+        self.session_due = Some(std::time::Instant::now() + std::time::Duration::from_millis(350));
     }
 
     fn open_file(&mut self, path: PathBuf) {
@@ -706,6 +867,7 @@ impl App {
                                 }
                                 self.after_save_close = false;
                                 self.after_save_open = false;
+                                self.after_save_project = false;
                             }
                             if !self.dirty && durable && self.after_save_close {
                                 self.after_save_close = false;
@@ -718,15 +880,23 @@ impl App {
                                     self.open_file(next);
                                 }
                             }
+                            if !self.dirty && durable && self.after_save_project {
+                                self.after_save_project = false;
+                                if let Some(next) = self.pending_project.take() {
+                                    self.apply_project(next);
+                                }
+                            }
                             if self.dirty {
                                 self.after_save_close = false;
                                 self.after_save_open = false;
+                                self.after_save_project = false;
                                 self.status.push_str("；保存过程中又有新修改，请再次保存。");
                             }
                         }
                         Err(error) => {
                             self.after_save_close = false;
                             self.after_save_open = false;
+                            self.after_save_project = false;
                             self.status =
                                 format!("Save failed (original source preserved): {error}");
                         }
@@ -1046,43 +1216,94 @@ impl App {
 
     fn compare(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(
-                "Click a highlighted token in either pane to inspect the SAME AST occurrence.",
-            );
-            ui.checkbox(&mut self.sync_scroll, "Link scrolling");
+            ui.label("点击任意一侧的高亮符号，定位两侧同一个 AST 语法出现位置。");
+            ui.checkbox(&mut self.sync_scroll, "联动滚动");
+            ui.small(format!("左侧 {:.0}%", self.compare_split * 100.0));
         });
         ui.separator();
+
         let jump = self.jump_to.take();
         let pending = self.scroll_follow.take();
+        let available = ui.available_rect_before_wrap();
+        let available_width = available.width().max(300.0);
+        let available_height = available.height().max(120.0);
+        let divider_width = 6.0;
+        let usable_width = (available_width - divider_width).max(280.0);
+        let minimum_pane = (usable_width * 0.28).clamp(100.0, 180.0);
+        let left_width =
+            (usable_width * self.compare_split).clamp(minimum_pane, usable_width - minimum_pane);
+        let right_width = usable_width - left_width;
         let (mut left, mut right) = (None, None);
-        ui.columns(2, |columns| {
-            columns[0].strong("☕ Java learning projection · read-only");
-            columns[1].strong("🦀 Original Rust · read-only");
-            left = Some(code_view::show(
-                &mut columns[0],
-                &self.projection.java,
-                &self.projection,
-                code_view::ViewOptions {
-                    id: "linked_java",
-                    side: code_view::Side::Java,
-                    selected: self.selected,
-                    jump_to: jump,
-                    scroll_to: pending.filter(|(rust, _)| !*rust).map(|(_, y)| y),
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_width, available_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |pane| {
+                    pane.strong("Java 心智模型 · 只读");
+                    left = Some(code_view::show(
+                        pane,
+                        &self.projection.java,
+                        &self.projection,
+                        code_view::ViewOptions {
+                            id: "linked_java",
+                            side: code_view::Side::Java,
+                            selected: self.selected,
+                            jump_to: jump,
+                            scroll_to: pending.filter(|(rust, _)| !*rust).map(|(_, y)| y),
+                        },
+                    ));
                 },
-            ));
-            right = Some(code_view::show(
-                &mut columns[1],
-                &self.rust,
-                &self.projection,
-                code_view::ViewOptions {
-                    id: "linked_rust",
-                    side: code_view::Side::Rust,
-                    selected: self.selected,
-                    jump_to: jump,
-                    scroll_to: pending.filter(|(rust, _)| *rust).map(|(_, y)| y),
+            );
+
+            let splitter = ui.allocate_response(
+                egui::vec2(divider_width, available_height),
+                egui::Sense::drag(),
+            );
+            ui.painter().rect_filled(
+                splitter.rect,
+                2.0,
+                if splitter.dragged() || splitter.hovered() {
+                    Color32::from_rgb(92, 145, 190)
+                } else {
+                    Color32::from_gray(70)
                 },
-            ));
+            );
+            if splitter.hovered() || splitter.dragged() {
+                ui.output_mut(|output| {
+                    output.cursor_icon = egui::CursorIcon::ResizeHorizontal;
+                });
+            }
+            if splitter.dragged()
+                && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+            {
+                self.compare_split =
+                    ((pointer.x - available.left()) / usable_width).clamp(0.25, 0.75);
+                ui.ctx().request_repaint();
+            }
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(right_width, available_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |pane| {
+                    pane.strong("原始 Rust 源码 · 只读对照");
+                    right = Some(code_view::show(
+                        pane,
+                        &self.rust,
+                        &self.projection,
+                        code_view::ViewOptions {
+                            id: "linked_rust",
+                            side: code_view::Side::Rust,
+                            selected: self.selected,
+                            jump_to: jump,
+                            scroll_to: pending.filter(|(rust, _)| *rust).map(|(_, y)| y),
+                        },
+                    ));
+                },
+            );
         });
+
         if let (Some(left), Some(right)) = (left, right) {
             if let Some(index) = left.clicked.or(right.clicked) {
                 self.select(index, false);
@@ -1346,35 +1567,6 @@ impl App {
                     }
                 });
         }
-        ui.separator();
-        ui.strong("Outline · declarations / concepts");
-        let outline: Vec<_> = self
-            .projection
-            .anchors
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| {
-                matches!(a.kind, "method" | "field" | "trait" | "concept")
-                    || (a.kind == "type" && a.topic == "Struct declaration")
-            })
-            .take(250)
-            .map(|(idx, anchor)| (idx, anchor.rust_at.line, anchor.symbol.clone(), anchor.kind))
-            .collect();
-        egui::ScrollArea::vertical()
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .show(ui, |ui| {
-                for (idx, line, name, kind) in outline {
-                    if ui
-                        .selectable_label(
-                            self.selected == Some(idx),
-                            format!("L{}  {} · {}", line + 1, name, kind),
-                        )
-                        .clicked()
-                    {
-                        self.select(idx, self.mode == Mode::Java);
-                    }
-                }
-            });
     }
 
     fn body(&mut self, ui: &mut egui::Ui) {
@@ -1564,43 +1756,66 @@ impl eframe::App for App {
                 });
             });
         }
-        if self.pending_open.is_some() && !self.confirm_close {
+        if (self.pending_open.is_some() || self.pending_project.is_some()) && !self.confirm_close {
             egui::Modal::new(egui::Id::new("confirm_open")).show(ctx, |ui| {
-                ui.heading("Switch file with unsaved changes");
-                ui.label("Save or discard your edits before switching files.");
+                let switching_project = self.pending_project.is_some();
+                ui.heading(if switching_project {
+                    "切换项目"
+                } else {
+                    "切换文件"
+                });
+                ui.label(if switching_project {
+                    "新项目只有在当前文档的保存或放弃决定完成后才会打开。"
+                } else {
+                    "打开另一个文件前，请先处理当前未保存修改。"
+                });
                 ui.label(&self.status);
-                ui.horizontal(|ui| {
+
+                if self.saving.is_some() {
+                    ui.spinner();
+                    ui.label("已接受的保存任务仍在执行。保存完成后会继续切换；如有新修改，需要再次确认。");
+                } else {
                     let durability_uncertain = self.status.contains("持久性未确认");
                     if durability_uncertain && !self.dirty {
-                        if ui.button("继续打开（内容已写入，持久性未确认）").clicked()
-                            && let Some(path) = self.pending_open.take()
-                        {
-                            self.open_file(path);
+                        if ui.button("确认风险并继续").clicked() {
+                            if let Some(folder) = self.pending_project.take() {
+                                self.apply_project(folder);
+                            } else if let Some(path) = self.pending_open.take() {
+                                self.open_file(path);
+                            }
                         }
                     } else if self.dirty {
-                        if ui
-                            .add_enabled(self.saving.is_none(), egui::Button::new("Save and open"))
-                            .clicked()
-                        {
-                            self.after_save_open = true;
-                            self.save();
-                        }
-                        if ui
-                            .add_enabled(
-                                self.saving.is_none(),
-                                egui::Button::new("Discard and open"),
-                            )
-                            .clicked()
-                            && let Some(path) = self.pending_open.take()
-                        {
-                            self.discard_on_open = true;
-                            self.open_file(path);
-                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(self.saving.is_none(), egui::Button::new("保存并继续"))
+                                .clicked()
+                            {
+                                self.after_save_open = self.pending_open.is_some();
+                                self.after_save_project = self.pending_project.is_some();
+                                self.save();
+                            }
+                            if ui
+                                .add_enabled(self.saving.is_none(), egui::Button::new("放弃并继续"))
+                                .clicked()
+                            {
+                                self.discard_current_recovery();
+                                self.dirty = false;
+                                if let Some(folder) = self.pending_project.take() {
+                                    self.apply_project(folder);
+                                } else if let Some(path) = self.pending_open.take() {
+                                    self.discard_on_open = true;
+                                    self.open_file(path);
+                                }
+                            }
+                        });
                     }
-                    if ui.button("Cancel").clicked() {
-                        self.pending_open = None;
-                    }
-                });
+                }
+                if ui.button("取消").clicked() {
+                    self.pending_open = None;
+                    self.pending_project = None;
+                    self.after_save_open = false;
+                    self.after_save_project = false;
+                }
             });
         }
         if let Some(action) = self.cargo_confirm {
@@ -1716,377 +1931,7 @@ impl eframe::App for App {
                     .saturating_sub(editor_core::EDITOR_PAGE_LINES);
             }
         }
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("RustBridge");
-                ui.separator();
-                if ui.button("Open .rs").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Rust", &["rs"])
-                        .pick_file()
-                {
-                    self.open(path);
-                }
-                if ui.button("Open folder").clicked()
-                    && let Some(folder) = rfd::FileDialog::new().pick_folder()
-                {
-                    if let Some(task)=self.lsp_task.take(){task.cancel();}
-                    self.lsp_ready=false;
-                    self.lsp_status="项目已切换；LSP 已停止，请明确重新启动。".into();
-                    self.lsp_hover.clear();
-                    self.lsp_completions.clear();
-                    self.lsp_definitions.clear();
-                    if let Some(task)=self.cargo_task.take(){task.cancel();}
-                    self.cargo_diagnostics.clear();
-                    self.cargo_log.clear();
-                    self.cargo_status="新项目已打开；Cargo 任务需要重新授权。".into();
-                    if let Some(task) = self.analyzer_diagnostics.take() { task.cancel(); }
-                    self.analyzer_diagnostics_status = "已切换项目；原项目诊断已取消。".into();
-                    self.dir_index = file_tree::DirectoryIndex::new();
-                    self.directory_limits.clear();
-                    self.symbol_revision+=1;
-                    self.symbol_hits.clear();
-                    self.symbol_pending=false;
-                    self.cargo_project = is_cargo_root(&folder);
-                    self.root = Some(folder);
-                    self.refresh_file_search();
-                    self.status = if self.cargo_project {
-                        "Opened Cargo project directory. Rust source remains the only editable truth.".into()
-                    } else {
-                        "Opened directory without Cargo.toml. Browsing Rust files.".into()
-                    };
-                }
-                ui.separator();
-                for (mode, label) in [
-                    (Mode::Java, "☕ Java 阅读"),
-                    (Mode::Rust, "🦀 Rust 源码"),
-                    (Mode::Compare, "◫ 双栏对照"),
-                    (Mode::Learn, "分页学习"),
-                ] {
-                    if ui.selectable_label(self.mode == mode, label).clicked() {
-                        self.mode = mode;
-                        self.last_scroll = None;
-                        self.jump_to = self.selected;
-                    }
-                }
-                if self.dirty {
-                    ui.colored_label(Color32::YELLOW, "● Unsaved");
-                }
-                if let Some(started)=self.saving_started{
-                    ui.spinner();
-                    ui.small(format!("安全保存中 {}s",started.elapsed().as_secs()));
-                    if started.elapsed()>std::time::Duration::from_secs(20){
-                        ui.colored_label(Color32::YELLOW,
-                            "存储设备响应慢；后台保存不能安全强制终止，请勿退出。");
-                    }
-                }
-                if self.external_change {
-                    ui.colored_label(Color32::RED, "Disk changed outside the app");
-                    if ui.button("Reload disk copy").clicked() {
-                        self.reload_disk_copy();
-                    }
-                }
-            });
-        });
-        egui::SidePanel::left("files")
-            .resizable(true)
-            .default_width(210.)
-            .show(ctx, |ui| {
-                ui.heading("真实项目文件 / Project");
-                ui.small("目录直接来自文件系统；只编辑 .rs，其他文件仍显示。");
-                let excluded_changed = ui
-                    .checkbox(
-                        &mut self.show_excluded,
-                        "Show .git, target and node_modules",
-                    )
-                    .changed();
-                ui.small("真实文件树；每页 180 项，可逐页展开，目录在后台读取。");
-                if ui.button("刷新目录").clicked() {
-                    self.dir_index = file_tree::DirectoryIndex::new();
-                    self.directory_limits.clear();
-                    self.refresh_file_search();
-                }
-                let changed = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.file_query)
-                            .hint_text("Find Rust file…"),
-                    )
-                    .changed();
-                if changed || excluded_changed {
-                    self.refresh_file_search();
-                }
-                ui.separator();
-                if let Some(root) = self.root.clone() {
-                    ui.strong(root.file_name().unwrap_or_default().to_string_lossy());
-                    ui.small(if self.cargo_project {
-                        "Cargo.toml detected"
-                    } else {
-                        "No Cargo.toml at this directory root"
-                    });
-                    if !self.file_query.trim().is_empty() {
-                        if self.file_search_pending {
-                            ui.small("Searching project files in the background…");
-                        } else {
-                            ui.small(format!(
-                                "{} result(s), limited to 100",
-                                self.search_results.len()
-                            ));
-                        }
-                        let results = self.search_results.clone();
-                        egui::ScrollArea::vertical()
-                            .max_height(180.)
-                            .show(ui, |ui| {
-                                for path in results {
-                                    let label = path
-                                        .strip_prefix(&root)
-                                        .unwrap_or(&path)
-                                        .display()
-                                        .to_string();
-                                    if ui
-                                        .selectable_label(self.file.as_ref() == Some(&path), label)
-                                        .clicked()
-                                    {
-                                        self.open(path);
-                                    }
-                                }
-                            });
-                        ui.separator();
-                    }
-                    egui::ScrollArea::vertical()
-                        .max_height(300.)
-                        .show(ui, |ui| self.directory(ui, &root, 0));
-                } else {
-                    ui.label("Open folder to browse the actual project.");
-                }
-                if !self.recent_files.is_empty() {
-                    ui.separator();
-                    ui.strong("Recent Rust files");
-                    let recent = self.recent_files.clone();
-                    for path in recent {
-                        if ui
-                            .selectable_label(
-                                self.file.as_ref() == Some(&path),
-                                path.display().to_string(),
-                            )
-                            .clicked()
-                        {
-                            self.open(path);
-                        }
-                    }
-                }
-                ui.separator();
-                ui.strong("可选 rust-analyzer / 诊断");
-                ui.small("手动触发；诊断磁盘中已保存的文件，不启动 LSP、补全或定义跳转。");
-                ui.label(&self.analyzer_status);
-                if ui
-                    .add_enabled(
-                        self.analyzer_check.is_none(),
-                        egui::Button::new("Check availability"),
-                    )
-                    .clicked()
-                {
-                    self.check_analyzer();
-                }
-                ui.separator();
-                ui.small(&self.analyzer_diagnostics_status);
-                if let Some(task) = self.analyzer_diagnostics.as_ref() {
-                    if ui.button("Cancel diagnostics").clicked() {
-                        task.cancel();
-                    }
-                } else if ui
-                    .add_enabled(
-                        self.cargo_project && self.root.is_some(),
-                        egui::Button::new("Check Cargo diagnostics"),
-                    )
-                    .clicked()
-                {
-                    self.start_analyzer_diagnostics();
-                }
-                ui.separator();
-                ui.strong("rust-analyzer LSP · 按需启动");
-                ui.small("真实 JSON-RPC：类型悬浮、补全、定义跳转；取消时终止会话。");
-                ui.horizontal_wrapped(|ui| {
-                    if self.lsp_task.is_none() {
-                        if ui
-                            .add_enabled(self.cargo_project, egui::Button::new("启动 LSP"))
-                            .clicked()
-                        {
-                            self.start_lsp();
-                        }
-                    } else if ui.button("停止 LSP").clicked() {
-                        if let Some(task) = self.lsp_task.take() {
-                            task.cancel();
-                        }
-                        self.lsp_ready = false;
-                        self.lsp_status = "rust-analyzer LSP 已停止。".into();
-                    }
-                    if self.lsp_ready {
-                        for (kind, label) in [
-                            (lsp::Kind::Hover, "类型提示"),
-                            (lsp::Kind::Completion, "补全"),
-                            (lsp::Kind::Definition, "跳转定义"),
-                        ] {
-                            if ui.button(label).clicked() {
-                                self.lsp_query(kind);
-                            }
-                        }
-                    }
-                });
-                ui.small(&self.lsp_status);
-                if !self.lsp_hover.is_empty() {
-                    egui::ScrollArea::vertical()
-                        .max_height(120.)
-                        .show(ui, |ui| {
-                            ui.monospace(&self.lsp_hover);
-                        });
-                }
-                if !self.lsp_completions.is_empty() {
-                    let items = self.lsp_completions.clone();
-                    ui.strong("可选补全（应用前请核对）");
-                    egui::ScrollArea::vertical()
-                        .max_height(120.)
-                        .show(ui, |ui| {
-                            for item in items {
-                                if ui.selectable_label(false, &item.label).clicked() {
-                                    self.insert_completion(item);
-                                }
-                            }
-                        });
-                }
-                if !self.lsp_definitions.is_empty() {
-                    let locations = self.lsp_definitions.clone();
-                    ui.strong("真实定义位置");
-                    for location in locations.into_iter().take(8) {
-                        let label = format!(
-                            "{}:{}:{}",
-                            location.path.display(),
-                            location.line + 1,
-                            location.character + 1
-                        );
-                        if ui.selectable_label(false, label).clicked() {
-                            self.jump_lsp_definition(location);
-                        }
-                    }
-                }
-                ui.separator();
-                ui.strong("Cargo 工程 / Build · Test · Run");
-                ui.small("手动确认后运行；cargo check 也可能执行 build.rs。");
-                ui.horizontal_wrapped(|ui| {
-                    for action in [
-                        cargo_runner::Action::Check,
-                        cargo_runner::Action::Test,
-                        cargo_runner::Action::Run,
-                    ] {
-                        if ui
-                            .add_enabled(
-                                self.cargo_project
-                                    && self.cargo_task.is_none()
-                                    && !self.dirty
-                                    && self.saving.is_none(),
-                                egui::Button::new(action.label()),
-                            )
-                            .clicked()
-                        {
-                            self.cargo_confirm = Some(action);
-                        }
-                    }
-                    if let Some(task) = self.cargo_task.as_ref()
-                        && ui.button("取消任务").clicked()
-                    {
-                        task.cancel();
-                    }
-                });
-                ui.small(&self.cargo_status);
-                let diagnostics = self.cargo_diagnostics.clone();
-                egui::ScrollArea::vertical()
-                    .max_height(170.)
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .show(ui, |ui| {
-                        for diag in diagnostics {
-                            let label = format!(
-                                "{} {}:{}:{} {}",
-                                diag.level,
-                                diag.path.file_name().unwrap_or_default().to_string_lossy(),
-                                diag.line,
-                                diag.column,
-                                diag.message
-                            );
-                            if ui
-                                .selectable_label(false, label)
-                                .on_hover_text(diag.path.display().to_string())
-                                .clicked()
-                            {
-                                self.jump_to_cargo_diagnostic(diag);
-                            }
-                        }
-                        for line in self.cargo_log.iter().rev().take(25) {
-                            ui.small(line);
-                        }
-                    });
-                ui.separator();
-                let complete_count = self.completed_lessons.iter().filter(|&&done| done).count();
-                ui.strong(format!(
-                    "Java 8 → Rust 课程 · {complete_count}/{}",
-                    lessons::LESSONS.len()
-                ));
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (idx, lesson) in lessons::LESSONS.iter().enumerate() {
-                        if ui
-                            .selectable_label(
-                                self.lesson == idx,
-                                format!(
-                                    "{} {:02} · {}",
-                                    if self.completed_lessons.get(idx) == Some(&true) {
-                                        "✓"
-                                    } else {
-                                        "·"
-                                    },
-                                    idx + 1,
-                                    lesson.java
-                                ),
-                            )
-                            .clicked()
-                        {
-                            self.lesson = idx;
-                            self.quiz_choice = None;
-                            self.mode = Mode::Learn;
-                        }
-                    }
-                });
-            });
-        egui::SidePanel::right("explanation")
-            .resizable(true)
-            .default_width(290.)
-            .show(ctx, |ui| {
-                self.right_guide(ui);
-            });
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.small(&self.status);
-                ui.separator();
-                ui.small(format!(
-                    "{} precise AST links",
-                    self.projection.anchors.len()
-                ));
-            });
-        });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong(
-                    self.file
-                        .as_ref()
-                        .and_then(|p| p.file_name())
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "examples/basics.rs".into()),
-                );
-                ui.weak(format!(
-                    " · {} lines · AST aligned",
-                    self.editor_line_starts.len()
-                ));
-            });
-            ui.separator();
-            self.body(ui);
-        });
+        self.render_workbench(ctx);
         if save_shortcut {
             self.save();
             ctx.request_repaint();
@@ -2179,6 +2024,49 @@ fn main() -> eframe::Result {
 mod file_tests {
     use super::*;
     use crate::editor_core::{append_rust_syntax, editor_page_bounds};
+
+    #[test]
+    fn project_switch_waits_for_unsaved_decision_and_resets_old_document_context() {
+        let root =
+            std::env::temp_dir().join(format!("rustbridge-project-switch-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"switch-target\"\n",
+        )
+        .unwrap();
+
+        let mut app = App {
+            file: Some(PathBuf::from("/tmp/old-project/src/main.rs")),
+            ..App::default()
+        };
+        app.rust.push_str("\n// unsaved old project edit");
+        app.dirty = true;
+        app.open_project(root.clone());
+
+        assert_eq!(app.root, None);
+        assert_eq!(app.pending_project, Some(root.clone()));
+        assert!(app.dirty);
+        assert_eq!(
+            app.file,
+            Some(PathBuf::from("/tmp/old-project/src/main.rs"))
+        );
+
+        // This is the explicit Discard-and-continue branch used by the modal.
+        app.discard_current_recovery();
+        app.dirty = false;
+        let next = app.pending_project.take().unwrap();
+        app.apply_project(next);
+
+        assert_eq!(app.root, Some(root.clone()));
+        assert!(app.cargo_project);
+        assert!(app.file.is_none());
+        assert!(!app.dirty);
+        assert!(app.rust.contains("fn main"));
+        assert!(matches!(app.mode, Mode::Java));
+        assert!(app.pending_project.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn restarting_restores_project_file_mode_lesson_cursor_and_progress() {

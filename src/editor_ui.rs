@@ -36,9 +36,26 @@ impl App {
     }
 
     pub(super) fn editor(&mut self, ui: &mut egui::Ui) {
+        if self.file.is_none() {
+            ui.colored_label(
+                Color32::YELLOW,
+                "内置示例为只读学习材料。打开真实 .rs 文件后才能编辑和保存。",
+            );
+            ui.small("示例不会被当作项目文件，也不会出现看似可用但无法保存的编辑状态。");
+            egui::ScrollArea::both()
+                .id_salt("readonly_builtin_example")
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&self.rust).monospace())
+                            .selectable(true)
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
+            return;
+        }
         ui.horizontal(|ui| {
-            ui.label("Real Rust source · editable");
-            if ui.button("Save · Ctrl+S").clicked() {
+            ui.label("原始 Rust 源码 · 可编辑");
+            if ui.button("保存 · Ctrl+S").clicked() {
                 self.save();
             }
         });

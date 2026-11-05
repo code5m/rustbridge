@@ -102,7 +102,7 @@ pub fn show(
                         continue;
                     }
                     if token.start > cursor {
-                        append_plain(row, &text[cursor..token.start]);
+                        append_plain(row, &text[cursor..token.start], side);
                     }
                     let marked = selected == Some(index);
                     let styled = RichText::new(&text[token.start..token.end])
@@ -133,9 +133,9 @@ pub fn show(
                     cursor = token.end;
                 }
                 if cursor < end {
-                    append_plain(row, &text[cursor..end]);
+                    append_plain(row, &text[cursor..end], side);
                 } else if begin == end {
-                    append_plain(row, " ");
+                    append_plain(row, " ", side);
                 }
             });
         }
@@ -156,8 +156,225 @@ fn span_for(anchor: &Anchor, side: Side) -> ByteSpan {
     }
 }
 
-fn append_plain(ui: &mut egui::Ui, source: &str) {
-    ui.add(
-        egui::Label::new(RichText::new(source).monospace()).wrap_mode(egui::TextWrapMode::Extend),
-    );
+fn append_plain(ui: &mut egui::Ui, source: &str, side: Side) {
+    let dark = ui.visuals().dark_mode;
+    let keyword_color = if dark {
+        Color32::from_rgb(198, 120, 221)
+    } else {
+        Color32::from_rgb(128, 56, 160)
+    };
+    let string_color = if dark {
+        Color32::from_rgb(152, 195, 121)
+    } else {
+        Color32::from_rgb(44, 115, 70)
+    };
+    let comment_color = if dark {
+        Color32::from_rgb(115, 145, 115)
+    } else {
+        Color32::from_rgb(90, 120, 90)
+    };
+    let number_color = if dark {
+        Color32::from_rgb(209, 154, 102)
+    } else {
+        Color32::from_rgb(160, 92, 30)
+    };
+    let type_color = if dark {
+        Color32::from_rgb(86, 182, 194)
+    } else {
+        Color32::from_rgb(0, 115, 130)
+    };
+
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    while cursor < source.len() {
+        let start = cursor;
+        let ch = source[cursor..]
+            .chars()
+            .next()
+            .expect("cursor is a char boundary");
+        let mut color = None;
+
+        if ch.is_whitespace() {
+            cursor += ch.len_utf8();
+            while cursor < source.len() {
+                let next = source[cursor..].chars().next().unwrap();
+                if !next.is_whitespace() {
+                    break;
+                }
+                cursor += next.len_utf8();
+            }
+        } else if source[cursor..].starts_with("//") {
+            cursor = source.len();
+            color = Some(comment_color);
+        } else if source[cursor..].starts_with("/*") {
+            cursor += 2;
+            if let Some(end) = source[cursor..].find("*/") {
+                cursor += end + 2;
+            } else {
+                cursor = source.len();
+            }
+            color = Some(comment_color);
+        } else if ch == '"' || ch == '\'' {
+            let quote = ch;
+            let mut probe = cursor + ch.len_utf8();
+            let mut escaped = false;
+            let mut closed = false;
+            while probe < source.len() {
+                let next = source[probe..].chars().next().unwrap();
+                probe += next.len_utf8();
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if next == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if next == quote {
+                    closed = true;
+                    break;
+                }
+                if next == '\n' {
+                    break;
+                }
+            }
+            if quote == '"' || closed {
+                cursor = probe;
+                color = Some(string_color);
+            } else {
+                cursor += ch.len_utf8();
+            }
+        } else if ch.is_alphabetic() || ch == '_' {
+            cursor += ch.len_utf8();
+            while cursor < source.len() {
+                let next = source[cursor..].chars().next().unwrap();
+                if !(next.is_alphanumeric() || next == '_') {
+                    break;
+                }
+                cursor += next.len_utf8();
+            }
+            let word = &source[start..cursor];
+            if is_keyword(word, side) {
+                color = Some(keyword_color);
+            } else if word.chars().next().is_some_and(char::is_uppercase) {
+                color = Some(type_color);
+            }
+        } else if ch.is_ascii_digit() {
+            cursor += ch.len_utf8();
+            while cursor < source.len() {
+                let byte = bytes[cursor];
+                if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.' {
+                    cursor += 1;
+                } else {
+                    break;
+                }
+            }
+            color = Some(number_color);
+        } else {
+            cursor += ch.len_utf8();
+        }
+
+        let text = RichText::new(&source[start..cursor]).monospace();
+        let text = color.map_or(text.clone(), |color| text.color(color));
+        ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend));
+    }
+}
+
+fn is_keyword(word: &str, side: Side) -> bool {
+    match side {
+        Side::Java => matches!(
+            word,
+            "abstract"
+                | "assert"
+                | "boolean"
+                | "break"
+                | "byte"
+                | "case"
+                | "catch"
+                | "char"
+                | "class"
+                | "const"
+                | "continue"
+                | "default"
+                | "do"
+                | "double"
+                | "else"
+                | "enum"
+                | "extends"
+                | "final"
+                | "finally"
+                | "float"
+                | "for"
+                | "if"
+                | "implements"
+                | "import"
+                | "instanceof"
+                | "int"
+                | "interface"
+                | "long"
+                | "native"
+                | "new"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "return"
+                | "short"
+                | "static"
+                | "strictfp"
+                | "super"
+                | "switch"
+                | "synchronized"
+                | "this"
+                | "throw"
+                | "throws"
+                | "transient"
+                | "try"
+                | "void"
+                | "volatile"
+                | "while"
+                | "true"
+                | "false"
+                | "null"
+        ),
+        Side::Rust => matches!(
+            word,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+        ),
+    }
 }

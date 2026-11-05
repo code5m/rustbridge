@@ -151,3 +151,12 @@ Text transforms never reorder source statements or insert/remove newlines, prese
 - **Performance:** active software rendering can use substantial CPU even if idle use is low. 24-hour memory stability and all-platform IME remain separate release gates.
 
 MIT licensed. See [CHANGELOG.md](CHANGELOG.md).
+
+## UI 2.0 design and interaction decisions
+
+RustBridge's UI 2.0 product intent, information architecture, layout rules, interaction contracts, and acceptance scenarios are documented in:
+
+- [UI 2.0 Product & Architecture Decision Record](docs/ui-2.0-decision-record.md)
+- [UI 2.0 Interaction Specification](docs/ui-2.0-interaction-spec.md)
+
+The redesigned shell separates Project / Structure / Search / Learn / Tools navigation from the central workbench, contextual explanation, and bottom Problems / Build / Run / Output tool window. The bundled example is read-only; only a real opened `.rs` file is editable. Project switches use explicit unsaved-change protection. Compare mode has a draggable divider. The UI remains native egui and keeps the real filesystem and Rust source authoritative.

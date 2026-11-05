@@ -82,3 +82,21 @@ Roadmap: optional rust-analyzer for resolved identities and go-to-definition; ri
 - rust-analyzer and Cargo subprocesses are optional. LSP does not apply workspace edits. Cargo check/test/run always require explicit project trust confirmation because build scripts/tests/programs execute user code.
 - Run native macOS/Windows CI and packaging, not only Linux cross-compilation. macOS/Windows in-place writes have private rollback copies but are not power-loss atomic; installers are unsigned/unnotarized until signing and notarization are configured.
 - Large source editing is a sliding bounded window over the original document, not a full rope editor. Keep absolute UTF-8 byte offsets and CRLF mappings exact across window rebases.
+
+
+## UI 2.0 product and interaction contract
+
+The binding product and architecture decisions are recorded in `docs/ui-2.0-decision-record.md`; user journeys and acceptance scenarios are in `docs/ui-2.0-interaction-spec.md`. These documents are the source of truth for UI work.
+
+- RustBridge is a focused Java 8 → Rust learning IDE, not a general-purpose IDE clone. The central code workspace is the primary product surface.
+- Preserve the actual filesystem and real `.rs` source as the only editable truth. The Java projection remains read-only, conservative, and explicitly educational.
+- The left navigation has one active section at a time: Project, Structure, Search, Learn, or Tools. Do not stack Cargo, LSP, lessons, and file tree into one permanently visible panel.
+- Keep the central workspace wider than secondary panels. Right-side explanations are contextual and collapsible; bottom Problems/Build/Run/Output is a separate resizable tool window.
+- Compare must preserve exact AST token pairing and linked scrolling. A draggable divider may change layout only; it must never change source mapping or selection.
+- Opening a project must use the same unsaved/save-in-progress lifecycle guard as opening a file. On project switch, cancel old project tasks and clear stale diagnostics before presenting the new root.
+- The bundled example is read-only. Never show an enabled editor/save action for a buffer without a real source path.
+- LSP and diagnostics remain opt-in. Cargo Check/Test/Run always require explicit project trust confirmation; opening a project never executes user code.
+- Do not fake multi-document tabs with a list of recent paths. A true tab implementation requires per-document buffers, dirty baselines, watchers, recovery journals, and asynchronous I/O ownership.
+- Responsive behavior must collapse secondary panels before making code panes unreadable. Keep the minimum window usable and provide visible controls to restore hidden panels.
+- Do not weaken existing safe-save, recovery, CRLF/Unicode, large-file, process-cancellation, or resource guarantees for visual convenience.
+- UI changes require unit/regression tests plus a real desktop visual/interaction check when possible. Headless window survival is not proof of visual usability.
