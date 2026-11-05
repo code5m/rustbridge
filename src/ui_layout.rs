@@ -8,9 +8,15 @@ use eframe::egui::{self, Color32};
 impl App {
     pub(super) fn render_workbench(&mut self, ctx: &egui::Context) {
         let window_width = ctx.content_rect().width();
-        let show_left = self.show_left_sidebar && window_width >= 760.0;
-        let show_right =
-            self.show_right_guide && window_width >= 1100.0 && !matches!(self.mode, Mode::Learn);
+        // Code remains the primary surface. Dual code panes need substantially
+        // more width than a one-pane lesson or editor.
+        let compare = matches!(self.mode, Mode::Compare);
+        let nav_threshold = if compare { 1100.0 } else { 760.0 };
+        let guide_threshold = if compare { 1580.0 } else { 1180.0 };
+        let show_left = self.show_left_sidebar && window_width >= nav_threshold;
+        let show_right = self.show_right_guide
+            && window_width >= guide_threshold
+            && !matches!(self.mode, Mode::Learn);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -120,8 +126,11 @@ impl App {
                     }
                 }
             });
-            if window_width < 1100.0 && self.show_right_guide {
-                ui.small("当前窗口较窄，说明栏已自动隐藏；可放大窗口后恢复。");
+            if window_width < guide_threshold && self.show_right_guide {
+                ui.small("优先保留代码宽度：说明栏已自动隐藏；放大窗口或切换到单栏阅读可显示。");
+            }
+            if window_width < nav_threshold && self.show_left_sidebar {
+                ui.small("当前为窄窗口，项目导航已自动收起以保护代码阅读区域。");
             }
         });
 
@@ -343,40 +352,35 @@ impl App {
             ui.label("正在更新结构索引…");
             return;
         }
-        let outline: Vec<_> = self
-            .projection
-            .anchors
-            .iter()
-            .enumerate()
-            .filter(|(_, anchor)| {
-                matches!(anchor.kind, "method" | "field" | "trait" | "concept")
-                    || (anchor.kind == "type" && anchor.topic == "Struct declaration")
-            })
-            .take(500)
-            .map(|(index, anchor)| {
-                (
-                    index,
-                    anchor.rust_at.line,
-                    anchor.symbol.clone(),
-                    anchor.kind,
-                )
-            })
-            .collect();
-        if outline.is_empty() {
-            ui.label("当前文件还没有可展示的已识别结构。");
-            ui.small("打开一个真实 .rs 文件，或切换到 Java 阅读模式查看可识别概念。");
+        let count = self.projection.structures.len();
+        if count == 0 {
+            ui.label("当前文件暂无可识别的 Rust AST 声明。");
+            ui.small("自由函数、导入、mod、struct、enum、trait、impl 与字段均可出现在结构视图。");
             return;
         }
-        for (index, line, name, kind) in outline {
-            if ui
-                .selectable_label(
-                    self.selected == Some(index),
-                    format!("L{}  {} · {}", line + 1, name, kind),
-                )
-                .clicked()
-            {
-                self.select(index, self.mode == Mode::Java);
-            }
+        ui.small(format!(
+            "{count} 个真实 AST 结构项 · 点击定位到两栏原位置。"
+        ));
+        let mut chosen = None;
+        for item in self.projection.structures.iter().take(800) {
+            ui.horizontal(|ui| {
+                ui.add_space(f32::from(item.depth) * 11.0);
+                ui.weak(format!("L{}", item.rust_line + 1));
+                let name = format!("{} · {}", item.kind, item.title);
+                if ui
+                    .selectable_label(false, name)
+                    .on_hover_text(item.explanation)
+                    .clicked()
+                {
+                    chosen = Some(item.rust_byte);
+                }
+            });
+        }
+        if count > 800 {
+            ui.small("当前只展示前 800 项；其余可通过文件内搜索访问。");
+        }
+        if let Some(byte) = chosen {
+            self.navigate_structure(byte);
         }
     }
 

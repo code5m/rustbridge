@@ -172,3 +172,13 @@ Each exercise runs a separate, temporary, dependency-free Cargo crate with `carg
 A four-step ownership/borrowing diagram illustrates move, shared borrow and mutable borrow; it does not attempt to infer borrow states for arbitrary projects. F12 source navigation offers Alt+Left to return to the previous source location. A green compiler check is not a claim that the solution meets its behavioral goal.
 
 See [Learning Path decision record](docs/learning-path-v1.md) for acceptance scope and limits.
+
+## Java 概念对照、结构导航与源码折叠
+
+Java 阅读区是**只读、不可编译的教学投影**。普通 `snake_case` 的方法、属性和局部标识符按 Java 命名习惯显示 `camelCase`，常规小写类型标识符显示 `UpperCamelCase`，但真实 Rust 源码、文件名、保存内容完全不变。
+
+`use` 仅类比 Java `import`，`mod` 是 Rust 模块/命名空间，**不是 Java 内部类**。自由函数、结构体、trait、impl 和成员方法都从真实 AST 进入左侧结构导航与右侧说明。不准确的所有权、宏、类型等不能伪造等价 Java 语义。
+
+Java / Rust 两个**只读**代码视图支持 AST 折叠 `▾/▸`、全部折叠、全部展开；折叠保持原始物理行号和符号双向定位。每个文档的两侧分别记住折叠状态，联动滚动按源文件行号而不是像素偏移。窗口较窄时优先保证双栏代码宽度，自动隐藏说明或导航。真正的 Rust 可编辑视图仍保留源文本，不通过删除字符模拟折叠。
+
+完整规则见 [Java 概念投影 UI 设计决策](docs/java-concept-projection-ui-v2.md)。

@@ -1,7 +1,8 @@
 //! Source-mapped, clickable, virtualized read-only code panes.
 //! Render only visible rows; clickable spans are mapped to exact AST token occurrences.
-use crate::parser::{Anchor, ByteSpan, Projection};
+use crate::parser::{Anchor, ByteSpan, FoldRegion, Projection};
 use eframe::egui::{self, Color32, RichText, Sense};
+use std::{collections::HashSet, sync::Arc};
 
 #[derive(Clone, Copy)]
 pub enum Side {
@@ -12,6 +13,10 @@ pub enum Side {
 pub struct ViewResult {
     pub clicked: Option<usize>,
     pub offset_y: f32,
+    /// Corresponding original physical line, even if this pane is folded.
+    pub top_source_line: usize,
+    /// Used by linked scrolling to ignore layout changes caused by folds.
+    pub fold_changed: bool,
     pub hovered: bool,
 }
 
@@ -21,10 +26,82 @@ pub struct ViewOptions {
     pub side: Side,
     pub selected: Option<usize>,
     pub jump_to: Option<usize>,
-    pub scroll_to: Option<f32>,
+    pub scroll_to_line: Option<usize>,
+    /// Stable open document identity: each file and each pane owns fold state.
+    pub document_id: u64,
 }
 
-/// Rendering deliberately preserves source line order. Do not use this as a Java code generator.
+#[derive(Clone, Default)]
+struct FoldState {
+    source_hash: u64,
+    collapsed: HashSet<usize>,
+    /// None means every physical line is visible (zero per-frame row-map cost).
+    visible_rows: Option<Vec<usize>>,
+}
+
+impl FoldState {
+    fn update_rows(&mut self, projection: &Projection, total_lines: usize) {
+        self.visible_rows = if self.collapsed.is_empty() {
+            None
+        } else {
+            Some(visible_physical_lines(
+                total_lines,
+                &projection.folds,
+                &projection.fold_starts,
+                &self.collapsed,
+            ))
+        };
+    }
+
+    fn reveal(&mut self, projection: &Projection, line: usize, total_lines: usize) -> bool {
+        let old_size = self.collapsed.len();
+        self.collapsed.retain(|index| {
+            projection
+                .folds
+                .get(*index)
+                .is_none_or(|fold| !(fold.start_line < line && line <= fold.end_line))
+        });
+        if self.collapsed.len() != old_size {
+            self.update_rows(projection, total_lines);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn row_for_line(&self, line: usize) -> usize {
+        self.visible_rows.as_ref().map_or(line, |rows| {
+            rows.binary_search(&line)
+                .unwrap_or_else(|index| index.saturating_sub(1))
+        })
+    }
+}
+
+/// Pure fold math used by both source panes; never drops/changes source bytes.
+fn visible_physical_lines(
+    total_lines: usize,
+    folds: &[FoldRegion],
+    fold_starts: &[Option<usize>],
+    collapsed: &HashSet<usize>,
+) -> Vec<usize> {
+    let mut rows = Vec::with_capacity(total_lines);
+    let mut line = 0;
+    while line < total_lines {
+        rows.push(line);
+        if let Some(Some(index)) = fold_starts.get(line)
+            && collapsed.contains(index)
+            && let Some(fold) = folds.get(*index)
+        {
+            line = fold.end_line.saturating_add(1).max(line + 1);
+        } else {
+            line += 1;
+        }
+    }
+    rows
+}
+
+/// Rendering deliberately preserves source order and original line numbers.
+/// Hidden rows are a view-only AST fold, not deletions or a rewritten source.
 pub fn show(
     ui: &mut egui::Ui,
     text: &str,
@@ -36,7 +113,8 @@ pub fn show(
         side,
         selected,
         jump_to,
-        scroll_to,
+        scroll_to_line,
+        document_id,
     } = options;
     // The parser computed these byte offsets once per document revision.
     // Avoid re-splitting a 40k-line file on every egui repaint.
@@ -45,6 +123,45 @@ pub fn show(
         Side::Rust => &projection.rust_line_starts,
     };
     let lines = line_starts.len();
+    // Share folding per document and source side across read-only and Compare.
+    // Each Rust/Java pane still has its own independent fold selections.
+    let state_id = egui::Id::new(("rustbridge_fold", document_id, matches!(side, Side::Java)));
+    let mut state = ui
+        .ctx()
+        .data(|data| data.get_temp::<Arc<FoldState>>(state_id))
+        .unwrap_or_default();
+    let mut state_changed = false;
+    if state.source_hash != projection.source_hash {
+        state = Arc::new(FoldState {
+            source_hash: projection.source_hash,
+            ..FoldState::default()
+        });
+        state_changed = true;
+    }
+    let mut command = None;
+    ui.horizontal(|ui| {
+        ui.small(format!(
+            "可折叠结构 {}",
+            projection.fold_starts.iter().flatten().count()
+        ));
+        if ui.small_button("全部折叠").clicked() {
+            command = Some(true);
+        }
+        if ui.small_button("全部展开").clicked() {
+            command = Some(false);
+        }
+    });
+    if let Some(collapse) = command {
+        let next = Arc::make_mut(&mut state);
+        next.collapsed.clear();
+        if collapse {
+            for &index in projection.fold_starts.iter().flatten() {
+                next.collapsed.insert(index);
+            }
+        }
+        next.update_rows(projection, lines);
+        state_changed = true;
+    }
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace) + 6.0;
     let jump_line = jump_to
         .and_then(|idx| projection.anchors.get(idx))
@@ -52,6 +169,11 @@ pub fn show(
             Side::Java => a.java_at.line,
             Side::Rust => a.rust_at.line,
         });
+    if let Some(line) = jump_line
+        && Arc::make_mut(&mut state).reveal(projection, line, lines)
+    {
+        state_changed = true;
+    }
     // Stable scrollbar presence prevents alternating layout/repaint loops on
     // large source views: egui would otherwise flip show_scroll every frame.
     let mut scroll = egui::ScrollArea::both()
@@ -60,14 +182,22 @@ pub fn show(
         .auto_shrink([false, false]);
     if let Some(line) = jump_line {
         scroll = scroll.vertical_scroll_offset(
-            line.saturating_sub(4) as f32 * (row_height + ui.spacing().item_spacing.y),
+            state.row_for_line(line).saturating_sub(4) as f32
+                * (row_height + ui.spacing().item_spacing.y),
         );
-    } else if let Some(y) = scroll_to {
-        scroll = scroll.vertical_scroll_offset(y);
+    } else if let Some(line) = scroll_to_line {
+        scroll = scroll.vertical_scroll_offset(
+            state.row_for_line(line) as f32 * (row_height + ui.spacing().item_spacing.y),
+        );
     }
+    let visible_count = state.visible_rows.as_ref().map_or(lines, Vec::len);
     let mut clicked = None;
-    let output = scroll.show_rows(ui, row_height, lines, |ui, visible| {
-        for line_number in visible {
+    let mut toggle_fold = None;
+    let output = scroll.show_rows(ui, row_height, visible_count, |ui, visible| {
+        for physical_row in visible {
+            let line_number = state.visible_rows.as_ref().map_or(physical_row, |rows| {
+                rows.get(physical_row).copied().unwrap_or(physical_row)
+            });
             let begin = line_starts[line_number];
             let end = line_starts
                 .get(line_number + 1)
@@ -76,6 +206,51 @@ pub fn show(
             ui.horizontal(|row| {
                 row.spacing_mut().item_spacing.x = 0.0;
                 row.set_min_height(row_height);
+                let fold_index = projection.fold_starts.get(line_number).copied().flatten();
+                if let Some(index) = fold_index {
+                    let folded = state.collapsed.contains(&index);
+                    // Paint the fold triangle as vector geometry: unlike
+                    // Unicode arrow glyphs it never becomes a missing-font box.
+                    if row
+                        .push_id(projection.folds[index].rust_byte, |row| {
+                            let response =
+                                row.allocate_response(egui::vec2(15.0, row_height), Sense::click());
+                            let center = response.rect.center();
+                            let points = if folded {
+                                vec![
+                                    center + egui::vec2(-3.0, -5.0),
+                                    center + egui::vec2(4.0, 0.0),
+                                    center + egui::vec2(-3.0, 5.0),
+                                ]
+                            } else {
+                                vec![
+                                    center + egui::vec2(-5.0, -3.0),
+                                    center + egui::vec2(5.0, -3.0),
+                                    center + egui::vec2(0.0, 4.0),
+                                ]
+                            };
+                            row.painter().add(egui::Shape::convex_polygon(
+                                points,
+                                Color32::from_rgb(122, 177, 224),
+                                egui::Stroke::NONE,
+                            ));
+                            response
+                        })
+                        .inner
+                        .on_hover_text(format!(
+                            "{} · {} · {} 行 · 点击{}",
+                            projection.folds[index].kind,
+                            projection.folds[index].title,
+                            projection.folds[index].end_line - line_number,
+                            if folded { "展开" } else { "折叠" },
+                        ))
+                        .clicked()
+                    {
+                        toggle_fold = Some(index);
+                    }
+                } else {
+                    row.add(egui::Label::new("  ").sense(Sense::hover()));
+                }
                 let line_label = egui::Label::new(
                     RichText::new(format!("{:>5} │ ", line_number + 1))
                         .monospace()
@@ -137,12 +312,42 @@ pub fn show(
                 } else if begin == end {
                     append_plain(row, " ", side);
                 }
+                if let Some(index) = fold_index
+                    && state.collapsed.contains(&index)
+                {
+                    row.colored_label(
+                        Color32::from_rgb(145, 153, 166),
+                        format!("  … {} 行", projection.folds[index].end_line - line_number),
+                    );
+                }
             });
         }
     });
+    if let Some(index) = toggle_fold {
+        let next = Arc::make_mut(&mut state);
+        if !next.collapsed.insert(index) {
+            next.collapsed.remove(&index);
+        }
+        next.update_rows(projection, lines);
+        state_changed = true;
+    }
+    if state_changed {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(state_id, Arc::clone(&state)));
+        ui.ctx().request_repaint();
+    }
     ViewResult {
         clicked,
         offset_y: output.state.offset.y,
+        fold_changed: state_changed,
+        top_source_line: {
+            let row = (output.state.offset.y / row_height).floor().max(0.0) as usize;
+            state.visible_rows.as_ref().map_or(row, |rows| {
+                rows.get(row)
+                    .copied()
+                    .unwrap_or_else(|| *rows.last().unwrap_or(&0))
+            })
+        },
         hovered: output
             .inner_rect
             .contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default())),
@@ -376,5 +581,55 @@ fn is_keyword(word: &str, side: Side) -> bool {
                 | "use"
                 | "where"
         ),
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+    use crate::parser;
+
+    #[test]
+    fn nested_ast_folds_hide_only_virtual_lines_and_keep_original_numbers() {
+        let source = "fn outer() {\n  let one = 1;\n  if one > 0 {\n    println!(\"ok\");\n  }\n}\nfn next() {\n  println!(\"next\");\n}\n";
+        let projection = parser::project(source);
+        let outer = projection.fold_starts[0].expect("outer function must be foldable");
+        let inner = projection.fold_starts[2].expect("if expression must be foldable");
+        let mut state = FoldState {
+            source_hash: projection.source_hash,
+            ..FoldState::default()
+        };
+        state.collapsed.insert(inner);
+        state.update_rows(&projection, projection.rust_line_starts.len());
+        assert!(state.visible_rows.as_ref().unwrap().contains(&2));
+        assert!(!state.visible_rows.as_ref().unwrap().contains(&3));
+        assert!(state.visible_rows.as_ref().unwrap().contains(&6));
+        state.collapsed.insert(outer);
+        state.update_rows(&projection, projection.rust_line_starts.len());
+        let rows = state.visible_rows.as_ref().unwrap();
+        assert!(rows.contains(&0));
+        assert!(!rows.contains(&2));
+        assert!(rows.contains(&6), "other functions must remain visible");
+        assert!(state.reveal(&projection, 3, projection.rust_line_starts.len()));
+        assert!(state.visible_rows.as_ref().is_none());
+    }
+
+    #[test]
+    fn folding_a_large_source_uses_physical_line_indices_without_editing_text() {
+        let source = format!("fn long() {{\n{} }}\n", "    let a = 1;\n".repeat(2000));
+        let projection = parser::project(&source);
+        let index = projection.fold_starts[0].unwrap();
+        let collapsed: HashSet<usize> = [index].into_iter().collect();
+        let visible = visible_physical_lines(
+            projection.rust_line_starts.len(),
+            &projection.folds,
+            &projection.fold_starts,
+            &collapsed,
+        );
+        assert!(
+            visible.len() < 5,
+            "large function collapses to its declaration"
+        );
+        assert_eq!(source.lines().count(), 2002, "folding never mutates source");
     }
 }

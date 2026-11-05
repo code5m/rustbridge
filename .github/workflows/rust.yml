@@ -12,7 +12,7 @@ jobs:
         with:
           components: rustfmt, clippy, rust-analyzer
       - name: Native and GUI smoke dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libx11-xcb-dev libgl1-mesa-dev libgl1-mesa-dri xvfb xdotool
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev libx11-xcb-dev libgl1-mesa-dev libgl1-mesa-dri xvfb xdotool x11-apps
       - run: cargo fmt --check
       - run: cargo check --all-targets
       - run: cargo test --all-targets
@@ -27,6 +27,8 @@ jobs:
         run: cargo build --release
       - name: Native GUI real keyboard and save smoke (Xvfb)
         run: xvfb-run -a -s '-screen 0 1440x900x24' bash tests/gui-smoke.sh ./target/release/rustbridge
+      - name: AST Compare collapse/expand and source immutability (Xvfb)
+        run: xvfb-run -a -s '-screen 0 1440x900x24' bash tests/compare-fold-gui-smoke.sh ./target/release/rustbridge
       - name: Crash recovery survives SIGKILL and relaunch (Xvfb)
         run: xvfb-run -a -s '-screen 0 1440x900x24' bash tests/recovery-smoke.sh ./target/release/rustbridge
       - name: Large-source idle resource smoke (Xvfb)

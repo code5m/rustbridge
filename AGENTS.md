@@ -138,3 +138,14 @@ The binding product and architecture decisions are recorded in `docs/ui-2.0-deci
 - Never call mark_active_document_synced merely because a background save completed: doing so can hide a newer editor revision and silently drop recovery data. A regression test must type a second revision while the first save is in flight and assert that the later text remains independently dirty or is durably saved by a follow-up.
 - FileStamp for an accepted save is captured in the DocumentIo background worker and sent alongside its outcome. No synchronous stat, canonicalize or disk read may be added to a common-case GUI save-completion path; identical document paths must be compared in memory first.
 - A committed-but-durability-uncertain save must not be misreported as a pre-commit failure or retried blindly. Preserve conflict detection, actual disk source identity, and the distinction between an in-flight accepted save and an unsaved later revision.
+
+## Java-concept projection and AST folding contract
+
+Design decisions and exact UI scope are binding in `docs/java-concept-projection-ui-v2.md`.
+
+- Original .rs paths/source and AST node spans are authoritative. Java read/Compare panes are **conceptual, noncompilable, read-only projections**. Never change stored Rust files to achieve Java-style appearance.
+- Rename only syntactically identifiable conventionally snake_case identifiers to lowerCamelCase, and conventionally lowercase type identifiers to UpperCamelCase, in the Java visual projection. Do not rewrite use paths, mod names, strings, macros, unknown/malformed syntax, or inferred type identities. Keep occurrence-level links bidirectionally exact.
+- Rust `use` is only analogous to import; `mod` is a module/namespace, NOT a Java inner class. Rust free functions cannot be silently placed in a fabricated Java class. `trait` and `impl` require explicit semantic caveats.
+- Structure navigation must include free functions, imports, modules, types, traits, impl blocks, fields and methods, with true AST line numbers and conservative Java labels.
+- Read-only code folding is AST-line-based, per document and per Java/Rust side. It must never mutate the editable buffer, lie about line numbers, or use pixel-offset linked scroll when two panes have different collapsed line ranges. Do not allocate a full visible-row map each frame for large untouched files.
+- Narrow compare must prioritize code width and hide explanation/navigation before squeezing the code into unreadable columns. All changes need parser link tests, folding tests, no-data-loss tests and real native GUI smoke; distinguish Xvfb from human QA.

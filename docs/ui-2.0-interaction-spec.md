@@ -171,3 +171,9 @@ Add shortcuts only when they do not conflict with egui text editing or OS conven
 ## 10. Learning system
 
 A stage-specific scratch editor provides two exercises for each of six stages. Compiling explicitly requires a user confirmation and uses Cargo check --all-targets --offline in an isolated temporary no-dependency crate. Error-code explanations are educational only. Practice drafts and progress persist with the session. See docs/learning-path-v1.md.
+
+## Java 概念命名与 AST 折叠（UI 2.1）
+
+设计约束见 [java-concept-projection-ui-v2.md](java-concept-projection-ui-v2.md)。Java 只读投影可把常规 Rust snake_case 符号显示为 camelCase（类型为 UpperCamelCase）；`use` 类比 import、`mod` 类比模块/命名空间而非内部类。不得改变真实 Rust AST 锚点和原文件，不得把 Rust 所有权和复杂类型误译为可编译 Java。
+
+Java/Rust 只读代码栏提供跨行 AST 结构的 `▾/▸` 及全部折叠/展开。折叠不会改动真实物理行号，双栏联动滚动按源行号而非像素偏移。左侧结构树和右侧导览覆盖自由函数、导入、mod、struct、enum、trait、impl、方法与字段。窄窗口优先代码区域，说明和导航可以自动收起。

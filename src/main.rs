@@ -82,7 +82,7 @@ struct App {
     selected: Option<usize>,
     jump_to: Option<usize>,
     sync_scroll: bool,
-    scroll_follow: Option<(bool, f32)>,
+    scroll_follow: Option<(bool, usize)>,
     last_scroll: Option<(f32, f32)>,
     dirty: bool,
     saved_source: String,
@@ -2252,7 +2252,7 @@ impl App {
         let jump = self.jump_to.take();
         let result = if java {
             ui.colored_label(Color32::YELLOW,
-                "Java 心智阅读模式 · 点击蓝色标记查看实际 Rust；这不是可编译 Java，复杂语义以 Rust 原文为准。");
+                "Java 心智阅读 · 方法/变量仅按命名约定显示 camelCase；use≈import、mod≈模块，不是内部类。只读、不可编译。");
             code_view::show(
                 ui,
                 &self.projection.java,
@@ -2262,7 +2262,8 @@ impl App {
                     side: code_view::Side::Java,
                     selected: self.selected,
                     jump_to: jump,
-                    scroll_to: None,
+                    scroll_to_line: None,
+                    document_id: self.documents.active().map_or(0, |doc| doc.id),
                 },
             )
         } else {
@@ -2275,7 +2276,8 @@ impl App {
                     side: code_view::Side::Rust,
                     selected: self.selected,
                     jump_to: jump,
-                    scroll_to: None,
+                    scroll_to_line: None,
+                    document_id: self.documents.active().map_or(0, |doc| doc.id),
                 },
             )
         };
@@ -2311,7 +2313,7 @@ impl App {
                 egui::vec2(left_width, available_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |pane| {
-                    pane.strong("Java 心智模型 · 只读");
+                    pane.strong("Java 概念投影 · camelCase · 只读");
                     left = Some(code_view::show(
                         pane,
                         &self.projection.java,
@@ -2321,7 +2323,10 @@ impl App {
                             side: code_view::Side::Java,
                             selected: self.selected,
                             jump_to: jump,
-                            scroll_to: pending.filter(|(rust, _)| !*rust).map(|(_, y)| y),
+                            scroll_to_line: pending
+                                .filter(|(rust, _)| !*rust)
+                                .map(|(_, line)| line),
+                            document_id: self.documents.active().map_or(0, |doc| doc.id),
                         },
                     ));
                 },
@@ -2367,7 +2372,8 @@ impl App {
                             side: code_view::Side::Rust,
                             selected: self.selected,
                             jump_to: jump,
-                            scroll_to: pending.filter(|(rust, _)| *rust).map(|(_, y)| y),
+                            scroll_to_line: pending.filter(|(rust, _)| *rust).map(|(_, line)| line),
+                            document_id: self.documents.active().map_or(0, |doc| doc.id),
                         },
                     ));
                 },
@@ -2377,21 +2383,30 @@ impl App {
         if let (Some(left), Some(right)) = (left, right) {
             if let Some(index) = left.clicked.or(right.clicked) {
                 self.select(index, false);
+            } else if left.fold_changed || right.fold_changed {
+                // A fold changes virtual scroll height. Never misinterpret that
+                // layout change as user scrolling the other pane.
+                self.scroll_follow = None;
+                self.last_scroll = None;
             } else if self.sync_scroll
                 && jump.is_none()
                 && pending.is_none()
                 && let Some((prev_left, prev_right)) = self.last_scroll
             {
-                // Detect wheel, touchpad, drag and scrollbar changes, not only wheel events.
+                // Detect wheel, touchpad, drag and scrollbar changes. Transfer
+                // original source lines across panes, NOT pixel offsets: the
+                // Java and Rust panes can have independently folded ranges.
                 let left_delta = (left.offset_y - prev_left).abs();
                 let right_delta = (right.offset_y - prev_right).abs();
                 if left_delta > 0.5 && (left.hovered || right_delta <= 0.5) {
-                    self.scroll_follow = Some((true, left.offset_y));
+                    self.scroll_follow = Some((true, left.top_source_line));
                 } else if right_delta > 0.5 && (right.hovered || left_delta <= 0.5) {
-                    self.scroll_follow = Some((false, right.offset_y));
+                    self.scroll_follow = Some((false, right.top_source_line));
                 }
             }
-            self.last_scroll = Some((left.offset_y, right.offset_y));
+            if !left.fold_changed && !right.fold_changed {
+                self.last_scroll = Some((left.offset_y, right.offset_y));
+            }
         }
     }
 
@@ -2510,44 +2525,80 @@ impl App {
         });
     }
 
+    fn navigate_structure(&mut self, rust_byte: usize) {
+        if let Some(index) = self.projection.rust_anchor(rust_byte) {
+            self.selected = Some(index);
+            self.jump_to = Some(index);
+            self.last_scroll = None;
+            self.status = "已定位到真实 Rust AST 节点；仅教学视图显示 Java 风格名称。".into();
+        }
+    }
+
     fn right_guide(&mut self, ui: &mut egui::Ui) {
         ui.heading("Java ↔ Rust 概念说明");
-        ui.small("AST 精确对应位置；并非类型解析或可编译 Java 转换");
+        ui.small("结构按 Java 心智组织；真实文件名、模块边界和 Rust 源码保持不变。");
+        ui.small("camelCase 只是教学视图的词法命名，非类型解析，不是可编译 Java。");
         ui.separator();
         if self.projection_pending {
             ui.label("Updating projection; links are temporarily unavailable.");
             return;
         }
-        let insights: Vec<_> = self
-            .projection
-            .java_insights
-            .iter()
-            .take(60)
-            .cloned()
-            .collect();
-        egui::CollapsingHeader::new(format!(
-            "Java 结构导览（{} 项）",
-            self.projection.java_insights.len()
-        ))
-        .default_open(true)
-        .show(ui, |ui| {
-            ui.small(
-                "把真实 struct / trait / impl 翻译成 Java 开发者熟悉的结构语言，不猜测类型身份。",
-            );
-            for item in insights {
-                if ui
-                    .selectable_label(false, &item.headline)
-                    .on_hover_text(item.explanation)
-                    .clicked()
-                    && let Some(idx) = self.projection.rust_anchor(item.rust_byte)
-                {
-                    self.select(idx, self.mode == Mode::Java);
+        let mut navigate = None;
+        let structure_count = self.projection.structures.len();
+        egui::CollapsingHeader::new(format!("Java 风格结构导航（{} 项）", structure_count))
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.small("按真实 Rust AST 组织：模块≈package、trait≈interface、impl≈方法归属；不凭文件名伪造类。");
+                if structure_count == 0 {
+                    ui.weak("此文件没有可识别的声明；语法不完整时不会编造结构。");
                 }
+                for item in self.projection.structures.iter().take(120) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(f32::from(item.depth) * 9.0);
+                        ui.small(format!("L{}", item.rust_line + 1));
+                        let title = if item.title.chars().count() > 58 {
+                            format!("{}…", item.title.chars().take(57).collect::<String>())
+                        } else {
+                            item.title.clone()
+                        };
+                        if ui
+                            .selectable_label(false, title)
+                            .on_hover_text(format!("{}\n{}", item.title, item.explanation))
+                            .clicked()
+                        {
+                            navigate = Some(item.rust_byte);
+                        }
+                    });
+                }
+                if structure_count > 120 {
+                    ui.small("只显示前 120 项。完整结构可在左侧「结构」面板查看。");
+                }
+            });
+        if let Some(byte) = navigate {
+            self.navigate_structure(byte);
+        }
+        if !self.projection.java_insights.is_empty() {
+            let mut insight_target = None;
+            egui::CollapsingHeader::new(format!(
+                "Java / Rust 结构语义差异（{} 项）",
+                self.projection.java_insights.len()
+            ))
+            .default_open(false)
+            .show(ui, |ui| {
+                for item in self.projection.java_insights.iter().take(45) {
+                    if ui
+                        .selectable_label(false, &item.headline)
+                        .on_hover_text(item.explanation)
+                        .clicked()
+                    {
+                        insight_target = Some(item.rust_byte);
+                    }
+                }
+            });
+            if let Some(byte) = insight_target {
+                self.navigate_structure(byte);
             }
-            if self.projection.java_insights.len() > 60 {
-                ui.small("结构较多，列表只展示前 60 项；其余可以通过源码锚点访问。");
-            }
-        });
+        }
         ui.separator();
         if self.projection.warning {
             ui.colored_label(

@@ -1,7 +1,10 @@
 //! Tree-sitter-backed, occurrence-level source maps for the Java reading projection.
 //! A projection is a teaching aid, not a Java transpiler or a name resolver.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+};
 use tree_sitter::{InputEdit, Node, ParseOptions, Parser, Point, Tree};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +46,29 @@ pub struct JavaInsight {
     pub explanation: &'static str,
 }
 
+/// A real Rust AST declaration, presented with a Java-friendly *conceptual*
+/// title. These are navigation items, never synthetic editable source nodes.
+#[derive(Clone, Debug)]
+pub struct StructureItem {
+    pub rust_byte: usize,
+    pub rust_line: usize,
+    pub depth: u8,
+    pub kind: &'static str,
+    pub title: String,
+    pub explanation: &'static str,
+}
+
+/// Foldable structural span in original/source line coordinates. The teaching
+/// projection retains line breaks, so either pane can use the same region.
+#[derive(Clone, Debug)]
+pub struct FoldRegion {
+    pub rust_byte: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub kind: &'static str,
+    pub title: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Projection {
     pub java: String,
@@ -58,6 +84,12 @@ pub struct Projection {
     pub rust_line_starts: Vec<usize>,
     pub java_line_starts: Vec<usize>,
     pub java_insights: Vec<JavaInsight>,
+    pub structures: Vec<StructureItem>,
+    pub folds: Vec<FoldRegion>,
+    /// For each original physical line, the outermost fold region that starts here.
+    pub fold_starts: Vec<Option<usize>>,
+    /// Stable while a document source is unchanged; UI fold state survives tab switches.
+    pub source_hash: u64,
     pub warning: bool,
 }
 
@@ -103,7 +135,7 @@ impl Projection {
 #[derive(Clone)]
 struct Edit {
     rust: ByteSpan,
-    replacement: &'static str,
+    replacement: String,
 }
 
 #[derive(Clone)]
@@ -123,6 +155,53 @@ struct Collector<'a> {
     cancelled: &'a dyn Fn() -> bool,
     visited: usize,
     insights: Vec<JavaInsight>,
+    structures: Vec<StructureItem>,
+    folds: Vec<FoldRegion>,
+}
+
+/// UI-only lexical normalization. This does not claim symbol identity,
+/// overload resolution or that the projection is valid Java.
+pub fn java_camel_case(name: &str) -> Option<String> {
+    if !name.contains('_')
+        || name.starts_with('_')
+        || name.ends_with('_')
+        || name.contains("__")
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || name.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let mut parts = name.split('_');
+    let mut result = parts.next()?.to_owned();
+    for part in parts {
+        let mut letters = part.chars();
+        let initial = letters.next()?;
+        result.push(initial.to_ascii_uppercase());
+        result.extend(letters);
+    }
+    Some(result)
+}
+
+/// Type declarations in Java convention use UpperCamelCase. This is an
+/// unambiguous display convention, not a rename of the Rust symbol.
+fn java_pascal_case(name: &str) -> Option<String> {
+    if name.starts_with('_')
+        || name.ends_with('_')
+        || name.contains("__")
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || name.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let camel = java_camel_case(name).unwrap_or_else(|| name.to_owned());
+    let mut letters = camel.chars();
+    let first = letters.next()?;
+    let result = format!("{}{}", first.to_ascii_uppercase(), letters.as_str());
+    (result != name).then_some(result)
 }
 
 impl Collector<'_> {
@@ -183,10 +262,242 @@ impl Collector<'_> {
                         start: token.start_byte(),
                         end: token.end_byte(),
                     },
-                    replacement,
+                    replacement: replacement.to_owned(),
                 });
             }
         }
+    }
+
+    fn rewrite_identifier(&mut self, node: Node<'_>, is_type: bool) {
+        let original = node.utf8_text(self.source.as_bytes()).unwrap_or("");
+        // A projection is not a resolver. Rename only syntactic identifiers,
+        // not imports, module paths, type names, strings or macro invocations.
+        let mut parent = node.parent();
+        while let Some(ancestor) = parent {
+            if matches!(
+                ancestor.kind(),
+                "use_declaration" | "macro_invocation" | "macro_definition" | "attribute_item"
+            ) {
+                return;
+            }
+            if ancestor.kind() == "mod_item"
+                && ancestor
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.start_byte() == node.start_byte())
+            {
+                return;
+            }
+            parent = ancestor.parent();
+        }
+        let renamed = if is_type {
+            java_pascal_case(original)
+        } else {
+            java_camel_case(original)
+        };
+        if let Some(replacement) = renamed {
+            self.edits.push(Edit {
+                rust: ByteSpan {
+                    start: node.start_byte(),
+                    end: node.end_byte(),
+                },
+                replacement,
+            });
+        }
+    }
+
+    fn describe_structure(&mut self, node: Node<'_>) {
+        let text = |field: &str| {
+            node.child_by_field_name(field)
+                .and_then(|child| child.utf8_text(self.source.as_bytes()).ok())
+        };
+        let kind = node.kind();
+        let (title, explanation): (String, &'static str) = match kind {
+            "use_declaration" => {
+                let raw = node.utf8_text(self.source.as_bytes()).unwrap_or("");
+                let name = raw
+                    .trim()
+                    .trim_start_matches("use")
+                    .trim()
+                    .trim_end_matches(';');
+                (
+                    format!("import {name}"),
+                    "use 类似 Java import，但 Rust 路径、作用域与重导出不同；不是可编译的 Java import。",
+                )
+            }
+            "mod_item" => {
+                let name = text("name").unwrap_or("module");
+                (
+                    format!("模块 {name}（≈ package）"),
+                    "Rust mod 定义或声明模块及名称空间；不是 Java 内部类，也不要求一文件一类。",
+                )
+            }
+            "struct_item" => (
+                format!(
+                    "class {}（数据）",
+                    text("name")
+                        .map(|name| java_pascal_case(name).unwrap_or_else(|| name.into()))
+                        .unwrap_or_else(|| "struct".into())
+                ),
+                "Rust struct 是数据结构；方法存在独立的 impl 中，不等价于 Java class 继承体系。",
+            ),
+            "trait_item" => (
+                format!(
+                    "interface {}（行为）",
+                    text("name")
+                        .map(|name| java_pascal_case(name).unwrap_or_else(|| name.into()))
+                        .unwrap_or_else(|| "trait".into())
+                ),
+                "Rust trait 类似 Java interface；默认实现、泛型和对象语义并不完全等价。",
+            ),
+            "enum_item" => (
+                format!(
+                    "enum {}（可带数据）",
+                    text("name")
+                        .map(|name| java_pascal_case(name).unwrap_or_else(|| name.into()))
+                        .unwrap_or_else(|| "enum".into())
+                ),
+                "Rust enum 的变体可以携带数据，不等价于所有 Java enum。",
+            ),
+            "impl_item" => {
+                let original_type = text("type").unwrap_or("未知类型");
+                let ty = java_pascal_case(original_type).unwrap_or_else(|| original_type.into());
+                if let Some(trait_name) = text("trait") {
+                    (
+                        format!("{ty} implements {trait_name}（概念）"),
+                        "impl Trait for Type 是 trait 的实现，不是 Java 的继承或内部类；行为不完全等价。",
+                    )
+                } else {
+                    (
+                        format!("{ty} 的方法实现"),
+                        "inherent impl 把方法挂到类型上；Rust 可以将数据定义和方法实现分开。",
+                    )
+                }
+            }
+            "function_item" | "function_signature_item" => {
+                let name = text("name").unwrap_or("function");
+                let display = java_camel_case(name).unwrap_or_else(|| name.to_owned());
+                let inside_impl = {
+                    let mut parent = node.parent();
+                    let mut result = false;
+                    while let Some(ancestor) = parent {
+                        if matches!(ancestor.kind(), "impl_item" | "trait_item") {
+                            result = true;
+                            break;
+                        }
+                        parent = ancestor.parent();
+                    }
+                    result
+                };
+                (
+                    format!(
+                        "{} {display}()",
+                        if inside_impl {
+                            "成员方法"
+                        } else {
+                            "自由函数"
+                        }
+                    ),
+                    "Rust 函数可在模块作用域独立存在；Java 不支持完全相同的自由函数组织。函数参数、所有权与返回值不能直接翻译。",
+                )
+            }
+            "field_declaration" => {
+                let name = text("name").unwrap_or("field");
+                (
+                    format!(
+                        "属性 {}",
+                        java_camel_case(name).unwrap_or_else(|| name.into())
+                    ),
+                    "只把属性标识符按 Java 惯例显示；Rust 字段的所有权/借用不等于 Java 对象属性。",
+                )
+            }
+            "const_item" | "static_item" => (
+                format!("常量 {}", text("name").unwrap_or("constant")),
+                "Rust const / static 有不同的初始化和存储语义；不能只当作 Java static final。",
+            ),
+            "type_item" => (
+                format!("类型别名 {}", text("name").unwrap_or("type")),
+                "Rust type alias 并不创建新类型，与 Java 类型别名和泛型机制不等价。",
+            ),
+            _ => return,
+        };
+        let rust_byte = node
+            .child_by_field_name("name")
+            .map_or(node.start_byte(), |n| n.start_byte());
+        let mut depth = 0_u8;
+        let mut parent = node.parent();
+        while let Some(ancestor) = parent {
+            if matches!(
+                ancestor.kind(),
+                "mod_item" | "impl_item" | "trait_item" | "struct_item" | "enum_item"
+            ) {
+                depth = depth.saturating_add(1).min(4);
+            }
+            parent = ancestor.parent();
+        }
+        self.structures.push(StructureItem {
+            rust_byte,
+            rust_line: node.start_position().row,
+            depth,
+            kind: match kind {
+                "use_declaration" => "import",
+                "mod_item" => "module",
+                "struct_item" => "class",
+                "trait_item" => "interface",
+                "enum_item" => "enum",
+                "impl_item" => "impl",
+                "function_item" | "function_signature_item" => "function",
+                "field_declaration" => "field",
+                "const_item" | "static_item" => "constant",
+                _ => "type",
+            },
+            title,
+            explanation,
+        });
+    }
+
+    fn collect_fold(&mut self, node: Node<'_>) {
+        let kind = node.kind();
+        if !matches!(
+            kind,
+            "mod_item"
+                | "impl_item"
+                | "struct_item"
+                | "trait_item"
+                | "enum_item"
+                | "function_item"
+                | "function_signature_item"
+                | "if_expression"
+                | "match_expression"
+                | "while_expression"
+                | "for_expression"
+                | "loop_expression"
+                | "use_declaration"
+                | "block"
+                | "closure_expression"
+        ) {
+            return;
+        }
+        let start_line = node.start_position().row;
+        let end_line = node.end_position().row;
+        if end_line <= start_line + 1 {
+            return;
+        }
+        let title = node
+            .child_by_field_name("name")
+            .and_then(|child| child.utf8_text(self.source.as_bytes()).ok())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                kind.trim_end_matches("_item")
+                    .trim_end_matches("_expression")
+                    .into()
+            });
+        self.folds.push(FoldRegion {
+            rust_byte: node.start_byte(),
+            start_line,
+            end_line,
+            kind,
+            title,
+        });
     }
 
     fn named(
@@ -270,6 +581,8 @@ impl Collector<'_> {
             return true;
         }
         self.describe_java_structure(node);
+        self.describe_structure(node);
+        self.collect_fold(node);
         match node.kind() {
             "struct_item" => {
                 self.keyword(node, "struct", Some("class"), "class ↔ struct",
@@ -289,6 +602,10 @@ impl Collector<'_> {
                 self.named(node, "type", "Rust enum",
                     "Rust enums can carry data in variants. Java enums are not a complete equivalent.");
             }
+            "use_declaration" => self.keyword(node, "use", Some("import"), "use ≈ Java import",
+                "Rust use brings a name/path into scope; it is not a byte-for-byte Java import or class loading."),
+            "mod_item" => self.keyword(node, "mod", Some("/*module≈package*/"), "mod ≈ module/namespace",
+                "Rust mod is a module declaration/namespace, not a Java inner class. Modules may live in files or inline blocks."),
             "impl_item" => self.keyword(node, "impl", None, "impl ↔ method implementation",
                 "Impl blocks attach inherent methods or implement a trait; they are not class declarations or inheritance."),
             "function_item" | "function_signature_item" => {
@@ -301,7 +618,21 @@ impl Collector<'_> {
                 "Struct fields hold Rust values directly; their ownership and mutability differ from Java object fields."),
             "let_declaration" => {
                 self.keyword(node, "let", Some("var"), "let ↔ local binding",
-                    "Rust let binds a value; bindings are immutable unless mut. Non-Copy values can move ownership.");
+                    "Java 8 局部变量需要显式类型。此处 var 只是教学标记，不是 Java 8 可编译语法；Rust let 默认不可变，mut 才允许重新绑定。");
+                let mut cursor = node.walk();
+                if let Some(mutable) = node.children(&mut cursor)
+                    .find(|child| child.kind() == "mutable_specifier")
+                {
+                    self.add(mutable, "concept", "mut ↔ 可变绑定",
+                        "Rust mut 表示绑定可变；Java 局部变量默认可重新赋值。所有权和借用规则仍不同。", 3);
+                    self.edits.push(Edit {
+                        rust: ByteSpan {
+                            start: mutable.start_byte(),
+                            end: mutable.end_byte(),
+                        },
+                        replacement: "/*mutable*/".into(),
+                    });
+                }
             }
             "reference_type" => self.keyword(node, "&", None, "Reference and borrowing",
                 "A reference borrows a value; the borrow checker prevents invalid lifetimes and conflicting mutable access."),
@@ -327,6 +658,11 @@ impl Collector<'_> {
 
     fn leaf(&mut self, node: Node<'_>) {
         let text = node.utf8_text(self.source.as_bytes()).unwrap_or("");
+        if matches!(node.kind(), "identifier" | "field_identifier") {
+            self.rewrite_identifier(node, false);
+        } else if node.kind() == "type_identifier" {
+            self.rewrite_identifier(node, true);
+        }
         match node.kind() {
             "type_identifier" => {
                 let (topic, detail, replacement) = match text {
@@ -383,7 +719,7 @@ fn apply_edits(source: &str, edits: &[Edit]) -> String {
     let mut cursor = 0;
     for edit in edits {
         result.push_str(&source[cursor..edit.rust.start]);
-        result.push_str(edit.replacement);
+        result.push_str(&edit.replacement);
         cursor = edit.rust.end;
     }
     result.push_str(&source[cursor..]);
@@ -587,6 +923,8 @@ fn project_tree(source: &str, tree: &Tree, cancelled: &dyn Fn() -> bool) -> Opti
         cancelled,
         visited: 0,
         insights: Vec::new(),
+        structures: Vec::new(),
+        folds: Vec::new(),
     };
     if !collector.walk(tree.root_node()) || cancelled() {
         return None;
@@ -613,6 +951,24 @@ fn project_tree(source: &str, tree: &Tree, cancelled: &dyn Fn() -> bool) -> Opti
     }
     let rust_lines = line_starts(source);
     let java_lines = line_starts(&java);
+    let mut source_hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut source_hasher);
+    let source_hash = source_hasher.finish();
+    let mut fold_starts = vec![None; rust_lines.len()];
+    for (index, fold) in collector.folds.iter().enumerate() {
+        if let Some(slot) = fold_starts.get_mut(fold.start_line) {
+            let previous = slot.map(|old: usize| &collector.folds[old]);
+            let better = previous.is_none_or(|old| {
+                fold.end_line > old.end_line
+                    || (fold.end_line == old.end_line
+                        && old.kind == "block"
+                        && fold.kind != "block")
+            });
+            if better {
+                *slot = Some(index);
+            }
+        }
+    }
     let mut anchors = Vec::new();
     for draft in collector.drafts {
         if cancelled() {
@@ -665,6 +1021,10 @@ fn project_tree(source: &str, tree: &Tree, cancelled: &dyn Fn() -> bool) -> Opti
         rust_line_starts: rust_lines,
         java_line_starts: java_lines,
         java_insights: collector.insights,
+        structures: collector.structures,
+        folds: collector.folds,
+        fold_starts,
+        source_hash,
         warning: tree.root_node().has_error(),
     })
 }
@@ -693,6 +1053,131 @@ mod tests {
             assert!(source.is_char_boundary(anchor.rust.start));
             assert!(projection.java.is_char_boundary(anchor.java.start));
         }
+    }
+
+    #[test]
+    fn teaching_view_import_module_and_camel_names_preserve_exact_ast_links() {
+        let src = r#"use std::ops::Range;
+mod helper_utils {
+    pub struct SomeType { first_name: String }
+    impl SomeType {
+        pub fn get_first_name(&self) -> &str { &self.first_name }
+    }
+    pub fn minimal_diff_span(old_end: usize) -> usize { old_end }
+}"#;
+        let p = project(src);
+        assert!(p.java.contains("import std::ops::Range;"));
+        assert!(p.java.contains("/*module≈package*/ helper_utils {"));
+        assert!(p.java.contains("firstName: String"));
+        assert!(p.java.contains("getFirstName(&self)"));
+        assert!(p.java.contains("self.firstName"));
+        assert!(p.java.contains("minimalDiffSpan(oldEnd"));
+        assert!(p.java.contains("{ oldEnd }"));
+        assert!(
+            p.structures
+                .iter()
+                .any(|e| e.title.contains("模块 helper_utils"))
+        );
+        assert!(
+            p.structures
+                .iter()
+                .any(|e| e.title.contains("class SomeType"))
+        );
+        assert!(
+            p.structures
+                .iter()
+                .any(|e| e.title.contains("成员方法 getFirstName"))
+        );
+        assert!(
+            p.structures
+                .iter()
+                .any(|e| e.title.contains("自由函数 minimalDiffSpan"))
+        );
+        assert!(p.folds.iter().any(|f| f.kind == "mod_item"));
+        assert!(p.folds.iter().any(|f| f.kind == "impl_item"));
+        assert_links(src);
+    }
+
+    #[test]
+    fn actual_line_index_rs_screenshot_case_has_java_style_free_function_outline() {
+        let source = include_str!("line_index.rs");
+        let p = project(source);
+        assert!(p.java.contains("import std::ops::Range;"));
+        assert!(p.java.contains("/*method*/ applyLinePatch("));
+        assert!(p.java.contains("var /*mutable*/ oldEnd = before.len()"));
+        assert!(p.java.contains("var /*mutable*/ newEnd = after.len()"));
+        assert!(
+            p.structures
+                .iter()
+                .any(|e| e.title.contains("自由函数 minimalDiff"))
+        );
+        assert!(
+            p.structures
+                .iter()
+                .any(|e| e.title.contains("自由函数 applyLinePatch"))
+        );
+        assert!(p.folds.iter().any(|f| f.kind == "function_item"));
+        assert_links(source);
+    }
+
+    #[test]
+    fn standalone_function_file_has_a_nonempty_structure_navigation() {
+        let src = "use std::ops::Range;\n\npub fn minimal_diff_span(before: &str, after: &str) -> usize {\n    let mut old_end = before.len();\n    while old_end > 0 {\n        old_end -= 1;\n    }\n    old_end\n}\n";
+        let p = project(src);
+        assert!(p.java.starts_with("import std::ops::Range;"));
+        assert!(p.java.contains("minimalDiffSpan("));
+        assert!(p.java.contains("oldEnd"));
+        assert!(
+            p.structures
+                .iter()
+                .any(|e| e.title.contains("minimalDiffSpan"))
+        );
+        assert!(p.folds.iter().any(|f| f.kind == "while_expression"));
+        assert_links(src);
+    }
+
+    #[test]
+    fn lowercase_struct_type_is_pascal_in_java_projection_but_real_rust_remains_intact() {
+        let src = "struct user_profile { account_id: usize }\nimpl user_profile {\n    fn get_account_id(&self) -> usize { self.account_id }\n}\n";
+        let p = project(src);
+        assert!(p.java.contains("class UserProfile { accountId: usize }"));
+        assert!(
+            p.java.contains("/*"),
+            "the teaching view is explicitly conceptual"
+        );
+        assert!(p.java.contains("impl UserProfile {"));
+        assert!(p.java.contains("getAccountId"));
+        assert!(
+            p.structures
+                .iter()
+                .any(|entry| entry.title.contains("class UserProfile"))
+        );
+        assert!(
+            p.structures
+                .iter()
+                .any(|entry| entry.title.contains("UserProfile 的方法"))
+        );
+        assert_links(src);
+    }
+
+    #[test]
+    fn never_rename_import_paths_macros_types_or_unusual_identifiers() {
+        let src = r#"use project_mod::snake_case;
+mod internal_mod;
+fn compute_value() {
+    custom_macro!(snake_case);
+    let SOME_CONSTANT = 1;
+    let __internal = 2;
+    let a = SomeCustomType::make_value();
+}"#;
+        let p = project(src);
+        assert!(p.java.contains("import project_mod::snake_case"));
+        assert!(p.java.contains("/*module≈package*/ internal_mod;"));
+        assert!(p.java.contains("custom_macro!(snake_case)"));
+        assert!(p.java.contains("SOME_CONSTANT"));
+        assert!(p.java.contains("__internal"));
+        assert!(p.java.contains("SomeCustomType::makeValue()"));
+        assert_links(src);
     }
 
     #[test]
