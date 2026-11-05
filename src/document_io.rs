@@ -39,6 +39,9 @@ pub enum Reply {
         path: PathBuf,
         content: String,
         result: io::Result<SaveOutcome>,
+        /// Captured by the background I/O worker after commit. The egui thread
+        /// must never call filesystem metadata APIs to finish a save.
+        stamp: Option<FileStamp>,
     },
 }
 enum Job {
@@ -130,11 +133,15 @@ impl DocumentIo {
                             content,
                         } => {
                             let result = save_if_unchanged(&path, &expected, &content);
+                            // A slow network mount must never stall the GUI's
+                            // save-completion callback just to stat the file.
+                            let stamp = result.as_ref().ok().and_then(|_| file_stamp(&path).ok());
                             Reply::Save {
                                 id,
                                 path,
                                 content,
                                 result,
+                                stamp,
                             }
                         }
                     };
@@ -332,8 +339,13 @@ mod tests {
             "fn changed() {}".into(),
         );
         loop {
-            if let Some(Reply::Save { result, .. }) = worker.take() {
+            if let Some(Reply::Save { result, stamp, .. }) = worker.take() {
                 assert_eq!(result.unwrap(), SaveOutcome::Durable);
+                assert_eq!(
+                    stamp,
+                    Some(file_stamp(&b).unwrap()),
+                    "the I/O worker must capture the saved file's metadata"
+                );
                 break;
             }
             assert!(Instant::now() < until);

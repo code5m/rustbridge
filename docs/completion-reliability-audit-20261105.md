@@ -52,3 +52,30 @@
 ## 五、统一合并条件
 
 在同一整改分支完成 `cargo fmt --check`、`cargo check --all-targets`、`cargo test --all-targets`、`cargo clippy --all-targets -- -D warnings`；Linux Release 构建及真实 GUI 编辑、崩溃恢复、资源验收；GitHub Windows、macOS、Linux 三平台原生 CI 均须通过后，才通过单 PR、单次合并进入 `main`。任何失败均回到相同分支修复，禁止跳过门禁或先部分合并。
+
+## 六、最新 main 复核补充：后台保存回执与并发编辑
+
+复查基线：`e6e43f7`。本次基于真实开发机执行，保留回归用例和日志，不把 CI 通过当作不存在竞态的证明。
+
+### 问题 A — P0：保存期间继续输入可能丢失多文档的脏状态
+
+场景：用户点击保存，DocumentIo 开始后台写入旧源码快照；在回执返回到 UI 前，用户继续编辑新版本。旧实现先用旧快照更新 Document Manager 的保存基线，随后直接执行 `mark_active_document_synced`，把**尚未同步到 Document Manager 的新源码版本**误认为已同步。
+
+结果：编辑器仍显示 dirty，但 Document Manager 可能错误地显示 clean，后续 Save All、关闭、项目切换和 Journal 删除都存在漏掉新编辑的风险。
+
+复现证据：新增 `file_tests::edits_during_an_accepted_save_remain_dirty_and_can_be_saved_again`，旧实现实际失败并输出 `manager lost post-save edits`。
+
+修复：先更新旧快照的保存基线，再调用 `sync_active_document` 以最新编辑器源码对账，之后才检查脏状态、维护 Journal 和继续排队保存。如果新编辑已经被自动跟进的第二次保存落盘，文档应是 clean；否则它必须是 dirty，绝不可出现“编辑器与 Document Manager 状态分叉”。
+
+### 问题 B — P1：保存完成的磁盘元数据读取可能卡住 UI
+
+旧实现的 `App::poll_document_io` 在 UI 线程同步调用 `file_stamp`。即便真正的文件保存已经转移到后台，在 NFS 或慢盘上回执处理仍可能阻塞渲染。
+
+修复：DocumentIo 保存工作线程在提交后获取 `FileStamp`，将快照连同 `SaveOutcome` 发送给 UI。相同文件路径优先内存比较，避免在典型保存回执中执行多余的 `canonicalize`。
+
+### 验收要求与边界
+
+- 保存中追加文字的单元回归必须通过，并验证最终真实磁盘文件、Document Manager 缓冲区、保存基线与 dirty 状态一致。
+- DocumentIo 后台保存回执必须携带实际文件戳，测试验证其等于真实保存后的文件元数据。
+- 运行 `cargo fmt --check`、`cargo check --all-targets`、`cargo test --all-targets`、`cargo clippy --all-targets -- -D warnings`，以及原生 Release GUI、大文件 CRLF、SIGKILL 恢复与资源冒烟测试。
+- 仍不声称已经证明网络文件系统永远不会卡死，Windows/macOS 原位保存完全断电原子，或已经做过真正的人类桌面操作体验测试。

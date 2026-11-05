@@ -1664,6 +1664,7 @@ impl App {
                     path,
                     content,
                     result,
+                    stamp,
                 } => {
                     if !self.saving.as_ref().is_some_and(|(pending, p, snapshot)| {
                         *pending == id && *p == path && *snapshot == content
@@ -1675,13 +1676,15 @@ impl App {
                     match result {
                         Ok(outcome) => {
                             let durable = matches!(&outcome, safe_save::SaveOutcome::Durable);
-                            let stamp = file_watch::file_stamp(&path).ok();
+                            // Metadata is already captured on the I/O worker.
+                            // Do not block the GUI when the source sits on a
+                            // slow filesystem or network mount.
                             self.documents
                                 .update_saved(&path, content.clone(), stamp.clone());
-                            let active_matches = self.file.as_ref().is_some_and(|active| {
-                                active.canonicalize().unwrap_or_else(|_| active.clone())
-                                    == path.canonicalize().unwrap_or_else(|_| path.clone())
-                            });
+                            let active_matches = self
+                                .file
+                                .as_ref()
+                                .is_some_and(|active| same_document_path(active, &path));
                             if active_matches {
                                 self.saved_source = content.clone();
                                 self.disk_stamp = stamp.clone();
@@ -1690,7 +1693,12 @@ impl App {
                                 if let Some(watch) = self.file_watch.as_mut() {
                                     watch.set_target(path.clone(), stamp);
                                 }
-                                self.mark_active_document_synced();
+                                // The save only commits its captured snapshot. If the user
+                                // typed again while I/O was in flight, the manager must
+                                // receive the newer visible buffer before we decide whether
+                                // the document is dirty or its recovery journal can be removed.
+                                // Marking the revision as synced here would hide those edits.
+                                self.sync_active_document();
                             }
                             self.persist_document_recovery(&path);
                             self.status = match outcome {
@@ -3174,6 +3182,11 @@ fn diagnostic_location(source: &str, line: usize, column: usize) -> parser::Byte
 }
 
 fn same_document_path(left: &Path, right: &Path) -> bool {
+    // Identical open-tab paths are common on every keystroke, save completion
+    // and session update. Avoid touching the filesystem in the common case.
+    if left == right {
+        return true;
+    }
     left.canonicalize().unwrap_or_else(|_| left.to_path_buf())
         == right.canonicalize().unwrap_or_else(|_| right.to_path_buf())
 }
@@ -3999,6 +4012,61 @@ mod file_tests {
         assert!(app.documents.get(&a).unwrap().is_dirty());
         assert!(!app.documents.get(&b).unwrap().is_dirty());
         assert_eq!(app.save_errors.len(), 1, "one conflict should be reported");
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edits_during_an_accepted_save_remain_dirty_and_can_be_saved_again() {
+        let root = std::env::temp_dir().join(format!(
+            "rustbridge-edits-while-saving-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+
+        let mut app = App::default();
+        app.open_file(path.clone());
+        app.wait_for_document_io();
+
+        let first = "\n// first revision";
+        let start = app.rust.len();
+        app.rust.push_str(first);
+        app.source_edited(start..start, first);
+        app.dirty = true;
+        app.save();
+        assert!(app.saving.is_some());
+
+        // The I/O worker can finish before UI polling; editing in the meantime
+        // must never become a phantom clean buffer or lose its recovery journal.
+        let second = "\n// newer revision while save was in flight";
+        let start = app.rust.len();
+        app.rust.push_str(second);
+        app.source_edited(start..start, second);
+        app.dirty = true;
+        app.mark_dirty_for_recovery();
+
+        app.wait_for_document_io();
+        // A successful first save can enqueue another save for the newer
+        // revision. Either the later edit must remain dirty, or the automatic
+        // second save must have durably persisted it. It must never disappear.
+        let disk = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            app.documents.get(&path).unwrap().source,
+            app.rust,
+            "manager lost post-save edits"
+        );
+        if disk != app.rust {
+            assert_eq!(disk, "fn main() {}\n// first revision");
+            assert!(app.dirty);
+            assert!(app.documents.get(&path).unwrap().is_dirty());
+            app.save();
+            app.wait_for_document_io();
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), app.rust);
+        assert!(!app.dirty);
+        assert!(!app.documents.get(&path).unwrap().is_dirty());
         drop(app);
         fs::remove_dir_all(root).unwrap();
     }

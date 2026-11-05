@@ -131,3 +131,10 @@ The binding product and architecture decisions are recorded in `docs/ui-2.0-deci
 - Never overwrite an invalid, overlarge or incompatible session without retaining its original bytes under a unique private backup. Do not change permissions through state-directory symlinks.
 - Windows/macOS non-atomic source writes require a durable independent rollback before mutation; retain rollback when post-commit directory durability is not confirmed. Do not claim power-loss atomicity or guaranteed recovery against all external writers.
 - Prevent regressions with native GUI crash/restore/edit/save tests, all-platform native CI, and explicit count tests for >256 recovery records. Do not merge a partial fix before the entire PR's gates pass.
+
+## Save acknowledgement and concurrent-edit contract
+
+- A save commits the immutable source snapshot accepted by DocumentIo, **not** every edit subsequently typed before its result is processed. Update the saved baseline to that snapshot, then reconcile any newer active editor text into Document Manager **before** dirty checks, Save All follow-ups, recovery-journal deletion, tab close or project switch.
+- Never call mark_active_document_synced merely because a background save completed: doing so can hide a newer editor revision and silently drop recovery data. A regression test must type a second revision while the first save is in flight and assert that the later text remains independently dirty or is durably saved by a follow-up.
+- FileStamp for an accepted save is captured in the DocumentIo background worker and sent alongside its outcome. No synchronous stat, canonicalize or disk read may be added to a common-case GUI save-completion path; identical document paths must be compared in memory first.
+- A committed-but-durability-uncertain save must not be misreported as a pre-commit failure or retried blindly. Preserve conflict detection, actual disk source identity, and the distinction between an in-flight accepted save and an unsaved later revision.
