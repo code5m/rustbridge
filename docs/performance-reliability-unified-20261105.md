@@ -1,7 +1,7 @@
 # RustBridge 性能、稳定性、可靠性统一整治决策与验收
 
-日期：2026-11-05  
-基线：`e8ab474` / `origin/main`  
+日期：2026-11-05
+基线：`e8ab474` / `origin/main`
 唯一工作分支：`fix/rustbridge-perf-reliability-unified-20261105`
 
 ## 一、目标与约束
