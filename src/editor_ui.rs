@@ -269,11 +269,55 @@ impl App {
         }
         self.handle_editor_lsp_shortcuts(ui);
         ui.horizontal(|ui| {
-            ui.label("原始 Rust 源码 · 可编辑");
+            ui.label(if self.editor_fold_preview {
+                "Rust AST 折叠阅读（只读预览；源文件不变）"
+            } else {
+                "原始 Rust 源码 · 可编辑"
+            });
             if ui.button("保存 · Ctrl+S").clicked() {
                 self.save();
             }
+            if ui
+                .button(if self.editor_fold_preview {
+                    "返回编辑（保留原始全部代码）"
+                } else {
+                    "折叠阅读（只读）"
+                })
+                .clicked()
+            {
+                self.editor_fold_preview = !self.editor_fold_preview;
+                self.editor_focused = false;
+                if !self.editor_fold_preview {
+                    self.editor_jump = self.selected.and_then(|index| {
+                        self.projection.anchors.get(index).map(|anchor| anchor.rust)
+                    });
+                }
+            }
         });
+        if self.editor_fold_preview {
+            if self.projection_pending {
+                ui.spinner();
+                ui.label("正在后台更新 Rust AST；完成后可折叠阅读。原始文件没有修改。");
+            } else {
+                let result = crate::code_view::show(
+                    ui,
+                    &self.rust,
+                    &self.projection,
+                    crate::code_view::ViewOptions {
+                        id: "rust_editor_fold_preview",
+                        side: crate::code_view::Side::Rust,
+                        selected: self.selected,
+                        jump_to: self.jump_to.take(),
+                        scroll_to_line: None,
+                        document_id: self.documents.active().map_or(0, |doc| doc.id),
+                    },
+                );
+                if let Some(index) = result.clicked {
+                    self.select(index, false);
+                }
+            }
+            return;
+        }
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.editor_query)

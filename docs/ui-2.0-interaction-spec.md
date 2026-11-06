@@ -48,7 +48,7 @@ The bar may wrap on narrow windows. It must not hide the only way to restore a p
 - Reopening an already-open path activates the existing tab; it must not create a duplicate buffer or overwrite unsaved text from disk.
 - Switching tabs preserves every document's buffer and dirty state. Opening a new file is asynchronous and does not block the editor.
 - Closing a clean tab closes immediately. Closing a dirty tab requires Save / Discard / Cancel for that document only. A save already in flight must finish before the tab closes.
-- Save All serializes accepted saves, reports the exact failing document and stops the remaining queue on conflict/failure. No successful save may mark a newer unsaved buffer clean.
+- Save All serializes accepted saves, reports each failed/conflicted document, and **continues safely with the remaining independent documents**. It must never overwrite a conflicting file or claim an incomplete batch succeeded. A normal single-file Ctrl+S saves only the accepted immutable snapshot: edits typed during the save remain dirty until another explicit save. Only an explicitly requested Save All transaction may requeue newer edits.
 - Session persistence records tab order, active path, per-tab cursor/mode and all pending document paths even while asynchronous restore is in progress.
 - Restart restores all valid tabs; an unreadable/unsupported entry must not prevent later tabs from restoring. Dirty recovery journals remain attached to their own document and are never silently overwritten by another tab.
 - Project switch and application close account for all dirty documents, not only the active editor. Unresolved recovery snapshots must be explicitly preserved or deleted when changing projects.
@@ -65,7 +65,7 @@ The bar may wrap on narrow windows. It must not hide the only way to restore a p
 ### Structure
 - Show declarations/concepts extracted from the current Rust AST.
 - Each item includes kind and line.
-- Clicking an item selects the exact known AST occurrence and navigates the current reading/editor mode.
+- Clicking an item selects the exact known AST occurrence and navigates the current reading/editor mode. Paginate all structure entries with bounded per-frame UI work; never silently truncate the list at 800.
 - Unknown declarations are not synthesized.
 
 ### Search

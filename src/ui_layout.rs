@@ -361,8 +361,35 @@ impl App {
         ui.small(format!(
             "{count} 个真实 AST 结构项 · 点击定位到两栏原位置。"
         ));
+        // Bound widget creation to a single page; no silent 800-item cap.
+        const STRUCTURE_PAGE_SIZE: usize = 60;
+        let page_id = egui::Id::new(("structure_page", self.projection.source_hash));
+        let max_page = (count - 1) / STRUCTURE_PAGE_SIZE;
+        let mut page = ui
+            .ctx()
+            .data(|data| data.get_temp::<usize>(page_id))
+            .unwrap_or(0)
+            .min(max_page);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(page > 0, egui::Button::new("上一页"))
+                .clicked()
+            {
+                page -= 1;
+            }
+            ui.label(format!("第 {} / {} 页", page + 1, max_page + 1));
+            if ui
+                .add_enabled(page < max_page, egui::Button::new("下一页"))
+                .clicked()
+            {
+                page += 1;
+            }
+        });
+        ui.ctx().data_mut(|data| data.insert_temp(page_id, page));
+        let start = page * STRUCTURE_PAGE_SIZE;
+        let end = (start + STRUCTURE_PAGE_SIZE).min(count);
         let mut chosen = None;
-        for item in self.projection.structures.iter().take(800) {
+        for item in &self.projection.structures[start..end] {
             ui.horizontal(|ui| {
                 ui.add_space(f32::from(item.depth) * 11.0);
                 ui.weak(format!("L{}", item.rust_line + 1));
@@ -375,9 +402,6 @@ impl App {
                     chosen = Some(item.rust_byte);
                 }
             });
-        }
-        if count > 800 {
-            ui.small("当前只展示前 800 项；其余可通过文件内搜索访问。");
         }
         if let Some(byte) = chosen {
             self.navigate_structure(byte);

@@ -498,7 +498,29 @@ impl Drop for PersistenceWorker {
         lock.lock().unwrap().closing = true;
         wake.notify_all();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            // A blocked network filesystem or storage driver may never
+            // return from a write. Do not make window destruction wait forever.
+            // The accepted journal worker is allowed a bounded grace period;
+            // if still blocked, report the unconfirmed persistence rather
+            // than falsely claiming that all queued state reached disk.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                if handle.join().is_err() {
+                    eprintln!("RustBridge persistence worker panicked during shutdown");
+                }
+            } else {
+                let (lock, _) = &*self.queue;
+                let pending_count = lock.lock().map_or(0, |queue| queue.jobs.len());
+                eprintln!(
+                    "WARNING: RustBridge persistence flush still blocked at shutdown;                      {pending_count} queued operations plus an in-flight write are unconfirmed.                      The worker has been detached; inspect the private recovery directory on restart."
+                );
+                // Joining this thread would make the native GUI unkillable.
+                // OS-uninterruptible I/O cannot be made durable by waiting.
+                drop(handle);
+            }
         }
     }
 }
@@ -633,6 +655,32 @@ mod tests {
         store.export_recovery(&orphan, &export).unwrap();
         assert_eq!(fs::read_to_string(export).unwrap(), "fn edited() {}");
     }
+    #[test]
+    fn shutdown_does_not_hang_forever_on_uninterruptible_worker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let queue = Arc::new((Mutex::new(PersistenceQueue::default()), Condvar::new()));
+        let still_blocked = Arc::new(AtomicBool::new(true));
+        let gate = Arc::clone(&still_blocked);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            while gate.load(Ordering::Acquire) {
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = done_tx.send(());
+        });
+        let worker = PersistenceWorker {
+            queue,
+            handle: Some(handle),
+        };
+        let start = std::time::Instant::now();
+        drop(worker);
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        still_blocked.store(false, Ordering::Release);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+    }
+
     #[test]
     fn persistence_queue_coalesces_many_pending_edit_snapshots() {
         let worker = PersistenceWorker::spawn(fixture());

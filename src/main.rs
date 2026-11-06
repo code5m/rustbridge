@@ -121,6 +121,8 @@ struct App {
     startup_explicit_path: Option<PathBuf>,
     pending_close_document: Option<PathBuf>,
     save_queue: VecDeque<PathBuf>,
+    /// True only after an explicit Save All (possibly Save All and Close).
+    save_all_in_progress: bool,
     save_errors: Vec<String>,
     io_revision: u64,
     opening: Option<(u64, PathBuf, u64)>,
@@ -138,6 +140,9 @@ struct App {
     symbol_pending: bool,
     symbol_target: Option<(PathBuf, parser::ByteSpan)>,
     editor_query: String,
+    /// Explicit read-only folded lens within the Rust editor tab. The
+    /// underlying text buffer remains unmodified and editable on return.
+    editor_fold_preview: bool,
     editor_find: Option<parser::ByteSpan>,
     editor_jump: Option<parser::ByteSpan>,
     editor_line_starts: Vec<usize>,
@@ -276,6 +281,7 @@ impl Default for App {
             startup_explicit_path: None,
             pending_close_document: None,
             save_queue: VecDeque::new(),
+            save_all_in_progress: false,
             save_errors: Vec::new(),
             io_revision: 0,
             opening: None,
@@ -293,6 +299,7 @@ impl Default for App {
             symbol_pending: false,
             symbol_target: None,
             editor_query: String::new(),
+            editor_fold_preview: false,
             editor_find: None,
             editor_jump: None,
             editor_line_starts,
@@ -1340,6 +1347,7 @@ impl App {
         self.restore_active = None;
         self.pending_close_document = None;
         self.save_queue.clear();
+        self.save_all_in_progress = false;
         self.save_errors.clear();
         if let Some(io) = self.document_io.as_ref() {
             io.cancel_open();
@@ -1717,7 +1725,8 @@ impl App {
                                 self.save_errors.push(self.status.clone());
                                 self.start_next_queued_save();
                             } else {
-                                if self.documents.get(&path).is_some_and(|doc| doc.is_dirty())
+                                if self.save_all_in_progress
+                                    && self.documents.get(&path).is_some_and(|doc| doc.is_dirty())
                                     && !self.save_queue.iter().any(|queued| queued == &path)
                                 {
                                     self.save_queue.push_back(path.clone());
@@ -1980,6 +1989,7 @@ impl App {
                 self.save_errors.push(self.status.clone());
             }
         }
+        self.save_all_in_progress = false;
         if !self.save_errors.is_empty() {
             self.status = format!(
                 "保存全部已结束，但 {} 个文档存在冲突或错误：{}",
@@ -1994,13 +2004,16 @@ impl App {
 
     fn save_all_documents(&mut self) {
         self.sync_active_document();
-        if self.saving.is_some() {
-            self.status = "当前保存完成后再继续保存其他文档。".into();
+        self.save_errors.clear();
+        self.save_all_in_progress = true;
+        self.save_queue = self.documents.dirty_paths().into();
+        if let Some((_, currently_saving, _)) = self.saving.as_ref() {
+            self.save_queue.retain(|path| path != currently_saving);
+            self.status = "当前保存完成后，将继续执行明确请求的全部保存。".into();
             return;
         }
-        self.save_errors.clear();
-        self.save_queue = self.documents.dirty_paths().into();
         if self.save_queue.is_empty() {
+            self.save_all_in_progress = false;
             self.status = "所有打开的文档均已保存。".into();
         } else {
             self.start_next_queued_save();
@@ -4068,6 +4081,39 @@ mod file_tests {
     }
 
     #[test]
+    fn explicit_save_all_requeues_edits_but_single_save_does_not() {
+        let root = std::env::temp_dir().join(format!(
+            "rustbridge-explicit-saveall-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("main.rs");
+        fs::write(&path, "fn main() {}").unwrap();
+        let mut app = App::default();
+        app.open_file(path.clone());
+        app.wait_for_document_io();
+        let first = "\n// first";
+        let at = app.rust.len();
+        app.rust.push_str(first);
+        app.source_edited(at..at, first);
+        app.dirty = true;
+        app.save_all_documents();
+        assert!(app.save_all_in_progress);
+        let second = "\n// later edit";
+        let at = app.rust.len();
+        app.rust.push_str(second);
+        app.source_edited(at..at, second);
+        app.dirty = true;
+        app.mark_dirty_for_recovery();
+        app.wait_for_document_io();
+        assert_eq!(fs::read_to_string(&path).unwrap(), app.rust);
+        assert!(!app.dirty);
+        assert!(!app.save_all_in_progress);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn edits_during_an_accepted_save_remain_dirty_and_can_be_saved_again() {
         let root = std::env::temp_dir().join(format!(
             "rustbridge-edits-while-saving-{}",
@@ -4099,22 +4145,20 @@ mod file_tests {
         app.mark_dirty_for_recovery();
 
         app.wait_for_document_io();
-        // A successful first save can enqueue another save for the newer
-        // revision. Either the later edit must remain dirty, or the automatic
-        // second save must have durably persisted it. It must never disappear.
+        // A normal Ctrl+S accepts exactly one immutable revision. Any later
+        // keystrokes remain dirty and require another explicit save.
         let disk = fs::read_to_string(&path).unwrap();
         assert_eq!(
             app.documents.get(&path).unwrap().source,
             app.rust,
             "manager lost post-save edits"
         );
-        if disk != app.rust {
-            assert_eq!(disk, "fn main() {}\n// first revision");
-            assert!(app.dirty);
-            assert!(app.documents.get(&path).unwrap().is_dirty());
-            app.save();
-            app.wait_for_document_io();
-        }
+        assert_eq!(disk, "fn main() {}\n// first revision");
+        assert!(app.dirty);
+        assert!(app.documents.get(&path).unwrap().is_dirty());
+        assert!(!app.save_all_in_progress);
+        app.save();
+        app.wait_for_document_io();
         assert_eq!(fs::read_to_string(&path).unwrap(), app.rust);
         assert!(!app.dirty);
         assert!(!app.documents.get(&path).unwrap().is_dirty());

@@ -63,6 +63,10 @@ pub struct StructureItem {
 #[derive(Clone, Debug)]
 pub struct FoldRegion {
     pub rust_byte: usize,
+    /// Exclusive end of the hidden source span. Closing delimiters are kept visible.
+    pub rust_end_byte: usize,
+    pub java_byte: usize,
+    pub java_end_byte: usize,
     pub start_line: usize,
     pub end_line: usize,
     pub kind: &'static str,
@@ -157,6 +161,9 @@ struct Collector<'a> {
     insights: Vec<JavaInsight>,
     structures: Vec<StructureItem>,
     folds: Vec<FoldRegion>,
+    /// Common local/parameter names repeat thousands of times in large
+    /// source files. Reuse their conservative Java display conversion.
+    rename_cache: HashMap<(bool, &'a str), Option<String>>,
 }
 
 /// UI-only lexical normalization. This does not claim symbol identity,
@@ -204,7 +211,7 @@ fn java_pascal_case(name: &str) -> Option<String> {
     (result != name).then_some(result)
 }
 
-impl Collector<'_> {
+impl<'a> Collector<'a> {
     fn add(
         &mut self,
         node: Node<'_>,
@@ -268,41 +275,44 @@ impl Collector<'_> {
         }
     }
 
-    fn rewrite_identifier(&mut self, node: Node<'_>, is_type: bool) {
-        let original = node.utf8_text(self.source.as_bytes()).unwrap_or("");
-        // A projection is not a resolver. Rename only syntactic identifiers,
-        // not imports, module paths, type names, strings or macro invocations.
-        let mut parent = node.parent();
-        while let Some(ancestor) = parent {
-            if matches!(
-                ancestor.kind(),
-                "use_declaration" | "macro_invocation" | "macro_definition" | "attribute_item"
-            ) {
-                return;
-            }
-            if ancestor.kind() == "mod_item"
-                && ancestor
+    fn rewrite_identifier(&mut self, node: Node<'_>, is_type: bool, forbidden: bool) {
+        if forbidden {
+            return;
+        }
+        let original: &'a str = node.utf8_text(self.source.as_bytes()).unwrap_or("");
+        // Most AST identifiers do not need a Java display rename. Cache
+        // repeated names without owning another copy of each source token.
+        let renamed = self
+            .rename_cache
+            .entry((is_type, original))
+            .or_insert_with(|| {
+                if is_type {
+                    java_pascal_case(original)
+                } else {
+                    java_camel_case(original)
+                }
+            })
+            .clone();
+        let Some(replacement) = renamed else {
+            return;
+        };
+        // Rewriter exclusion is inherited as a cheap boolean during AST
+        // traversal; don't climb the entire parent chain for each identifier.
+        if node.parent().is_some_and(|parent| {
+            parent.kind() == "mod_item"
+                && parent
                     .child_by_field_name("name")
                     .is_some_and(|name| name.start_byte() == node.start_byte())
-            {
-                return;
-            }
-            parent = ancestor.parent();
+        }) {
+            return;
         }
-        let renamed = if is_type {
-            java_pascal_case(original)
-        } else {
-            java_camel_case(original)
-        };
-        if let Some(replacement) = renamed {
-            self.edits.push(Edit {
-                rust: ByteSpan {
-                    start: node.start_byte(),
-                    end: node.end_byte(),
-                },
-                replacement,
-            });
-        }
+        self.edits.push(Edit {
+            rust: ByteSpan {
+                start: node.start_byte(),
+                end: node.end_byte(),
+            },
+            replacement,
+        });
     }
 
     fn describe_structure(&mut self, node: Node<'_>) {
@@ -491,8 +501,29 @@ impl Collector<'_> {
                     .trim_end_matches("_expression")
                     .into()
             });
+        // Preserve the declaration signature and the opening brace; folding
+        // only hides the inner body and retains closing braces/siblings.
+        let rust_byte = node
+            .child_by_field_name("body")
+            .filter(|body| body.start_position().row == start_line)
+            .map_or(node.start_byte(), |body| {
+                body.start_byte().saturating_add(1)
+            });
+        let mut rust_end_byte = node.end_byte();
+        // Keep the matching closing brace visible. Besides being familiar
+        // editor behavior, this lets same-line sibling items remain visible.
+        if rust_end_byte > rust_byte && self.source.as_bytes().get(rust_end_byte - 1) == Some(&b'}')
+        {
+            rust_end_byte -= 1;
+        }
+        if rust_end_byte <= rust_byte {
+            return;
+        }
         self.folds.push(FoldRegion {
-            rust_byte: node.start_byte(),
+            rust_byte,
+            rust_end_byte,
+            java_byte: 0,
+            java_end_byte: 0,
             start_line,
             end_line,
             kind,
@@ -563,7 +594,12 @@ impl Collector<'_> {
         }
     }
 
-    fn walk(&mut self, node: Node<'_>) -> bool {
+    fn walk(&mut self, node: Node<'_>, blocked_rewrite: bool) -> bool {
+        let blocked_rewrite = blocked_rewrite
+            || matches!(
+                node.kind(),
+                "use_declaration" | "macro_invocation" | "macro_definition" | "attribute_item"
+            );
         self.visited += 1;
         if self.visited.is_multiple_of(128) && (self.cancelled)() {
             return false;
@@ -574,7 +610,7 @@ impl Collector<'_> {
         if node.has_error() {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if !self.walk(child) {
+                if !self.walk(child, blocked_rewrite) {
                     return false;
                 }
             }
@@ -644,24 +680,24 @@ impl Collector<'_> {
         }
 
         if node.child_count() == 0 {
-            self.leaf(node);
+            self.leaf(node, blocked_rewrite);
         }
 
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if !self.walk(child) {
+            if !self.walk(child, blocked_rewrite) {
                 return false;
             }
         }
         true
     }
 
-    fn leaf(&mut self, node: Node<'_>) {
+    fn leaf(&mut self, node: Node<'_>, blocked_rewrite: bool) {
         let text = node.utf8_text(self.source.as_bytes()).unwrap_or("");
         if matches!(node.kind(), "identifier" | "field_identifier") {
-            self.rewrite_identifier(node, false);
+            self.rewrite_identifier(node, false, blocked_rewrite);
         } else if node.kind() == "type_identifier" {
-            self.rewrite_identifier(node, true);
+            self.rewrite_identifier(node, true, blocked_rewrite);
         }
         match node.kind() {
             "type_identifier" => {
@@ -730,6 +766,11 @@ fn shifted(value: usize, offset: isize) -> usize {
     value
         .checked_add_signed(offset)
         .expect("valid projection offset")
+}
+
+fn map_offset(byte: usize, edits: &[Edit], offsets: &[isize]) -> usize {
+    let index = edits.partition_point(|edit| edit.rust.end <= byte);
+    shifted(byte, offsets[index])
 }
 
 fn map_span(span: ByteSpan, edits: &[Edit], offsets: &[isize]) -> Option<ByteSpan> {
@@ -925,8 +966,9 @@ fn project_tree(source: &str, tree: &Tree, cancelled: &dyn Fn() -> bool) -> Opti
         insights: Vec::new(),
         structures: Vec::new(),
         folds: Vec::new(),
+        rename_cache: HashMap::new(),
     };
-    if !collector.walk(tree.root_node()) || cancelled() {
+    if !collector.walk(tree.root_node(), false) || cancelled() {
         return None;
     }
     collector.edits.sort_by_key(|edit| edit.rust.start);
@@ -954,6 +996,10 @@ fn project_tree(source: &str, tree: &Tree, cancelled: &dyn Fn() -> bool) -> Opti
     let mut source_hasher = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut source_hasher);
     let source_hash = source_hasher.finish();
+    for fold in &mut collector.folds {
+        fold.java_byte = map_offset(fold.rust_byte, &non_overlapping, &offsets);
+        fold.java_end_byte = map_offset(fold.rust_end_byte, &non_overlapping, &offsets);
+    }
     let mut fold_starts = vec![None; rust_lines.len()];
     for (index, fold) in collector.folds.iter().enumerate() {
         if let Some(slot) = fold_starts.get_mut(fold.start_line) {

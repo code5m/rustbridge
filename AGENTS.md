@@ -149,3 +149,10 @@ Design decisions and exact UI scope are binding in `docs/java-concept-projection
 - Structure navigation must include free functions, imports, modules, types, traits, impl blocks, fields and methods, with true AST line numbers and conservative Java labels.
 - Read-only code folding is AST-line-based, per document and per Java/Rust side. It must never mutate the editable buffer, lie about line numbers, or use pixel-offset linked scroll when two panes have different collapsed line ranges. Do not allocate a full visible-row map each frame for large untouched files.
 - Narrow compare must prioritize code width and hide explanation/navigation before squeezing the code into unreadable columns. All changes need parser link tests, folding tests, no-data-loss tests and real native GUI smoke; distinguish Xvfb from human QA.
+
+## 2026-11-06 direct-main follow-up safety rules
+
+- Explicit Ctrl+S must commit only the accepted source revision. Later typing remains dirty and recoverable; only an explicitly requested Save All may requeue newer revisions. Save All continues safe independent files after a conflict and reports all failures.
+- AST fold rendering must retain code after a closing brace on the same original line, with exact source-mapped Rust/Java byte boundaries, CRLF and Unicode safety. A read-only folding lens in the editor tab must never rewrite the underlying editable buffer.
+- Never silently truncate the AST structure sidebar. Paginate large structures, preserving original line numbers.
+- If storage I/O never finishes during shutdown, a bounded wait must log unconfirmed recovery writes instead of silently declaring durable completion. There is no universal guaranteed recovery from uninterruptible disk/NFS errors.
