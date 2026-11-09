@@ -2026,13 +2026,10 @@ impl App {
         if paths.len() < 2 {
             return;
         }
-        let Some(active) = self.file.as_ref() else {
+        let Some(active) = self.documents.active_path() else {
             return;
         };
-        let Some(index) = paths.iter().position(|path| {
-            path.canonicalize().unwrap_or_else(|_| path.clone())
-                == active.canonicalize().unwrap_or_else(|_| active.clone())
-        }) else {
+        let Some(index) = paths.iter().position(|path| *path == active) else {
             return;
         };
         let next = (index as isize + direction).rem_euclid(paths.len() as isize) as usize;
@@ -3486,10 +3483,10 @@ mod file_tests {
         app.dirty = true;
         app.sync_active_document();
 
-        app.open(a.clone());
+        app.cycle_document(1);
         assert!(app.dirty);
         assert!(app.rust.contains("unsaved A"));
-        app.open(b.clone());
+        app.cycle_document(-1);
         assert!(app.dirty);
         assert!(app.rust.contains("unsaved B"));
 
