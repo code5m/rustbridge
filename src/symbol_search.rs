@@ -10,7 +10,7 @@ use std::{
     },
     thread,
 };
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, ParseOptions, Parser, Point, Tree};
 
 #[derive(Clone, Debug)]
 pub struct Declaration {
@@ -151,6 +151,21 @@ fn scan_node(
         }
     }
 }
+
+fn parse_source(parser: &mut Parser, source: &str, cancelled: &impl Fn() -> bool) -> Option<Tree> {
+    if cancelled() {
+        return None;
+    }
+    let mut progress = |_state: &tree_sitter::ParseState| cancelled();
+    let options = ParseOptions::new().progress_callback(&mut progress);
+    let mut input = |byte: usize, _point: Point| &source.as_bytes()[byte..];
+    let tree = parser.parse_with_options(&mut input, None, Some(options));
+    if tree.is_none() {
+        parser.reset();
+    }
+    tree.filter(|_| !cancelled())
+}
+
 fn find_declarations(
     parser: &mut Parser,
     root: &Path,
@@ -195,7 +210,7 @@ fn find_declarations(
                 let Ok(source) = fs::read_to_string(&path) else {
                     continue;
                 };
-                let Some(tree) = parser.parse(&source, None) else {
+                let Some(tree) = parse_source(parser, &source, cancelled) else {
                     continue;
                 };
                 scan_node(
@@ -220,6 +235,25 @@ fn find_declarations(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    #[test]
+    fn cancelled_parse_can_be_reused_for_the_next_file() {
+        use std::cell::Cell;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let checks = Cell::new(0);
+        let source = "fn sample() { let value = 123; }\n".repeat(20_000);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 1
+        };
+        assert!(parse_source(&mut parser, &source, &cancelled).is_none());
+        assert!(checks.get() > 1);
+        let tree = parse_source(&mut parser, "fn next() {}", &|| false).unwrap();
+        assert!(!tree.root_node().has_error());
+        assert_eq!(tree.root_node().end_byte(), "fn next() {}".len());
+    }
     #[test]
     fn cancel_and_drop_invalidate_old_work() {
         let worker = SymbolSearch::new();
