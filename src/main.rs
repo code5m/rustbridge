@@ -2148,11 +2148,17 @@ impl App {
         self.search_results.clear();
         let Some(root) = self.root.clone() else {
             self.file_search_pending = false;
+            if let Some(worker) = self.file_search_worker.as_ref() {
+                worker.cancel();
+            }
             return;
         };
         let query = self.file_query.trim().to_lowercase();
         if query.is_empty() {
             self.file_search_pending = false;
+            if let Some(worker) = self.file_search_worker.as_ref() {
+                worker.cancel();
+            }
             return;
         }
         self.file_search_pending = true;

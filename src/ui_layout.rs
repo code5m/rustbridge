@@ -416,6 +416,7 @@ impl App {
         };
 
         ui.strong("文件名");
+        ui.small("搜索最多深入 12 层；达到 100 项时请缩小搜索词。");
         let changed = ui
             .add(
                 egui::TextEdit::singleline(&mut self.file_query)

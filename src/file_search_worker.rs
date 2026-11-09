@@ -9,6 +9,7 @@ use std::{
 struct State {
     pending: Option<(u64, Request)>,
     result: Option<(u64, Vec<PathBuf>)>,
+    current_revision: Option<u64>,
     closed: bool,
 }
 
@@ -40,21 +41,13 @@ impl FileSearchWorker {
                 drop(state);
                 let results = search(&request, || {
                     let state = lock.lock().unwrap();
-                    state.closed
-                        || state
-                            .pending
-                            .as_ref()
-                            .is_some_and(|(next, _)| *next > revision)
+                    state.closed || state.current_revision != Some(revision)
                 });
                 let mut state = lock.lock().unwrap();
                 if state.closed {
                     break;
                 }
-                if state
-                    .pending
-                    .as_ref()
-                    .is_none_or(|(next, _)| *next <= revision)
-                {
+                if state.current_revision == Some(revision) {
                     state.result = Some((revision, results));
                 }
             }
@@ -65,6 +58,7 @@ impl FileSearchWorker {
     pub fn submit(&self, revision: u64, root: PathBuf, query: String, show_excluded: bool) {
         let (lock, ready) = &*self.shared;
         let mut state = lock.lock().unwrap();
+        state.current_revision = Some(revision);
         state.pending = Some((
             revision,
             Request {
@@ -75,6 +69,13 @@ impl FileSearchWorker {
         ));
         state.result = None;
         ready.notify_one();
+    }
+
+    pub fn cancel(&self) {
+        let mut state = self.shared.0.lock().unwrap();
+        state.current_revision = None;
+        state.pending = None;
+        state.result = None;
     }
 
     pub fn take(&self) -> Option<(u64, Vec<PathBuf>)> {
@@ -187,6 +188,35 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < deadline, "worker did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_search_does_not_publish_and_worker_can_be_reused() {
+        let root =
+            std::env::temp_dir().join(format!("rustbridge-worker-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("new.rs"), "").unwrap();
+        let worker = FileSearchWorker::new();
+        worker.submit(1, root.clone(), "old".into(), false);
+        worker.cancel();
+        {
+            let state = worker.shared.0.lock().unwrap();
+            assert!(state.current_revision.is_none());
+            assert!(state.pending.is_none());
+            assert!(state.result.is_none());
+        }
+        worker.submit(2, root.clone(), "new".into(), false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((revision, results)) = worker.take() {
+                assert_eq!(revision, 2);
+                assert_eq!(results, vec![root.join("new.rs")]);
+                break;
+            }
+            assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
         std::fs::remove_dir_all(root).unwrap();
