@@ -55,6 +55,17 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 impl DocumentManager {
+    fn index_of(&self, path: &Path) -> Option<usize> {
+        self.documents
+            .iter()
+            .position(|doc| doc.path == path)
+            .or_else(|| {
+                self.documents
+                    .iter()
+                    .position(|doc| same_path(&doc.path, path))
+            })
+    }
+
     pub fn len(&self) -> usize {
         self.documents.len()
     }
@@ -97,17 +108,16 @@ impl DocumentManager {
     }
 
     pub fn contains(&self, path: &Path) -> bool {
-        self.documents.iter().any(|doc| same_path(&doc.path, path))
+        self.index_of(path).is_some()
     }
 
     pub fn get(&self, path: &Path) -> Option<&Document> {
-        self.documents.iter().find(|doc| same_path(&doc.path, path))
+        self.index_of(path).map(|index| &self.documents[index])
     }
 
     pub fn get_mut(&mut self, path: &Path) -> Option<&mut Document> {
-        self.documents
-            .iter_mut()
-            .find(|doc| same_path(&doc.path, path))
+        let index = self.index_of(path)?;
+        Some(&mut self.documents[index])
     }
 
     pub fn active(&self) -> Option<&Document> {
@@ -128,11 +138,7 @@ impl DocumentManager {
         mode: String,
         disk_stamp: Option<FileStamp>,
     ) -> u64 {
-        if let Some(existing) = self
-            .documents
-            .iter()
-            .find(|doc| same_path(&doc.path, &path))
-        {
+        if let Some(existing) = self.get(&path) {
             return existing.id;
         }
         self.next_id = self.next_id.saturating_add(1).max(1);
@@ -153,10 +159,8 @@ impl DocumentManager {
     }
 
     pub fn activate(&mut self, path: &Path) -> Option<Document> {
-        let doc = self
-            .documents
-            .iter()
-            .find(|doc| same_path(&doc.path, path))?;
+        let index = self.index_of(path)?;
+        let doc = &self.documents[index];
         self.active_id = Some(doc.id);
         Some(doc.clone())
     }
@@ -238,10 +242,7 @@ impl DocumentManager {
     }
 
     pub fn remove(&mut self, path: &Path) -> Option<Document> {
-        let index = self
-            .documents
-            .iter()
-            .position(|doc| same_path(&doc.path, path))?;
+        let index = self.index_of(path)?;
         let removed = self.documents.remove(index);
         if self.active_id == Some(removed.id) {
             self.active_id = self
@@ -263,10 +264,10 @@ impl DocumentManager {
     }
 
     pub fn set_active_path(&mut self, path: &Path) -> bool {
-        let Some(doc) = self.documents.iter().find(|doc| same_path(&doc.path, path)) else {
+        let Some(index) = self.index_of(path) else {
             return false;
         };
-        self.active_id = Some(doc.id);
+        self.active_id = Some(self.documents[index].id);
         true
     }
 }
@@ -274,6 +275,39 @@ impl DocumentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_paths_take_priority_and_aliases_still_find_the_document() {
+        use std::{fs, os::unix::fs::symlink};
+        let root = std::env::temp_dir().join(format!(
+            "rustbridge-document-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        let alias = root.join("alias.rs");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        symlink(&second, &alias).unwrap();
+        let mut manager = DocumentManager::default();
+        manager.insert_loaded(first, "first".into(), 0, "rust".into(), None);
+        let id = manager.insert_loaded(second.clone(), "second".into(), 0, "rust".into(), None);
+        assert_eq!(manager.get(&second).unwrap().id, id);
+        assert_eq!(manager.get(&alias).unwrap().id, id);
+        assert_eq!(
+            manager.insert_loaded(alias.clone(), "other".into(), 0, "rust".into(), None),
+            id
+        );
+        assert_eq!(manager.len(), 2);
+        assert_eq!(manager.remove(&alias).unwrap().id, id);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn documents_keep_independent_buffers_dirty_states_and_identity() {
