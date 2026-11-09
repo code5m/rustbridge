@@ -1391,10 +1391,16 @@ impl App {
         self.analyzer_diagnostics_status = "已切换项目；原项目诊断已取消。".into();
 
         self.symbol_revision += 1;
+        if let Some(worker) = self.symbol_worker.as_ref() {
+            worker.cancel(self.symbol_revision);
+        }
         self.symbol_hits.clear();
         self.symbol_pending = false;
         self.symbol_target = None;
         self.file_search_revision += 1;
+        if let Some(worker) = self.file_search_worker.as_ref() {
+            worker.cancel();
+        }
         self.file_search_pending = false;
         self.search_results.clear();
         self.file_query.clear();

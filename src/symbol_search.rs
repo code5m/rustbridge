@@ -85,10 +85,17 @@ impl SymbolSearch {
     pub fn take(&self) -> Option<(u64, Vec<Declaration>)> {
         self.shared.state.lock().unwrap().result.take()
     }
+    pub fn cancel(&self, revision: u64) {
+        let mut state = self.shared.state.lock().unwrap();
+        self.shared.latest.store(revision, Ordering::Release);
+        state.pending = None;
+        state.result = None;
+    }
 }
 impl Drop for SymbolSearch {
     fn drop(&mut self) {
         let mut state = self.shared.state.lock().unwrap();
+        self.shared.latest.fetch_add(1, Ordering::AcqRel);
         state.closed = true;
         state.pending = None;
         self.shared.ready.notify_one();
@@ -213,6 +220,31 @@ fn find_declarations(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    #[test]
+    fn cancel_and_drop_invalidate_old_work() {
+        let worker = SymbolSearch::new();
+        let shared = Arc::clone(&worker.shared);
+        worker.submit(1, PathBuf::from("missing"), "Foo".into());
+        worker.cancel(2);
+        {
+            let state = shared.state.lock().unwrap();
+            assert_eq!(shared.latest.load(Ordering::Acquire), 2);
+            assert!(state.pending.is_none());
+            assert!(state.result.is_none());
+        }
+        worker.submit(3, PathBuf::from("missing"), "Bar".into());
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((revision, _)) = worker.take() {
+                assert_eq!(revision, 3);
+                break;
+            }
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(worker);
+        assert_ne!(shared.latest.load(Ordering::Acquire), 3);
+    }
     #[test]
     fn finds_only_syntax_declarations_across_files_not_identical_name_uses() {
         let root = std::env::temp_dir().join(format!("rustbridge-symbol-{}", std::process::id()));
