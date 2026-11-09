@@ -1,6 +1,6 @@
 # RustBridge Agent Handoff — 2026-11-04
 
-> 历史快照：本文件记录 v0.2/main 的接手节点，不代表 v0.3 修复后的状态。最新集中修复说明请参阅 [hardening-2026-11-04.md](hardening-2026-11-04.md)。
+> 历史快照：本文件保留 2026-11-04 的接手背景；2026-11-09 的最新状态见文末“最新节点更新”。
 
 这份记录用于把当前节点交给后续 Agent。它区分了已经合并并验证的工作、已有证据、尚未完成的工作和当前不能宣称的结论。
 
@@ -130,4 +130,14 @@ rust-analyzer 诊断命令已在本项目上实际运行完成，耗时约 20.1 
 - 不用 headless 进程存活冒充 GUI 验收。
 - 新增代码完成后继续执行格式、编译、测试和严格 Clippy；涉及 parser/projection 时补齐真实风险测试。
 - 任何性能结论都要写明机器、项目规模、方法、重复次数和实测值。
+
+## 最新节点更新（2026-11-09）
+
+- 当前 `main` 与 `origin/main` 已同步，最新提交为 `84ee9fb`。
+- 其间已合入 v0.3/v0.4/v0.5 的可靠性、恢复、多文档、学习路径、原生 LSP、UI 折叠和安全保存改动；最新主线包含 `e6e43f7`、`46d0ed7`、`5a6f722`、`c9cef9e`、`84ee9fb`。
+- 当前测试门禁实测通过：`cargo fmt --check`、`cargo check --all-targets`、`cargo test --all-targets`、`cargo clippy --all-targets -- -D warnings`。
+- 测试结果：主 crate 122 个通过、3 个忽略；`projection_probe` 19 个通过；另有 1 个独立测试二进制通过。忽略项是需要真实 native OS / rust-analyzer / Cargo 子进程的手工集成测试，不能等同于 GUI 验收。
+- 新增能力已经覆盖多文档状态、恢复档案后台清单、保存确认与并发编辑、原生 LSP 生命周期、学习路径/练习、结构导航和 AST 折叠；具体设计以 `docs/*20261105.md`、`docs/ui-2.0-*`、`docs/java-concept-projection-ui-v2.md` 为准。
+- 仍未完成的最高优先级是：真实 Linux 原生 GUI 交互验收、跨平台 native CI/打包、可重复启动/打开/编辑/长时资源测试，以及对新恢复和折叠路径的人工验收。Xvfb、headless 进程存活和单元测试都不能替代这些证据。
+- 后续 Agent 应先阅读 `docs/completion-reliability-audit-20261105.md`、`docs/direct-main-review-20261106.md` 和 `docs/performance-reliability-unified-20261105.md`，再继续修改；所有性能、恢复、LSP、文档管理工作仍应保持单分支、单门禁合并。
 
