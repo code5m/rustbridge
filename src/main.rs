@@ -1545,7 +1545,7 @@ impl App {
         self.file = Some(document.path.clone());
         self.rust = document.source;
         self.saved_source = document.saved_source;
-        self.dirty = self.rust != self.saved_source;
+        self.dirty = document.dirty;
         self.cursor_byte = document.cursor_byte.min(self.rust.len());
         if !self.rust.is_char_boundary(self.cursor_byte) {
             self.cursor_byte = self
