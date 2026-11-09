@@ -1257,18 +1257,24 @@ impl App {
     }
 
     fn open(&mut self, path: PathBuf) {
-        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
-        if self
-            .file
-            .as_ref()
-            .is_some_and(|active| active.canonicalize().unwrap_or_else(|_| active.clone()) == key)
+        if self.file.as_ref() == Some(&path)
+            || self
+                .opening
+                .as_ref()
+                .is_some_and(|(_, opening, _)| *opening == path)
         {
             return;
         }
-        if self.opening.as_ref().is_some_and(|(_, opening, _)| {
-            opening.canonicalize().unwrap_or_else(|_| opening.clone()) == key
-        }) {
-            return;
+        let known_document = self.documents.iter().any(|document| document.path == path);
+        if !known_document {
+            let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if self.file.as_ref().is_some_and(|active| {
+                active.canonicalize().unwrap_or_else(|_| active.clone()) == key
+            }) || self.opening.as_ref().is_some_and(|(_, opening, _)| {
+                opening.canonicalize().unwrap_or_else(|_| opening.clone()) == key
+            }) {
+                return;
+            }
         }
 
         self.sync_active_document();
@@ -1277,7 +1283,7 @@ impl App {
             self.persist_document_recovery(&active);
         }
 
-        if self.documents.contains(&path) {
+        if known_document || self.documents.contains(&path) {
             if !self.restore_queue.is_empty() {
                 self.restore_active = Some(path.clone());
                 self.activate_document(path);
