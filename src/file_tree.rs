@@ -63,9 +63,7 @@ impl DirectoryIndex {
                     if state.closed {
                         return;
                     }
-                    let dir = state.queue.pop_front().unwrap();
-                    state.queued.remove(&dir);
-                    dir
+                    state.queue.pop_front().unwrap()
                 };
                 let snapshot = match read_directory(&directory) {
                     Ok(entries) => Snapshot::Ready(Arc::new(entries)),
@@ -75,6 +73,7 @@ impl DirectoryIndex {
                 if state.closed {
                     return;
                 }
+                state.queued.remove(&directory);
                 state.scans.insert(directory, (snapshot, Instant::now()));
             }
         });
@@ -145,12 +144,11 @@ fn read_directory(directory: &PathBuf) -> Result<Vec<Entry>, String> {
         };
         result.push(Entry { name, path, kind });
     }
-    result.sort_by(|a, b| {
-        let a_dir = a.kind == EntryKind::Directory;
-        let b_dir = b.kind == EntryKind::Directory;
-        b_dir
-            .cmp(&a_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    result.sort_by_cached_key(|entry| {
+        (
+            entry.kind != EntryKind::Directory,
+            entry.name.to_lowercase(),
+        )
     });
     Ok(result)
 }
@@ -163,6 +161,59 @@ mod tests {
         time::{Duration, Instant},
     };
     static SERIAL: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn slow_scan_is_not_queued_again_until_it_finishes() {
+        let directory = PathBuf::from("slow-directory");
+        let index = DirectoryIndex {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State::default()),
+                ready: Condvar::new(),
+            }),
+        };
+        assert!(matches!(
+            index.get_or_request_at(directory.clone(), Duration::ZERO),
+            Snapshot::Loading
+        ));
+        {
+            let mut state = index.shared.state.lock().unwrap();
+            assert_eq!(state.queue.pop_front(), Some(directory.clone()));
+        }
+        for _ in 0..3 {
+            index.get_or_request_at(directory.clone(), Duration::ZERO);
+        }
+        {
+            let mut state = index.shared.state.lock().unwrap();
+            assert!(state.queue.is_empty());
+            assert!(state.queued.remove(&directory));
+            state.scans.insert(
+                directory.clone(),
+                (Snapshot::Ready(Arc::new(Vec::new())), Instant::now()),
+            );
+        }
+        index.get_or_request_at(directory.clone(), Duration::ZERO);
+        let state = index.shared.state.lock().unwrap();
+        assert_eq!(state.queue.len(), 1);
+        assert!(state.queued.contains(&directory));
+    }
+
+    #[test]
+    fn directory_order_is_case_insensitive_and_directories_first() {
+        let root = std::env::temp_dir().join(format!(
+            "rustbridge-tree-order-{}-{}",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("Zoo")).unwrap();
+        fs::create_dir_all(root.join("alpha")).unwrap();
+        for name in ["z.rs", "B.rs", "a.rs", "中文.rs"] {
+            fs::write(root.join(name), "").unwrap();
+        }
+        let entries = read_directory(&root).unwrap();
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "Zoo", "a.rs", "B.rs", "z.rs", "中文.rs"]);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn real_directory_entries_not_limited_to_180() {
@@ -225,6 +276,40 @@ mod tests {
                 break;
             }
             assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_directory_scan_recovers_after_directory_is_created() {
+        let root = std::env::temp_dir().join(format!(
+            "rustbridge-tree-recover-{}-{}",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let worker = DirectoryIndex::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(
+                worker.get_or_request_at(root.clone(), Duration::from_millis(25)),
+                Snapshot::Error(_)
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("recovered.rs"), "").unwrap();
+        loop {
+            if let Snapshot::Ready(entries) =
+                worker.get_or_request_at(root.clone(), Duration::from_millis(25))
+                && entries.iter().any(|entry| entry.name == "recovered.rs")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
         }
         fs::remove_dir_all(root).unwrap();

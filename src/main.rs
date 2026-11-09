@@ -2052,6 +2052,8 @@ impl App {
             }
             file_tree::Snapshot::Error(error) => {
                 ui.colored_label(Color32::YELLOW, format!("无法读取目录: {error}"));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs(3));
             }
             file_tree::Snapshot::Ready(entries) => {
                 ui.ctx()
