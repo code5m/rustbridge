@@ -1,7 +1,6 @@
 //! A cancellable, bounded filename search worker for real Rust project trees.
 
 use std::{
-    collections::VecDeque,
     path::PathBuf,
     sync::{Arc, Condvar, Mutex},
 };
@@ -95,39 +94,43 @@ impl Drop for FileSearchWorker {
 
 fn search(request: &Request, is_cancelled: impl Fn() -> bool) -> Vec<PathBuf> {
     let mut results = Vec::new();
-    let mut pending = VecDeque::from([(request.root.clone(), 0)]);
     let query = request.query.to_lowercase();
-    while let Some((directory, depth)) = pending.pop_front() {
-        if is_cancelled() || depth > 12 || results.len() >= 100 {
+    let Ok(root) = std::fs::read_dir(&request.root) else {
+        return results;
+    };
+    let mut stack = vec![(root, 0)];
+    while let Some((entries, depth)) = stack.last_mut() {
+        if is_cancelled() || results.len() >= 100 {
             break;
         }
-        let Ok(entries) = std::fs::read_dir(directory) else {
+        let Some(entry) = entries.next() else {
+            stack.pop();
             continue;
         };
-        for entry in entries.flatten() {
-            if is_cancelled() || results.len() >= 100 {
-                break;
-            }
-            let path = entry.path();
-            let name = entry.file_name();
-            let excluded = matches!(name.to_str(), Some(".git" | "target" | "node_modules"));
-            // Never follow symlinks while scanning: avoid cycles and leaving the selected root.
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_symlink() {
-                continue;
-            }
-            if kind.is_dir() {
-                if request.show_excluded || !excluded {
-                    pending.push_back((path, depth + 1));
-                }
-            } else if kind.is_file()
-                && path.extension().is_some_and(|extension| extension == "rs")
-                && name.to_string_lossy().to_lowercase().contains(&query)
+        let depth = *depth;
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let name = entry.file_name();
+        let excluded = matches!(name.to_str(), Some(".git" | "target" | "node_modules"));
+        // Never follow symlinks while scanning: avoid cycles and leaving the selected root.
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            if depth < 12
+                && (request.show_excluded || !excluded)
+                && let Ok(child) = std::fs::read_dir(&path)
             {
-                results.push(path);
+                stack.push((child, depth + 1));
             }
+        } else if kind.is_file()
+            && path.extension().is_some_and(|extension| extension == "rs")
+            && name.to_string_lossy().to_lowercase().contains(&query)
+        {
+            results.push(path);
         }
     }
     results.sort();
@@ -186,6 +189,59 @@ mod tests {
             assert!(Instant::now() < deadline, "worker did not finish");
             std::thread::sleep(Duration::from_millis(5));
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_respects_depth_and_can_stop_mid_scan() {
+        use std::cell::Cell;
+        let root =
+            std::env::temp_dir().join(format!("rustbridge-worker-depth-{}", std::process::id()));
+        let mut directory = root.clone();
+        for depth in 0..=13 {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(format!("match_{depth}.rs")), "").unwrap();
+            directory.push("child");
+        }
+        let request = Request {
+            root: root.clone(),
+            query: "match".into(),
+            show_excluded: false,
+        };
+        let results = search(&request, || false);
+        assert_eq!(results.len(), 13);
+        assert!(results.iter().any(|path| path.ends_with("match_12.rs")));
+        assert!(!results.iter().any(|path| path.ends_with("match_13.rs")));
+        let checks = Cell::new(0);
+        let cancelled = search(&request, || {
+            checks.set(checks.get() + 1);
+            checks.get() > 3
+        });
+        assert!(cancelled.len() < results.len());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_limits_results_and_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+        let root =
+            std::env::temp_dir().join(format!("rustbridge-worker-limit-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        std::fs::write(root.join("outside/only_external.rs"), "").unwrap();
+        symlink(root.join("outside"), root.join("project/link")).unwrap();
+        for index in 0..110 {
+            std::fs::write(root.join(format!("project/match_{index}.rs")), "").unwrap();
+        }
+        let mut request = Request {
+            root: root.join("project"),
+            query: "match".into(),
+            show_excluded: true,
+        };
+        assert_eq!(search(&request, || false).len(), 100);
+        request.query = "only_external".into();
+        assert!(search(&request, || false).is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
