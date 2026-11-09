@@ -171,6 +171,29 @@ controlled experiment. It excludes filesystem scanning, GUI latency and peak
 memory. Cached keys consume temporary memory proportional to directory entries;
 these results do not establish an end-to-end improvement or memory budget.
 
+### Wide-directory traversal microbenchmark — 2026-11-09
+
+On the same Ryzen 7 5700U / Linux workstation and Rust 1.96.0, an isolated
+temporary directory containing 10,000 empty child directories and no Rust files
+was scanned five times per algorithm. `scripts/directory-walk-bench.rs` is a
+simplified traversal comparison, not the full search worker: it omits query
+matching, cancellation, excluded names and the GUI. Compile it with
+`rustc -O scripts/directory-walk-bench.rs -o /tmp/rustbridge-walk-bench` and
+run `/usr/bin/time -f 'peak_rss_kib=%M' /tmp/rustbridge-walk-bench old DIR`
+and then `new DIR`. The old version always ran first in each pair, so cache
+effects and run order can affect the timing.
+
+| Measurement | Breadth-first queue | Depth-first iterator stack |
+| --- | ---: | ---: |
+| Maximum pending directories/iterators | 10,000 | 2 |
+| Process peak RSS, median of 5 | 2,992 KiB | 2,036 KiB |
+| Elapsed time, median of 5 | 64.525 ms | 64.816 ms |
+
+This is a synthetic wide tree and does not predict full-application RSS or
+latency. Depth-first traversal holds directory handles along the active path
+(at most 13 under the configured depth limit), and when more than 100 files
+match, its selected subset can differ from the previous breadth-first search.
+
 The modified release build also passed `tests/gui-smoke.sh` and
 `tests/resource-smoke.sh` under Xvfb. The resource script used a generated
 40,000-line CRLF Rust file, warmed up for 15 seconds, and sampled `/proc` over
