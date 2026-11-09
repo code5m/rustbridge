@@ -437,19 +437,22 @@ impl App {
                 self.search_results.len()
             ));
         }
-        let results = self.search_results.clone();
-        for path in results {
+        let mut selected_path = None;
+        for path in &self.search_results {
             let label = path
                 .strip_prefix(&root)
-                .unwrap_or(&path)
+                .unwrap_or(path)
                 .display()
                 .to_string();
             if ui
-                .selectable_label(self.file.as_ref() == Some(&path), label)
+                .selectable_label(self.file.as_ref() == Some(path), label)
                 .clicked()
             {
-                self.open(path);
+                selected_path = Some(path.clone());
             }
+        }
+        if let Some(path) = selected_path {
+            self.open(path);
         }
 
         ui.separator();
@@ -729,9 +732,9 @@ impl App {
                 if self.cargo_diagnostics.is_empty() {
                     ui.label("当前没有 Cargo 诊断。构建或检查完成后，问题会显示在这里。");
                 } else {
-                    let diagnostics = self.cargo_diagnostics.clone();
+                    let mut selected_diagnostic = None;
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for diagnostic in diagnostics {
+                        for diagnostic in &self.cargo_diagnostics {
                             let label = format!(
                                 "{} · {}:{}:{} · {}",
                                 diagnostic.level,
@@ -749,7 +752,7 @@ impl App {
                                 .on_hover_text(diagnostic.path.display().to_string())
                                 .clicked()
                             {
-                                self.jump_to_cargo_diagnostic(diagnostic.clone());
+                                selected_diagnostic = Some(diagnostic.clone());
                             }
                             if let Some((code, advice)) =
                                 diagnostic.code.as_deref().and_then(|code| {
@@ -770,6 +773,9 @@ impl App {
                             }
                         }
                     });
+                    if let Some(diagnostic) = selected_diagnostic {
+                        self.jump_to_cargo_diagnostic(diagnostic);
+                    }
                 }
             }
             BottomTab::Build => {
