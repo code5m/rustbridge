@@ -149,3 +149,32 @@ machine and renderer, not universal CPU/RSS guarantees. The soak is three minute
 not a 24-hour soak. The scheduled CI workflow runs a 15-minute weekly Linux soak;
 longer 24-hour endurance, real-user multi-platform interaction, and signing/
 notarization remain separate release requirements.
+
+## Directory sorting microbenchmark — 2026-11-09
+
+On Linux 7.0.0-42-generic, AMD Ryzen 7 5700U (8 cores / 16 threads),
+Rust 1.96.0, a standalone optimized benchmark read real directory entry names
+once and timed sorting cloned entries. It compares the old per-comparison
+lowercase conversion with the cached-key implementation and asserts identical
+ordering each time. After two warm-up iterations, 50 samples were sorted and
+the upper middle sample recorded:
+
+| Directory | Entries | Previous median | Cached-key median |
+| --- | ---: | ---: | ---: |
+| `/usr/bin` | 1,752 | 1,051 µs | 213 µs |
+| `/usr/lib/x86_64-linux-gnu` | 2,741 | 1,765 µs | 362 µs |
+
+Reproduce with `rustc -O scripts/directory-sort-bench.rs -o /tmp/rustbridge-sort-bench`
+and run `/tmp/rustbridge-sort-bench /path/to/directory`. Each iteration times the
+old sort first, so this is a local microbenchmark rather than a randomized
+controlled experiment. It excludes filesystem scanning, GUI latency and peak
+memory. Cached keys consume temporary memory proportional to directory entries;
+these results do not establish an end-to-end improvement or memory budget.
+
+The modified release build also passed `tests/gui-smoke.sh` and
+`tests/resource-smoke.sh` under Xvfb. The resource script used a generated
+40,000-line CRLF Rust file, warmed up for 15 seconds, and sampled `/proc` over
+5 seconds: idle CPU was 0.00% of one core, RSS 235,296 → 235,296 KiB, and
+open file descriptors 10 → 10. This single short sample is not a long-running
+test or a before/after comparison. The GUI script verified small-file saving
+and paged CRLF editing; it did not exercise directory-error recovery.
